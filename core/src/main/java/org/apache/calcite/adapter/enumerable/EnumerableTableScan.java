@@ -101,15 +101,15 @@ public class EnumerableTableScan
   }
 
   private JavaRowFormat format() {
-    if (Object[].class.isAssignableFrom(elementType)) {
-      return JavaRowFormat.ARRAY;
-    }
-    if (Row.class.isAssignableFrom(elementType)) {
-      return JavaRowFormat.ROW;
-    }
     int fieldCount = getRowType().getFieldCount();
     if (fieldCount == 0) {
       return JavaRowFormat.LIST;
+    }
+    if (Object[].class.isAssignableFrom(elementType)) {
+      return fieldCount == 1 ? JavaRowFormat.SCALAR : JavaRowFormat.ARRAY;
+    }
+    if (Row.class.isAssignableFrom(elementType)) {
+      return JavaRowFormat.ROW;
     }
     if (fieldCount == 1 && (Object.class == elementType
           || Primitive.is(elementType)
