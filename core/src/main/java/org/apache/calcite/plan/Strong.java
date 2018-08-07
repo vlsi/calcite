@@ -23,6 +23,7 @@ import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.util.ImmutableBitSet;
+import org.apache.calcite.util.Util;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
@@ -87,7 +88,7 @@ public class Strong {
   /** Returns how to deduce whether a particular kind of expression is null,
    * given whether its arguments are null. */
   public static Policy policy(SqlKind kind) {
-    return Objects.requireNonNull(MAP.get(kind), kind.toString());
+    return Util.first(MAP.get(kind), Policy.AS_IS);
   }
 
   /** Returns whether an expression is definitely not true. */
@@ -107,6 +108,12 @@ public class Strong {
    * "if {@code x} is null, is {@code x + y} null? */
   public boolean isNull(RexNode node) {
     final Policy policy = MAP.get(node.getKind());
+    if (policy == null) {
+      // Well, we have no idea what is the Strong policy for a given node,
+      // so we return "false" for "definitely null".
+      // Such node might be AS(.., ...) or other nodes
+      return false;
+    }
     switch (policy) {
     case NOT_NULL:
       return false;
@@ -197,8 +204,6 @@ public class Strong {
     map.put(SqlKind.LITERAL, Policy.CUSTOM);
 
     map.put(SqlKind.EXISTS, Policy.NOT_NULL);
-    map.put(SqlKind.IS_DISTINCT_FROM, Policy.NOT_NULL);
-    map.put(SqlKind.IS_NOT_DISTINCT_FROM, Policy.NOT_NULL);
     map.put(SqlKind.IS_NULL, Policy.NOT_NULL);
     map.put(SqlKind.IS_NOT_NULL, Policy.NOT_NULL);
     map.put(SqlKind.IS_TRUE, Policy.NOT_NULL);
@@ -220,9 +225,7 @@ public class Strong {
     map.put(SqlKind.PLUS_PREFIX, Policy.ANY);
     map.put(SqlKind.MINUS_PREFIX, Policy.ANY);
     map.put(SqlKind.PLUS, Policy.ANY);
-    map.put(SqlKind.PLUS_PREFIX, Policy.ANY);
     map.put(SqlKind.MINUS, Policy.ANY);
-    map.put(SqlKind.MINUS_PREFIX, Policy.ANY);
     map.put(SqlKind.TIMES, Policy.ANY);
     map.put(SqlKind.DIVIDE, Policy.ANY);
     map.put(SqlKind.CAST, Policy.ANY);

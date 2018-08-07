@@ -16,10 +16,12 @@
  */
 package org.apache.calcite.rex;
 
+import org.apache.calcite.plan.Strong;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlOperator;
 import org.apache.calcite.sql.SqlSyntax;
+import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.util.Litmus;
 
 import com.google.common.collect.ImmutableList;
@@ -56,6 +58,9 @@ public class RexCall extends RexNode {
       RelDataType type,
       SqlOperator op,
       List<? extends RexNode> operands) {
+    if (type == null) {
+      throw new NullPointerException("type is null for " + op + "(" + operands + ")");
+    }
     this.type = Objects.requireNonNull(type);
     this.op = Objects.requireNonNull(op);
     this.operands = ImmutableList.copyOf(operands);
@@ -118,35 +123,64 @@ public class RexCall extends RexNode {
   @Override public boolean isAlwaysTrue() {
     // "c IS NOT NULL" occurs when we expand EXISTS.
     // This reduction allows us to convert it to a semi-join.
+    RexNode op0 = operands.isEmpty() ? null : operands.get(0);
     switch (getKind()) {
+    case IS_NULL:
+    case IS_UNKNOWN:
+      return op0.isAlwaysNull();
     case IS_NOT_NULL:
-      return !operands.get(0).getType().isNullable();
+      // IS_NOT_UNKNOWN does not exist yet
+      return !op0.getType().isNullable();
+    case IS_TRUE:
+      return op0.isAlwaysTrue();
     case IS_NOT_FALSE:
+      return op0.isAlwaysTrue() || op0.isAlwaysNull() || !isBoolean(op0);
     case NOT:
-      return operands.get(0).isAlwaysFalse();
+      return op0.isAlwaysFalse();
     case IS_NOT_TRUE:
+      return op0.isAlwaysFalse() || op0.isAlwaysNull() || !isBoolean(op0);
     case IS_FALSE:
+      return op0.isAlwaysFalse();
     case CAST:
-      return operands.get(0).isAlwaysTrue();
+      return op0.isAlwaysTrue();
     default:
       return false;
     }
   }
 
   @Override public boolean isAlwaysFalse() {
+    RexNode op0 = operands.isEmpty() ? null : operands.get(0);
     switch (getKind()) {
+    case IS_NOT_NULL:
+      // IS_NOT_UNKNOWN does not exist yet
+      return op0.isAlwaysNull();
     case IS_NULL:
-      return !operands.get(0).getType().isNullable();
+    case IS_UNKNOWN:
+      return !op0.getType().isNullable();
+    case IS_FALSE:
+      return op0.isAlwaysTrue() || op0.isAlwaysNull() || !isBoolean(op0);
     case IS_NOT_TRUE:
     case NOT:
-      return operands.get(0).isAlwaysTrue();
-    case IS_NOT_FALSE:
+      return op0.isAlwaysTrue();
     case IS_TRUE:
+      return op0.isAlwaysFalse() || op0.isAlwaysNull() || !isBoolean(op0);
+    case IS_NOT_FALSE:
     case CAST:
-      return operands.get(0).isAlwaysFalse();
+      return op0.isAlwaysFalse();
     default:
       return false;
     }
+  }
+
+  private boolean isBoolean(RexNode e) {
+    return e.getType().getSqlTypeName() == SqlTypeName.BOOLEAN;
+  }
+
+  @Override public boolean isAlwaysNull() {
+    if (operands.size() == 1 && Strong.policy(getKind()) == Strong.Policy.ANY) {
+      return operands.get(0).isAlwaysNull();
+    }
+    return false;
   }
 
   public SqlKind getKind() {

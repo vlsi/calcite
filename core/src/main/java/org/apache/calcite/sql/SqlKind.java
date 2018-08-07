@@ -1230,6 +1230,8 @@ public enum SqlKind {
   }
 
   /** Returns the kind that you get if you apply NOT to this kind.
+   * {@code NOT(IS_TRUE(x)) == IS_NOT_TRUE(x)}, so {@code IS_TRUE.negate() == IS_NOT_TRUE}.
+   * {@code NOT(IS_NULL(x)) == IS_NOT_NULL(x)}, so {@code IS_NULL.negate() == IS_NOT_NULL}.
    *
    * <p>For example, {@code IS_NOT_NULL.negate()} returns {@link #IS_NULL}.
    *
@@ -1267,8 +1269,10 @@ public enum SqlKind {
     }
   }
 
-  /** Returns the kind that you get if you negate this kind.
+  /** Returns the kind that you get if you negate this kind while keeping null to be null.
    * To conform to null semantics, null value should not be compared.
+   *  {@code IS_TRUE(NOT(x)) == IS_FALSE(x)}, so {@code IS_TRUE.negateNullSafe() == IS_FALSE}.
+   *  {@code IS_NULL(NOT(x)) == IS_NULL(x)}, so {@code IS_NULL.negateNullSafe() == IS_NULL}.
    *
    * <p>For {@link #IS_TRUE}, {@link #IS_FALSE}, {@link #IS_NOT_TRUE} and
    * {@link #IS_NOT_FALSE}, nullable inputs need to be treated carefully:
@@ -1302,6 +1306,9 @@ public enum SqlKind {
       return IS_NOT_FALSE;
     case IS_NOT_FALSE:
       return IS_NOT_TRUE;
+    case IS_NULL: // IS_NULL(NOT($0)) == IS_NULL($0)
+    case IS_NOT_NULL: // IS_NOT_NULL(NOT($0)) == IS_NOT_NULL($0)
+      return this;
     default:
       return this.negate();
     }

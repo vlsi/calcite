@@ -775,7 +775,7 @@ public class RexProgram {
    *     or null to not simplify
    * @return Normalized program
    */
-  public RexProgram normalize(RexBuilder rexBuilder, RexSimplify simplify) {
+  public RexProgram normalize(RexBuilder rexBuilder, RexSimplifier simplify) {
     // Normalize program by creating program builder from the program, then
     // converting to a program. getProgram does not need to normalize
     // because the builder was normalized on creation.

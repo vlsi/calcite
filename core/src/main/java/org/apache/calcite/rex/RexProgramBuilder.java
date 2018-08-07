@@ -48,7 +48,7 @@ public class RexProgramBuilder {
   private final List<RexLocalRef> localRefList = new ArrayList<>();
   private final List<RexLocalRef> projectRefList = new ArrayList<>();
   private final List<String> projectNameList = new ArrayList<>();
-  private final RexSimplify simplify;
+  private final RexSimplifier simplify;
   private RexLocalRef conditionRef = null;
   private boolean validating;
 
@@ -65,7 +65,7 @@ public class RexProgramBuilder {
    * Creates a program-builder.
    */
   private RexProgramBuilder(RelDataType inputRowType, RexBuilder rexBuilder,
-      RexSimplify simplify) {
+      RexSimplifier simplify) {
     this.inputRowType = Objects.requireNonNull(inputRowType);
     this.rexBuilder = Objects.requireNonNull(rexBuilder);
     this.simplify = simplify; // may be null
@@ -100,7 +100,7 @@ public class RexProgramBuilder {
       RexNode condition,
       final RelDataType outputRowType,
       boolean normalize,
-      RexSimplify simplify) {
+      RexSimplifier simplify) {
     this(inputRowType, rexBuilder, simplify);
 
     // Create a shuttle for registering input expressions.
@@ -532,7 +532,7 @@ public class RexProgramBuilder {
       final RexNode condition,
       final RelDataType outputRowType,
       boolean normalize,
-      RexSimplify simplify) {
+      RexSimplifier simplify) {
     return new RexProgramBuilder(rexBuilder, inputRowType, exprList,
         projectList, condition, outputRowType, normalize, simplify);
   }

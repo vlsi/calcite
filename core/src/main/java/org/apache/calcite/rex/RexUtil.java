@@ -1760,6 +1760,16 @@ public class RexUtil {
       return SqlStdOperatorTable.LESS_THAN_OR_EQUAL;
     case GREATER_THAN_OR_EQUAL:
       return SqlStdOperatorTable.GREATER_THAN_OR_EQUAL;
+    case IS_DISTINCT_FROM:
+      return SqlStdOperatorTable.IS_DISTINCT_FROM;
+    case IS_NOT_DISTINCT_FROM:
+      return SqlStdOperatorTable.IS_NOT_DISTINCT_FROM;
+    case AND:
+      return SqlStdOperatorTable.AND;
+    case OR:
+      return SqlStdOperatorTable.OR;
+    case COALESCE:
+      return SqlStdOperatorTable.COALESCE;
     default:
       throw new AssertionError(kind);
     }

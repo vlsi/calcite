@@ -2772,6 +2772,12 @@ public class SqlToRelConverterTest extends SqlToRelTestBase {
     sql(sql).ok();
   }
 
+//  @Test public void testOrAlwaysTrue() {
+//    final String sql = "select SAL from EMPNULLABLES_20 \n"
+//        + "where SAL IS NOT NULL OR SAL is null";
+//    sql(sql).ok();
+//  }
+
   @Test public void testMatchRecognizePrevDown() {
     final String sql = "SELECT *\n"
         + "FROM emp\n"
