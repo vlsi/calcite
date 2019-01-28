@@ -1721,6 +1721,9 @@ public class VolcanoPlanner extends AbstractRelOptPlanner {
           continue;
         }
         RelSubset parentSubset = getSubset(parent);
+        if (parentSubset == next) {
+          continue;
+        }
         String status = visitedNodes.get(parentSubset);
         if (shouldNotReach.equals(status)) {
           return true;
