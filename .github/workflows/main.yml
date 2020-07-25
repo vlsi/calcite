@@ -50,7 +50,7 @@ jobs:
     - name: 'Test'
       shell: cmd
       run: |
-        ./gradlew --no-parallel --no-daemon build javadoc
+        ./gradlew --scan --no-parallel --no-daemon build javadoc
 
   linux-avatica:
     if: github.event.action != 'labeled'
@@ -71,7 +71,7 @@ jobs:
         fetch-depth: 50
     - name: 'Test'
       run: |
-        ./gradlew --no-parallel --no-daemon build javadoc -Pcalcite.avatica.version=1.0.0-dev-master-SNAPSHOT -PenableMavenLocal
+        ./gradlew --scan --no-parallel --no-daemon build javadoc -Pcalcite.avatica.version=1.0.0-dev-master-SNAPSHOT -PenableMavenLocal
 
   mac:
     if: github.event.action != 'labeled'
@@ -87,7 +87,7 @@ jobs:
           java-version: 14
       - name: 'Test'
         run: |
-          ./gradlew --no-parallel --no-daemon build javadoc
+          ./gradlew --scan --no-parallel --no-daemon build javadoc
 
   linux-slow:
     # Run slow tests when the commit is on master or it is requested explicitly by adding an
@@ -105,4 +105,4 @@ jobs:
           java-version: 8
       - name: 'Test'
         run: |
-          ./gradlew --no-parallel --no-daemon testSlow
+          ./gradlew --scan --no-parallel --no-daemon testSlow
