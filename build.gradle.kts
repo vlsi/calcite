@@ -33,6 +33,7 @@ plugins {
     // Verification
     checkstyle
     calcite.buildext
+    id("com.autonomousapps.dependency-analysis")
     id("com.github.autostyle")
     id("org.nosphere.apache.rat")
     id("com.github.spotbugs")
