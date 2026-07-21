@@ -70,6 +70,21 @@ the attacker's full capability above.
 * the internal network reachable from that host: no attacker-directed
   outbound requests.
 
+## Inputs
+
+Everything the attacker controls resolves to one of P1–P4 or to an explicit
+carve-out below. A report that reaches a sink not covered here is a model gap
+(see [Triage dispositions](#triage-dispositions)).
+
+| Input | How it is supplied | What it feeds | Governing rule |
+| --- | --- | --- | --- |
+| SQL text, including DDL | any statement on the connection | parser → validator → planner → generated code | P1–P4; parser nesting depth is a DoS surface (see [Denial of service](#denial-of-service)) |
+| The class-naming SPI positions — `schemaFactory`, `tableFactory`, function, operator, `parserFactory`, `typeSystem` | connection property or `model` | a class loaded through a Calcite SPI | [Surprising vs unsurprising class loading](#surprising-vs-unsurprising-class-loading) (P1) |
+| `dataSource`, `jdbcDriver` | connection property or `model` | a class loaded through a standard-Java SPI (`javax.sql.DataSource`, `java.sql.Driver`) | Surprising vs unsurprising class loading (P1); the host it then dials is P3 |
+| `model` — inline JSON, a `file:` path, or a URL | connection property | schema/table factories and adapter operands | P1 (factories via SPI), P2 (local-file operands), P3 (a URL model, or a URL-fetching adapter) |
+| A serialized RelNode plan (`RelJson`) | any path that reconstructs a plan from attacker input | type / operator / class resolution | Surprising vs unsurprising class loading (P1) |
+| Adapter operands — e.g. a file/CSV/JSON path, or the os-adapter | `model` or SQL | the adapter's configured resource | P2 for a configured local path (opt-in ⇒ not a vulnerability); the os-adapter is opt-in (not a vulnerability) |
+
 ## Security properties
 
 * **P1: no code execution.** Neither connecting nor running SQL may
@@ -119,6 +134,29 @@ the attacker's full capability above.
   authorization; scoping each connection's root schema to what its principal may
   see is the embedder's job. P4 applies where the user submits only SQL; a user
   who also sets connection properties configures their own schema visibility.
+
+## Downstream responsibilities
+
+Calcite is embedded; several controls are the host's or operator's, not the
+library's. A finding that lands in one of these is not a Calcite vulnerability.
+
+* **Transport and identity.** Calcite opens no socket. TLS, the network
+  perimeter, authentication, and authorization live in the host. A host that
+  lets an untrusted principal set connection properties has handed that
+  principal the full attacker capability described in
+  [Attacker and trust boundary](#attacker-and-trust-boundary).
+* **Schema scoping.** Scope each connection's root schema to exactly what its
+  principal may see. Calcite has no authn/authz; cross-tenant reads that
+  follow from exposing several principals' schemas on one connection are the
+  embedder's to prevent. P4 covers only the user who submits SQL alone.
+* **Adapter selection.** The os-adapter and the file/CSV/JSON adapters do what
+  they are configured to do. Add them only where the query author is trusted
+  to reach what they expose.
+* **Classpath.** The operator owns the classpath. Calcite gates class loading
+  by SPI, but which classes are present is the operator's trust decision.
+* **What a `model` points at.** A third-party driver or service a `model`
+  references is configured and patched by the operator; its behavior past the
+  connection boundary is out of this model.
 
 ## Surprising vs unsurprising class loading
 
@@ -205,3 +243,31 @@ land.
 
 Once the planning bounds exist, a single reasonably-sized query that exceeds
 them is a configuration choice, not a vulnerability.
+
+## Triage dispositions
+
+Every security report against Calcite resolves to exactly one of:
+
+* **Valid** — violates P1–P4, or matches an item in
+  [Always a vulnerability](#always-a-vulnerability). Gets a fix. A demonstrated
+  class-loading primitive qualifies on its own (see
+  [Triage rule for class-loading sinks](#triage-rule-for-class-loading-sinks));
+  it need not be chained to end-to-end RCE.
+* **Not a vulnerability (by design)** — matches an item in
+  [Not a vulnerability](#not-a-vulnerability): the os-adapter, an opt-in
+  file/CSV/JSON adapter reading its configured path, third-party driver
+  behavior past the connection, or cross-tenant reads that follow from the
+  embedder's schema exposure. Close with a pointer to this model.
+* **Out of model** — requires a capability the attacker does not have (changing
+  a JVM system property or the classpath), or lands in a layer this model
+  assigns to the host (network transport, TLS, authentication, authorization).
+  Close; redirect to the operator or embedder.
+* **Known limitation** — a [Denial of service](#denial-of-service) gap whose
+  control has not landed yet. Tracked as hardening, not a per-report
+  vulnerability, until the bound exists.
+* **Duplicate** — the same sink or root cause is already tracked (an entry in
+  [Known class-loading sinks]({{ site.baseurl }}/docs/security_known_class_loading_sinks.html),
+  or an open Jira). Link and close.
+* **Model gap** — plausible, but this model does not clearly place it in or out.
+  Escalate to the PMC to decide, then update this document with the ruling so
+  the next report of its kind is no longer a gap.
