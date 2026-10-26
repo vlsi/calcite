@@ -100,6 +100,15 @@ public class FireboltSqlDialect extends SqlDialect {
     return false;
   }
 
+  @Override public void quoteStringLiteral(StringBuilder buf,
+      @Nullable String charsetName, String val) {
+    // Firebolt treats backslash as an escape character inside string literals,
+    // so a literal backslash must be doubled before the base method escapes the
+    // enclosing quote. Otherwise a value ending in a backslash terminates the
+    // literal early and the trailing text is parsed as SQL rather than data.
+    super.quoteStringLiteral(buf, charsetName, escapeBackslash(val));
+  }
+
   @Override public void unparseOffsetFetch(SqlWriter writer, @Nullable SqlNode offset,
       @Nullable SqlNode fetch) {
     unparseFetchUsingLimit(writer, offset, fetch);
@@ -122,7 +131,7 @@ public class FireboltSqlDialect extends SqlDialect {
   }
 
   @Override protected boolean identifierNeedsQuote(String val) {
-    return IDENTIFIER_REGEX.matcher(val).matches()
+    return !IDENTIFIER_REGEX.matcher(val).matches()
         || RESERVED_KEYWORDS.contains(val.toUpperCase(Locale.ROOT));
   }
 

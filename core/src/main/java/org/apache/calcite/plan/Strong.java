@@ -358,7 +358,7 @@ public class Strong {
 
     map.put(SqlKind.DIVIDE, Policy.ANY);
     map.put(SqlKind.CAST, Policy.ANY);
-    map.put(SqlKind.REINTERPRET, Policy.ANY);
+    map.put(SqlKind.REINTERPRET, Policy.ANY);  // deprecated, kept until removed
     map.put(SqlKind.TRIM, Policy.ANY);
     map.put(SqlKind.LTRIM, Policy.ANY);
     map.put(SqlKind.RTRIM, Policy.ANY);
@@ -370,6 +370,7 @@ public class Strong {
     map.put(SqlKind.TIMESTAMP_ADD, Policy.ANY);
     map.put(SqlKind.TIMESTAMP_DIFF, Policy.ANY);
     map.put(SqlKind.ITEM, Policy.ANY);
+    map.put(SqlKind.COLON, Policy.ANY);
 
     // Assume that any other expressions cannot be simplified.
     for (SqlKind k

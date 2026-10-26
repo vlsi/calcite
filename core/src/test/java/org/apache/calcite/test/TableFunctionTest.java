@@ -16,19 +16,27 @@
  */
 package org.apache.calcite.test;
 
+import org.apache.calcite.DataContext;
 import org.apache.calcite.config.CalciteConnectionProperty;
 import org.apache.calcite.jdbc.CalciteConnection;
+import org.apache.calcite.linq4j.Enumerable;
+import org.apache.calcite.linq4j.Linq4j;
 import org.apache.calcite.linq4j.tree.Primitive;
+import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.schema.ScannableTable;
 import org.apache.calcite.schema.SchemaPlus;
 import org.apache.calcite.schema.Table;
 import org.apache.calcite.schema.TableFunction;
 import org.apache.calcite.schema.impl.AbstractSchema;
+import org.apache.calcite.schema.impl.AbstractTable;
 import org.apache.calcite.schema.impl.TableFunctionImpl;
+import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.validate.SqlConformanceEnum;
 import org.apache.calcite.util.Smalls;
 import org.apache.calcite.util.TestUtil;
 
+import org.checkerframework.checker.nullness.qual.Nullable;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
@@ -59,6 +67,9 @@ class TableFunctionTest {
     final String m = Smalls.MULTIPLICATION_TABLE_METHOD.getName();
     final String m2 = Smalls.FIBONACCI_TABLE_METHOD.getName();
     final String m3 = Smalls.FIBONACCI_LIMIT_TABLE_METHOD.getName();
+    final String m4 = Smalls.SCALAR_QUERY_ARGUMENTS_TABLE_METHOD.getName();
+    final String m5 =
+        Smalls.SCALAR_QUERY_ARGUMENTS_TABLE_WITHOUT_COLUMN_METHOD.getName();
     return CalciteAssert.model("{\n"
         + "  version: '1.0',\n"
         + "   schemas: [\n"
@@ -77,6 +88,14 @@ class TableFunctionTest {
         + "           name: 'fibonacci2',\n"
         + "           className: '" + c + "',\n"
         + "           methodName: '" + m3 + "'\n"
+        + "         }, {\n"
+        + "           name: 'scalar_query_arguments',\n"
+        + "           className: '" + c + "',\n"
+        + "           methodName: '" + m4 + "'\n"
+        + "         }, {\n"
+        + "           name: 'scalar_query_arguments_without_column',\n"
+        + "           className: '" + c + "',\n"
+        + "           methodName: '" + m5 + "'\n"
         + "         }\n"
         + "       ]\n"
         + "     }\n"
@@ -182,6 +201,60 @@ class TableFunctionTest {
         + "S=xyz\n"
         + "S=generate(w=5, h=3, s=1)\n";
     assertThat(CalciteAssert.toString(resultSet), is(result));
+  }
+
+  /** Tests set operations between one-column table functions and tables. */
+  @Test void testOneColumnTableFunctionSetOperations() throws SQLException {
+    try (Connection connection = DriverManager.getConnection("jdbc:calcite:");
+         Statement statement = connection.createStatement()) {
+      final SchemaPlus schema = connection.unwrap(CalciteConnection.class)
+          .getRootSchema().add("s", new AbstractSchema());
+      schema.add("numbers_fn", TableFunctionImpl.create(NumbersTable.class, "numbers"));
+      schema.add("numbers_table", new NumbersTable(2, 3));
+
+      final String function = "SELECT n FROM TABLE(\"s\".\"numbers_fn\"())";
+      final String table = "SELECT n FROM \"s\".\"numbers_table\"";
+      assertThat(CalciteAssert.toString(statement.executeQuery(function + " EXCEPT " + table)),
+          is("N=1\n"));
+      assertThat(CalciteAssert.toString(statement.executeQuery(table + " EXCEPT " + function)),
+          is("N=3\n"));
+      assertThat(
+          CalciteAssert.toString(
+              statement.executeQuery(function + " UNION " + table + " ORDER BY n")),
+          is("N=1\nN=2\nN=3\n"));
+      assertThat(
+          CalciteAssert.toString(
+              statement.executeQuery(table + " UNION " + function + " ORDER BY n")),
+          is("N=1\nN=2\nN=3\n"));
+      assertThat(CalciteAssert.toString(statement.executeQuery(function + " INTERSECT " + table)),
+          is("N=2\n"));
+      assertThat(CalciteAssert.toString(statement.executeQuery(table + " INTERSECT " + function)),
+          is("N=2\n"));
+    }
+  }
+
+  /** A one-column table whose rows are arrays, used as a table and a function. */
+  public static class NumbersTable extends AbstractTable implements ScannableTable {
+    private final Object[][] rows;
+
+    NumbersTable(int... values) {
+      rows = new Object[values.length][1];
+      for (int i = 0; i < values.length; i++) {
+        rows[i][0] = values[i];
+      }
+    }
+
+    public static ScannableTable numbers() {
+      return new NumbersTable(1, 2);
+    }
+
+    @Override public RelDataType getRowType(RelDataTypeFactory typeFactory) {
+      return typeFactory.builder().add("N", SqlTypeName.INTEGER).build();
+    }
+
+    @Override public Enumerable<@Nullable Object[]> scan(DataContext root) {
+      return Linq4j.asEnumerable(rows);
+    }
   }
 
   /** As {@link #testScannableTableFunction()} but with named parameters. */
@@ -398,6 +471,139 @@ class TableFunctionTest {
             "row_name=row 0; c1=101; c2=102",
             "row_name=row 1; c1=102; c2=104",
             "row_name=row 2; c1=103; c2=106");
+  }
+
+  @Test void testTableFunctionWithScalarQueryLiteralAndColumnArguments() {
+    final String sql = "select d.n as outer_value,\n"
+        + "  f.\"scalar_value\" as scalar_value,\n"
+        + "  f.\"literal_value\" as literal_value,\n"
+        + "  f.\"column_value\" as column_value\n"
+        + "from (values (100), (200)) as d(n)\n"
+        + "cross join lateral table(\"s\".\"scalar_query_arguments\"(\n"
+        + "  (select 10), 20, d.n)) as f";
+    with().query(sql)
+        .returnsUnordered(
+            "OUTER_VALUE=100; SCALAR_VALUE=10; LITERAL_VALUE=20; COLUMN_VALUE=100",
+            "OUTER_VALUE=200; SCALAR_VALUE=10; LITERAL_VALUE=20; COLUMN_VALUE=200");
+  }
+
+  @Test void testTableFunctionWithScalarQueriesAndColumnArguments() {
+    final String sql = "select d.n as outer_value,\n"
+        + "  f.\"scalar_value\" as scalar_value,\n"
+        + "  f.\"literal_value\" as literal_value,\n"
+        + "  f.\"column_value\" as column_value\n"
+        + "from (values (100), (200)) as d(n)\n"
+        + "cross join lateral table(\"s\".\"scalar_query_arguments\"(\n"
+        + "  (select 10), (select 20), d.n)) as f";
+    with().query(sql)
+        .returnsUnordered(
+            "OUTER_VALUE=100; SCALAR_VALUE=10; LITERAL_VALUE=20; COLUMN_VALUE=100",
+            "OUTER_VALUE=200; SCALAR_VALUE=10; LITERAL_VALUE=20; COLUMN_VALUE=200");
+  }
+
+  @Test void testTableFunctionWithScalarQueryAndLiteralArguments() {
+    final String sql = "select f.\"scalar_value\" as scalar_value,\n"
+        + "  f.\"literal_value\" as literal_value\n"
+        + "from table(\"s\".\"scalar_query_arguments_without_column\"(\n"
+        + "  (select 10), 20)) as f";
+    with().query(sql)
+        .returnsUnordered("SCALAR_VALUE=10; LITERAL_VALUE=20");
+  }
+
+  @Test void testTableFunctionWithEmptyScalarQuery() {
+    final String sql = "select f.\"scalar_value\" as scalar_value,\n"
+        + "  f.\"literal_value\" as literal_value\n"
+        + "from table(\"s\".\"scalar_query_arguments_without_column\"(\n"
+        + "  (select v from (values (10)) as q(v) where v < 0), 20)) as f";
+    with().query(sql)
+        .returnsUnordered("SCALAR_VALUE=null; LITERAL_VALUE=20");
+  }
+
+  @Test void testTableFunctionWithMultiRowScalarQuery() {
+    final String sql = "select *\n"
+        + "from table(\"s\".\"scalar_query_arguments_without_column\"(\n"
+        + "  (select v from (values (10), (20)) as q(v)), 20))";
+    with().query(sql)
+        .throws_("more than one value in agg SINGLE_VALUE");
+  }
+
+  @Test void testTableFunctionWithCorrelatedScalarQueryAndLiteralArguments() {
+    final String sql = "select d.n as outer_value,\n"
+        + "  f.\"scalar_value\" as scalar_value,\n"
+        + "  f.\"literal_value\" as literal_value\n"
+        + "from (values (100), (200)) as d(n)\n"
+        + "cross join lateral table(\"s\".\"scalar_query_arguments_without_column\"(\n"
+        + "  (select d.n + 1), 20)) as f";
+    with().query(sql)
+        .returnsUnordered(
+            "OUTER_VALUE=100; SCALAR_VALUE=101; LITERAL_VALUE=20",
+            "OUTER_VALUE=200; SCALAR_VALUE=201; LITERAL_VALUE=20");
+  }
+
+  @Test void
+      testTableFunctionWithCorrelatedScalarQueryLiteralAndColumnArguments() {
+    final String sql = "select d.n as outer_value,\n"
+        + "  f.\"scalar_value\" as scalar_value,\n"
+        + "  f.\"literal_value\" as literal_value,\n"
+        + "  f.\"column_value\" as column_value\n"
+        + "from (values (100), (200)) as d(n)\n"
+        + "cross join lateral table(\"s\".\"scalar_query_arguments\"(\n"
+        + "  (select d.n + 1), 20, d.n)) as f";
+    with().query(sql)
+        .returnsUnordered(
+            "OUTER_VALUE=100; SCALAR_VALUE=101; LITERAL_VALUE=20; COLUMN_VALUE=100",
+            "OUTER_VALUE=200; SCALAR_VALUE=201; LITERAL_VALUE=20; COLUMN_VALUE=200");
+  }
+
+  @Test void testTableFunctionWithScalarQueryExpressionLiteralAndColumnArguments() {
+    final String sql = "select d.n as outer_value,\n"
+        + "  f.\"scalar_value\" as scalar_value,\n"
+        + "  f.\"literal_value\" as literal_value,\n"
+        + "  f.\"column_value\" as column_value\n"
+        + "from (values (100), (200)) as d(n)\n"
+        + "cross join lateral table(\"s\".\"scalar_query_arguments\"(\n"
+        + "  (select 4) + (select 6), 20, d.n)) as f";
+    with().query(sql)
+        .returnsUnordered(
+            "OUTER_VALUE=100; SCALAR_VALUE=10; LITERAL_VALUE=20; COLUMN_VALUE=100",
+            "OUTER_VALUE=200; SCALAR_VALUE=10; LITERAL_VALUE=20; COLUMN_VALUE=200");
+  }
+
+  @Test void testTableFunctionWithScalarQueryExpressionAndLiteralArguments() {
+    final String sql = "select f.\"scalar_value\" as scalar_value,\n"
+        + "  f.\"literal_value\" as literal_value\n"
+        + "from table(\"s\".\"scalar_query_arguments_without_column\"(\n"
+        + "  (select 4) + (select 6), 20)) as f";
+    with().query(sql)
+        .returnsUnordered("SCALAR_VALUE=10; LITERAL_VALUE=20");
+  }
+
+  @Test void testTableFunctionWithRowScalarQueryLiteralAndColumnArguments() {
+    final String sql = "select d.n as outer_value,\n"
+        + "  f.\"row_value_0\" as row_value_0,\n"
+        + "  f.\"row_value_1\" as row_value_1,\n"
+        + "  f.\"literal_value\" as literal_value,\n"
+        + "  f.\"column_value\" as column_value\n"
+        + "from (values (100), (200)) as d(n)\n"
+        + "cross join lateral table(\"s\".\"scalar_query_arguments\"(\n"
+        + "  (select row(1, 2)), 20, d.n)) as f";
+    with().query(sql)
+        .returnsUnordered(
+            "OUTER_VALUE=100; ROW_VALUE_0=1; ROW_VALUE_1=2; "
+                + "LITERAL_VALUE=20; COLUMN_VALUE=100",
+            "OUTER_VALUE=200; ROW_VALUE_0=1; ROW_VALUE_1=2; "
+                + "LITERAL_VALUE=20; COLUMN_VALUE=200");
+  }
+
+  @Test void testTableFunctionWithRowScalarQueryAndLiteralArguments() {
+    final String sql = "select f.\"row_value_0\" as row_value_0,\n"
+        + "  f.\"row_value_1\" as row_value_1,\n"
+        + "  f.\"literal_value\" as literal_value\n"
+        + "from table(\"s\".\"scalar_query_arguments_without_column\"(\n"
+        + "  (select row(1, 2)), 20)) as f";
+    with().query(sql)
+        .returnsUnordered(
+            "ROW_VALUE_0=1; ROW_VALUE_1=2; LITERAL_VALUE=20");
   }
 
   /** Tests a query with a table function in the FROM clause,

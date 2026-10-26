@@ -224,12 +224,21 @@ public class EnumerableWindow extends Window implements EnumerableRel {
 
       List<AggImpState> aggs = new ArrayList<>();
       List<AggregateCall> aggregateCalls = group.getAggregateCalls(this);
+      final RexImplementorTable implementorTable =
+          RexImplementorTables.of(getCluster());
       for (int aggIdx = 0; aggIdx < aggregateCalls.size(); aggIdx++) {
         AggregateCall call = aggregateCalls.get(aggIdx);
         if (call.ignoreNulls()) {
-          throw new UnsupportedOperationException("IGNORE NULLS not supported");
+          switch (call.getAggregation().getKind()) {
+          case FIRST_VALUE:
+          case LAST_VALUE:
+            // IGNORE NULLS is implemented for these functions below.
+            break;
+          default:
+            throw new UnsupportedOperationException("IGNORE NULLS not supported");
+          }
         }
-        aggs.add(new AggImpState(aggIdx, call, true));
+        aggs.add(new AggImpState(aggIdx, call, true, implementorTable));
       }
 
       // The output from this stage is the input plus the aggregate functions.
@@ -451,6 +460,7 @@ public class EnumerableWindow extends Window implements EnumerableRel {
               hasRows, frameRowCount, partitionRowCount,
               jDecl, inputPhysTypeFinal);
 
+      final RelDataType inputRowType = inputPhysType.getRowType();
       final Function<AggImpState, List<RexNode>> rexArguments = agg -> {
         List<Integer> argList = agg.call.getArgList();
         List<RelDataType> inputTypes =
@@ -464,7 +474,7 @@ public class EnumerableWindow extends Window implements EnumerableRel {
         return args;
       };
 
-      implementAdd(aggs, builder7, resultContextBuilder, rexArguments, jDecl);
+      implementAdd(aggs, builder7, resultContextBuilder, rexArguments, jDecl, inputRowType);
       BlockStatement forBlock = builder7.toBlock();
 
       // Don't run the aggregate function if current row is excluded
@@ -818,6 +828,10 @@ public class EnumerableWindow extends Window implements EnumerableRel {
             @Override public RexWindowExclusion getExclude() {
               return exclusion;
             }
+
+            @Override public boolean ignoreNulls() {
+              return agg.call.ignoreNulls();
+            }
           };
       String aggName = "a" + agg.aggIdx;
       if (CalciteSystemProperty.DEBUG.value()) {
@@ -866,7 +880,8 @@ public class EnumerableWindow extends Window implements EnumerableRel {
       final BlockBuilder builder7,
       final Function<BlockBuilder, WinAggFrameResultContext> frame,
       final Function<AggImpState, List<RexNode>> rexArguments,
-      final DeclarationStatement jDecl) {
+      final DeclarationStatement jDecl,
+      final RelDataType inputRowType) {
     for (final AggImpState agg : aggs) {
       final WinAggAddContext addContext =
           new WinAggAddContextImpl(builder7, requireNonNull(agg.state, "agg.state"), frame) {
@@ -879,7 +894,9 @@ public class EnumerableWindow extends Window implements EnumerableRel {
             }
 
             @Override public @Nullable RexNode rexFilterArgument() {
-              return null; // REVIEW
+              return agg.call.filterArg < 0
+                  ? null
+                  : RexInputRef.of(agg.call.filterArg, inputRowType);
             }
           };
       agg.implementor.implementAdd(requireNonNull(agg.context, "agg.context"), addContext);
@@ -987,6 +1004,7 @@ public class EnumerableWindow extends Window implements EnumerableRel {
     Expression val =
         translator.translate(new RexInputRef(orderKey, keyType), desiredKeyType);
     if (!bound.isCurrentRow()) {
+      final Expression key = val;
       RexNode node = bound.getOffset();
       Expression offs = translator.translate(node);
       // TODO: support date + interval somehow
@@ -994,6 +1012,16 @@ public class EnumerableWindow extends Window implements EnumerableRel {
         val = Expressions.add(val, offs);
       } else {
         val = Expressions.subtract(val, offs);
+      }
+      if (keyType.isNullable()) {
+        // A null key's finite RANGE bounds are the edges of its peer group.
+        // Keep the offset arithmetic inside the non-null branch, and box its
+        // result so that the conditional expression does not unbox null.
+        final Type boundType = Primitive.box(val.getType());
+        val =
+            Expressions.condition(Expressions.equal(key, Expressions.constant(null)),
+            Expressions.constant(null, boundType),
+            EnumUtils.convert(val, boundType));
       }
     }
     return Expressions.call(

@@ -430,6 +430,14 @@ public class SqlDialect {
 
   /** Appends a string literal to a buffer.
    *
+   * <p>The default implementation escapes only the literal quote character
+   * (by doubling it). If the target backend also treats backslash as an
+   * in-string escape character (as MySQL, MariaDB and BigQuery do), the
+   * dialect must override this method and double backslashes as well via
+   * {@link #escapeBackslash(String)}; otherwise a value ending in a
+   * backslash escapes the closing quote, shifts the boundary of the emitted
+   * literal, and changes the structure of the generated statement.
+   *
    * @param buf Buffer
    * @param charsetName Character set name, e.g. "utf16", or null
    * @param val String value
@@ -443,6 +451,13 @@ public class SqlDialect {
     buf.append(literalQuoteString);
     buf.append(val.replace(literalEndQuoteString, literalEscapedQuote));
     buf.append(literalEndQuoteString);
+  }
+
+  /** Doubles every backslash in {@code val}, for dialects whose backend
+   * treats {@code \} as an in-string escape character (e.g. MySQL,
+   * MariaDB, BigQuery). */
+  protected static String escapeBackslash(String val) {
+    return val.replace("\\", "\\\\");
   }
 
   public void unparseCall(SqlWriter writer, SqlCall call, int leftPrec,
@@ -489,9 +504,9 @@ public class SqlDialect {
   public void unparseSqlDatetimeArithmetic(SqlWriter writer,
       SqlCall call, SqlKind sqlKind, int leftPrec, int rightPrec) {
     final SqlWriter.Frame frame = writer.startList("(", ")");
-    call.operand(0).unparse(writer, leftPrec, rightPrec);
+    call.operand(0).unparse(writer, leftPrec, call.getOperator().getLeftPrec());
     writer.sep((SqlKind.PLUS == sqlKind) ? "+" : "-");
-    call.operand(1).unparse(writer, leftPrec, rightPrec);
+    call.operand(1).unparse(writer, call.getOperator().getRightPrec(), rightPrec);
     writer.endList(frame);
     // Only two parameters are present normally.
     // Checking parameter count to prevent errors.
@@ -570,6 +585,15 @@ public class SqlDialect {
   /** Converts table scan hints. The default implementation suppresses all hints. */
   public void unparseTableScanHints(SqlWriter writer,
       SqlNodeList hints, int leftPrec, int rightPrec) {
+  }
+
+  /** Converts a UUID literal to a SQL string. The default implementation
+   * returns strings such as
+   * <code>UUID '123e4567-e89b-12d3-a456-426655440000'</code>. A dialect whose
+   * product spells it differently should override this method. */
+  public void unparseUuidLiteral(SqlWriter writer,
+      SqlUuidLiteral literal, int leftPrec, int rightPrec) {
+    writer.literal(literal.toString());
   }
 
   /**
@@ -1071,7 +1095,7 @@ public class SqlDialect {
       final SqlWriter.Frame offsetFrame =
           writer.startList(SqlWriter.FrameTypeEnum.OFFSET);
       writer.keyword("OFFSET");
-      offset.unparse(writer, -1, -1);
+      unparseOffsetExpression(writer, offset);
       writer.keyword("ROWS");
       writer.endList(offsetFrame);
     }
@@ -1081,23 +1105,65 @@ public class SqlDialect {
           writer.startList(SqlWriter.FrameTypeEnum.FETCH);
       writer.keyword("FETCH");
       writer.keyword("NEXT");
-      fetch.unparse(writer, -1, -1);
+      unparseFetchExpression(writer, fetch);
       writer.keyword("ROWS");
       writer.keyword("ONLY");
       writer.endList(fetchFrame);
     }
   }
 
+  private static void unparseOffsetExpression(SqlWriter writer, SqlNode offset) {
+    unparseExpression(writer, offset);
+  }
+
+  private static void unparseFetchExpression(SqlWriter writer, SqlNode fetch) {
+    if (fetch instanceof SqlLiteral
+        || fetch instanceof SqlDynamicParam) {
+      fetch.unparse(writer, -1, -1);
+      return;
+    }
+    final SqlWriter.Frame expressionFrame = writer.startList("(", ")");
+    unparseExpression(writer, fetch);
+    writer.endList(expressionFrame);
+  }
+
+  private static void unparseExpression(SqlWriter writer, SqlNode node) {
+    if (node instanceof SqlCall) {
+      writer.getDialect().unparseCall(writer, (SqlCall) node, 0, 0);
+    } else {
+      node.unparse(writer, 0, 0);
+    }
+  }
+
   /** Unparses offset/fetch using "LIMIT fetch OFFSET offset" syntax. */
   protected static void unparseFetchUsingLimit(SqlWriter writer, @Nullable SqlNode offset,
       @Nullable SqlNode fetch) {
+    unparseFetchUsingLimit(writer, offset, fetch, false);
+  }
+
+  /** Unparses offset/fetch using "LIMIT fetch OFFSET offset" syntax,
+   * optionally allowing scalar expressions as fetch and offset. */
+  protected static void unparseFetchUsingLimit(SqlWriter writer, @Nullable SqlNode offset,
+      @Nullable SqlNode fetch, boolean allowExpression) {
     checkArgument(fetch != null || offset != null);
-    unparseLimit(writer, fetch);
-    unparseOffset(writer, offset);
+    unparseLimit(writer, fetch, allowExpression);
+    unparseOffset(writer, offset, allowExpression);
   }
 
   protected static void unparseLimit(SqlWriter writer, @Nullable SqlNode fetch) {
+    unparseLimit(writer, fetch, false);
+  }
+
+  private static void unparseLimit(SqlWriter writer, @Nullable SqlNode fetch,
+      boolean allowExpression) {
     if (fetch != null) {
+      if (!allowExpression
+          && !(fetch instanceof SqlLiteral)
+          && !(fetch instanceof SqlDynamicParam)) {
+        throw new IllegalArgumentException(
+            "LIMIT dialect does not support FETCH expressions that cannot "
+                + "be reduced to a literal");
+      }
       writer.newlineAndIndent();
       final SqlWriter.Frame fetchFrame =
           writer.startList(SqlWriter.FrameTypeEnum.FETCH);
@@ -1108,7 +1174,19 @@ public class SqlDialect {
   }
 
   protected static void unparseOffset(SqlWriter writer, @Nullable SqlNode offset) {
+    unparseOffset(writer, offset, false);
+  }
+
+  private static void unparseOffset(SqlWriter writer, @Nullable SqlNode offset,
+      boolean allowExpression) {
     if (offset != null) {
+      if (!allowExpression
+          && !(offset instanceof SqlLiteral)
+          && !(offset instanceof SqlDynamicParam)) {
+        throw new IllegalArgumentException(
+            "LIMIT dialect does not support OFFSET expressions that cannot "
+                + "be reduced to a literal");
+      }
       writer.newlineAndIndent();
       final SqlWriter.Frame offsetFrame =
           writer.startList(SqlWriter.FrameTypeEnum.OFFSET);
@@ -1825,4 +1903,22 @@ public class SqlDialect {
           conformance, nullCollation, dataTypeSystem, jethroInfo);
     }
   }
+
+  /**
+   * Returns whether this dialect requires wrapping a nested JOIN in a subquery with <b>mandatory
+   * aliases</b> for both the table and its projected columns.
+   *
+   * <p>Example for ClickHouse (returns true):
+   * <pre>{@code
+   * // Before: ... LEFT JOIN (dept d1 INNER JOIN dept d2 ON ...) AS j ON ...
+   * // After:  ... LEFT JOIN (
+   * //           SELECT d1.deptno AS deptno, d2.loc AS loc ...
+   * //           FROM dept d1 INNER JOIN dept d2 ON ...
+   * //         ) AS t0 ON ...
+   * }</pre>
+   */
+  public boolean shouldWrapNestedJoin(RelNode relNode) {
+    return false;
+  }
+
 }

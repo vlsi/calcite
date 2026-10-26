@@ -64,9 +64,11 @@ import org.apache.calcite.sql.type.InferTypes;
 import org.apache.calcite.sql.type.OperandTypes;
 import org.apache.calcite.sql.type.ReturnTypes;
 import org.apache.calcite.sql.type.SqlOperandCountRanges;
+import org.apache.calcite.sql.type.SqlOperandTypeChecker;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeFamily;
 import org.apache.calcite.sql.type.SqlTypeName;
+import org.apache.calcite.sql.type.SqlTypeTransforms;
 import org.apache.calcite.sql.util.ReflectiveSqlOperatorTable;
 import org.apache.calcite.sql.validate.SqlConformance;
 import org.apache.calcite.sql.validate.SqlConformanceEnum;
@@ -121,16 +123,20 @@ public class SqlStdOperatorTable extends ReflectiveSqlOperatorTable {
       new SqlSetOperator("UNION ALL", SqlKind.UNION, 12, true);
 
   public static final SqlSetOperator EXCEPT =
-      new SqlSetOperator("EXCEPT", SqlKind.EXCEPT, 12, false);
+      new SqlSetOperator("EXCEPT", SqlKind.EXCEPT, 12, false,
+          ReturnTypes.LEAST_RESTRICTIVE_EXCEPT, null, OperandTypes.SET_OP);
 
   public static final SqlSetOperator EXCEPT_ALL =
-      new SqlSetOperator("EXCEPT ALL", SqlKind.EXCEPT, 12, true);
+      new SqlSetOperator("EXCEPT ALL", SqlKind.EXCEPT, 12, true,
+          ReturnTypes.LEAST_RESTRICTIVE_EXCEPT, null, OperandTypes.SET_OP);
 
   public static final SqlSetOperator INTERSECT =
-      new SqlSetOperator("INTERSECT", SqlKind.INTERSECT, 14, false);
+      new SqlSetOperator("INTERSECT", SqlKind.INTERSECT, 14, false,
+          ReturnTypes.LEAST_RESTRICTIVE_INTERSECT, null, OperandTypes.SET_OP);
 
   public static final SqlSetOperator INTERSECT_ALL =
-      new SqlSetOperator("INTERSECT ALL", SqlKind.INTERSECT, 14, true);
+      new SqlSetOperator("INTERSECT ALL", SqlKind.INTERSECT, 14, true,
+          ReturnTypes.LEAST_RESTRICTIVE_INTERSECT, null, OperandTypes.SET_OP);
 
   /**
    * The {@code MULTISET UNION DISTINCT} operator.
@@ -1023,7 +1029,7 @@ public class SqlStdOperatorTable extends ReflectiveSqlOperatorTable {
           80,
           ReturnTypes.ARG0,
           InferTypes.RETURN_TYPE,
-          OperandTypes.NUMERIC_OR_INTERVAL);
+          OperandTypes.SIGNED_OR_INTERVAL);
 
   /**
    * Checked version of prefix arithmetic minus operator, '<code>-</code>'.
@@ -1120,7 +1126,9 @@ public class SqlStdOperatorTable extends ReflectiveSqlOperatorTable {
    */
   public static final SqlBasicAggFunction ARG_MAX =
       SqlBasicAggFunction.create("ARG_MAX", SqlKind.ARG_MAX,
-          ReturnTypes.ARG0_NULLABLE_IF_EMPTY, OperandTypes.ANY_COMPARABLE)
+          ReturnTypes.ARG0_NULLABLE_IF_EMPTY
+              .andThen(SqlTypeTransforms.TO_NULLABLE),
+          OperandTypes.ANY_COMPARABLE)
           .withGroupOrder(Optionality.FORBIDDEN)
           .withFunctionType(SqlFunctionCategory.SYSTEM);
 
@@ -1129,7 +1137,9 @@ public class SqlStdOperatorTable extends ReflectiveSqlOperatorTable {
    */
   public static final SqlBasicAggFunction ARG_MIN =
       SqlBasicAggFunction.create("ARG_MIN", SqlKind.ARG_MIN,
-              ReturnTypes.ARG0_NULLABLE_IF_EMPTY, OperandTypes.ANY_COMPARABLE)
+          ReturnTypes.ARG0_NULLABLE_IF_EMPTY
+              .andThen(SqlTypeTransforms.TO_NULLABLE),
+          OperandTypes.ANY_COMPARABLE)
           .withGroupOrder(Optionality.FORBIDDEN)
           .withFunctionType(SqlFunctionCategory.SYSTEM);
 
@@ -1364,6 +1374,29 @@ public class SqlStdOperatorTable extends ReflectiveSqlOperatorTable {
       new SqlBitOpAggFunction(SqlKind.BIT_XOR);
 
   /**
+   * Operand type checker shared by the left shift operator ({@code <<}) and its
+   * function form ({@code LEFTSHIFT}). The first operand is the value being
+   * shifted (integer, binary or unsigned numeric) and the second is the integer
+   * shift amount.
+   */
+  private static final SqlOperandTypeChecker SHIFT_OPERAND_TYPE_CHECKER =
+      OperandTypes.INTEGER_INTEGER
+          .or(OperandTypes.family(SqlTypeFamily.BINARY, SqlTypeFamily.INTEGER))
+          .or(OperandTypes.family(SqlTypeFamily.UNSIGNED_NUMERIC, SqlTypeFamily.INTEGER));
+
+  /**
+   * Operand type checker for the right shift operator ({@code >>}) and its
+   * function form ({@code RIGHTSHIFT}). Like {@link #SHIFT_OPERAND_TYPE_CHECKER}
+   * but the value being shifted may only be integer or unsigned numeric, not
+   * binary. Binary right shift is intentionally excluded until the endianness of
+   * bitwise shifts on {@code BINARY}/{@code VARBINARY} is settled; see
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7651">[CALCITE-7651]</a>.
+   */
+  private static final SqlOperandTypeChecker NON_BINARY_SHIFT_OPERAND_TYPE_CHECKER =
+      OperandTypes.INTEGER_INTEGER
+          .or(OperandTypes.family(SqlTypeFamily.UNSIGNED_NUMERIC, SqlTypeFamily.INTEGER));
+
+  /**
    * <code>{@code <<}</code> (left shift) operator.
    */
   public static final SqlBinaryOperator BIT_LEFT_SHIFT =
@@ -1374,10 +1407,7 @@ public class SqlStdOperatorTable extends ReflectiveSqlOperatorTable {
           true,
           ReturnTypes.ARG0_NULLABLE,
           InferTypes.FIRST_KNOWN,
-          OperandTypes.or(
-              OperandTypes.family(SqlTypeFamily.INTEGER, SqlTypeFamily.INTEGER),
-              OperandTypes.family(SqlTypeFamily.BINARY, SqlTypeFamily.INTEGER),
-              OperandTypes.family(SqlTypeFamily.UNSIGNED_NUMERIC, SqlTypeFamily.INTEGER)));
+          SHIFT_OPERAND_TYPE_CHECKER);
 
   /**
    * left shift function.
@@ -1387,10 +1417,30 @@ public class SqlStdOperatorTable extends ReflectiveSqlOperatorTable {
           "LEFTSHIFT",
           SqlKind.OTHER_FUNCTION,
           ReturnTypes.ARG0_NULLABLE,
-          OperandTypes.or(
-              OperandTypes.family(SqlTypeFamily.INTEGER, SqlTypeFamily.INTEGER),
-              OperandTypes.family(SqlTypeFamily.BINARY, SqlTypeFamily.INTEGER),
-              OperandTypes.family(SqlTypeFamily.UNSIGNED_NUMERIC, SqlTypeFamily.INTEGER)));
+          SHIFT_OPERAND_TYPE_CHECKER);
+
+  /**
+   * <code>{@code >>}</code> (right shift) operator.
+   */
+  public static final SqlBinaryOperator BIT_RIGHT_SHIFT =
+      new SqlBinaryOperator(
+          ">>",
+          SqlKind.OTHER,
+          32,                                     // Standard shift operator precedence
+          true,
+          ReturnTypes.ARG0_NULLABLE,
+          InferTypes.FIRST_KNOWN,
+          NON_BINARY_SHIFT_OPERAND_TYPE_CHECKER);
+
+  /**
+   * right shift function.
+   */
+  public static final SqlFunction RIGHTSHIFT =
+      SqlBasicFunction.create(
+          "RIGHTSHIFT",
+          SqlKind.OTHER_FUNCTION,
+          ReturnTypes.ARG0_NULLABLE,
+          NON_BINARY_SHIFT_OPERAND_TYPE_CHECKER);
 
   //-------------------------------------------------------------
   // WINDOW Aggregate Functions
@@ -1741,7 +1791,14 @@ public class SqlStdOperatorTable extends ReflectiveSqlOperatorTable {
    * it accepts one operand and stores the target type as the return type. It
    * performs an overflow check if it has <i>any</i> second operand, whether
    * true or not.
+   *
+   * @deprecated The semantics of REINTERPRET depend on the physical
+   * representation of values, which only an adapter or calling convention
+   * knows; a logical plan must not contain this operator.
+   * The enumerable convention does not implement it.
+   * Use {@link #CAST} instead.
    */
+  @Deprecated // to be removed before 2.0
   public static final SqlSpecialOperator REINTERPRET =
       new SqlSpecialOperator("Reinterpret", SqlKind.REINTERPRET) {
         @Override public SqlOperandCountRange getOperandCountRange() {
@@ -2312,6 +2369,11 @@ public class SqlStdOperatorTable extends ReflectiveSqlOperatorTable {
       new SqlItemOperator("ITEM", OperandTypes.ARRAY_OR_MAP_OR_VARIANT, 1, true);
 
   /**
+   * Colon operator, '<code>:</code>', used for variant path access.
+   */
+  public static final SqlOperator COLON = new SqlColonOperator();
+
+  /**
    * The ARRAY Value Constructor. e.g. "<code>ARRAY[1, 2, 3]</code>".
    */
   public static final SqlArrayValueConstructor ARRAY_VALUE_CONSTRUCTOR =
@@ -2391,7 +2453,7 @@ public class SqlStdOperatorTable extends ReflectiveSqlOperatorTable {
       new SqlInternalOperator(
           "$SCALAR_QUERY",
           SqlKind.SCALAR_QUERY,
-          0,
+          100, // High precedence to prevent SqlCall from adding extra parentheses
           false,
           ReturnTypes.RECORD_TO_SCALAR,
           null,
@@ -2401,9 +2463,15 @@ public class SqlStdOperatorTable extends ReflectiveSqlOperatorTable {
             SqlCall call,
             int leftPrec,
             int rightPrec) {
-          final SqlWriter.Frame frame = writer.startList("(", ")");
-          call.operand(0).unparse(writer, 0, 0);
-          writer.endList(frame);
+          final SqlNode operand = call.operand(0);
+          if (operand.getKind() == SqlKind.SELECT) {
+            operand.unparse(writer, leftPrec, rightPrec);
+          } else {
+            final SqlWriter.Frame frame =
+                writer.startList(SqlWriter.FrameTypeEnum.SUB_QUERY, "(", ")");
+            operand.unparse(writer, 0, 0);
+            writer.endList(frame);
+          }
         }
 
         @Override public boolean argumentMustBeScalar(int ordinal) {
@@ -2477,7 +2545,8 @@ public class SqlStdOperatorTable extends ReflectiveSqlOperatorTable {
    * The LISTAGG operator. String aggregator function.
    */
   public static final SqlAggFunction LISTAGG =
-      new SqlListaggAggFunction(SqlKind.LISTAGG, ReturnTypes.ARG0_NULLABLE);
+      new SqlListaggAggFunction(SqlKind.LISTAGG,
+          ReturnTypes.ARG0_NULLABLE_IF_EMPTY);
 
   /**
    * The FUSION operator. Multiset aggregator function.

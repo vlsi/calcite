@@ -30,6 +30,7 @@ import org.apache.calcite.linq4j.function.NullableDoubleFunction1;
 import org.apache.calcite.linq4j.function.NullableFloatFunction1;
 import org.apache.calcite.linq4j.function.NullableIntegerFunction1;
 import org.apache.calcite.linq4j.function.NullableLongFunction1;
+import org.apache.calcite.linq4j.function.NullablePredicate2;
 import org.apache.calcite.linq4j.function.Predicate1;
 import org.apache.calcite.linq4j.function.Predicate2;
 
@@ -547,6 +548,32 @@ public interface ExtendedEnumerable<TSource> {
   <C extends Collection<? super TSource>> C removeAll(C sink);
 
   /**
+   * Updates rows of {@code sink} based on the contents of this sequence.
+   *
+   * <p>For each element {@code x} of this sequence, {@code sourceKeySelector}
+   * computes a key, and {@code sourceTransform} computes a replacement row.
+   * Then for each element {@code y} of {@code sink}, {@code sinkKeySelector}
+   * computes a key; if it matches a key produced from this sequence, {@code y}
+   * is replaced (in place) with the corresponding replacement row.
+   *
+   * <p>The sink is a {@link List} so that elements can be replaced
+   * in place while preserving order.
+   *
+   * @param sink              List to be updated in place
+   * @param sinkKeySelector   Function that extracts a key from a sink row
+   * @param sourceKeySelector Function that extracts a key from a source row
+   * @param transform         Function that produces the replacement row from a
+   *                          source row
+   * @param <TKey>            Key type
+   * @return Number of rows replaced
+   */
+  <TKey> long update(
+      List<TSource> sink,
+      Function1<TSource, TKey> sinkKeySelector,
+      Function1<TSource, TKey> sourceKeySelector,
+      Function1<TSource, TSource> transform);
+
+  /**
    * Correlates the elements of two sequences based on
    * matching keys. The default equality comparer is used to compare
    * keys.
@@ -645,6 +672,71 @@ public interface ExtendedEnumerable<TSource> {
       EqualityComparer<TKey> comparer,
       boolean generateNullsOnLeft, boolean generateNullsOnRight,
       Predicate2<TSource, TInner> predicate);
+
+  /**
+   * Mark each row of the current enumerable to see if it has a join partner in the
+   * <code>inner</code>. Whether a join partner exists depends on:
+   * - matching keys
+   * - non-equi predicate (if provided)
+   *
+   * <p> Refer to <a href="https://dl.gi.de/items/c5f7c49f-1572-490e-976a-cc4292519bdd">
+   *   The Complete Story of Joins (in HyPer)</a>.
+   *
+   * @param inner                       Inner enumerable
+   * @param outerKeyNullAwareSelector   Function that extracts keys from the current enumerable
+   *                                    (return NULL when a not null-safe key has a NULL value)
+   * @param innerKeyNullAwareSelector   Function that extracts keys from the inner enumerable
+   *                                    (return NULL when a not null-safe key has a NULL value)
+   * @param outerNullSafeKeySelector    Function that extracts null-safe keys from the current
+   *                                    enumerable
+   * @param innerNullSafeKeySelector    Function that extracts null-safe keys from the inner
+   *                                    enumerable
+   * @param atMostOneNotNullSafeKey     True when there is at most one not null-safe key in join
+   *                                    keys
+   * @param resultSelector              Function that concat the row of the current enumerable and
+   *                                    marker
+   * @param comparer                    Function that compares the keys
+   * @param nullSafeComparer            Function that compares the null-safe keys
+   * @param nonEquiPredicate            Non-equi predicate that can return NULL
+   * @param equiPredicate               Equi predicate that can return NULL
+   */
+  <TInner, TKey, TNsKey, TResult> Enumerable<TResult> leftMarkHashJoin(Enumerable<TInner> inner,
+      Function1<TSource, TKey> outerKeyNullAwareSelector,
+      Function1<TInner, TKey> innerKeyNullAwareSelector,
+      Function1<TSource, TNsKey> outerNullSafeKeySelector,
+      Function1<TInner, TNsKey> innerNullSafeKeySelector,
+      boolean atMostOneNotNullSafeKey,
+      Function2<TSource, @Nullable Boolean, TResult> resultSelector,
+      EqualityComparer<TKey> comparer,
+      EqualityComparer<TNsKey> nullSafeComparer,
+      NullablePredicate2<TSource, TInner> nonEquiPredicate,
+      NullablePredicate2<TSource, TInner> equiPredicate);
+
+  /**
+   * The implementation of left mark join based on nested loop.
+   *
+   * @param inner                       Inner enumerable
+   * @param predicate                   Non-equi predicate that can return NULL
+   * @param resultSelector              Function that concat the row of the current enumerable and
+   *                                    marker
+   * @see #leftMarkHashJoin
+   */
+  <TInner, TResult> Enumerable<TResult> leftMarkNestedLoopJoin(Enumerable<TInner> inner,
+      NullablePredicate2<TSource, TInner> predicate,
+      Function2<TSource, @Nullable Boolean, TResult> resultSelector);
+
+  /**
+   * For each row of the current enumerable returns correlated rows where each row
+   * from the inner enumerable satisfies the predicate (correlated LEFT_MARK join).
+   *
+   * @param inner function to generate inner enumerable from outer row
+   * @param predicate predicate that can return NULL
+   * @param resultSelector selector of the result, receives outer row and boolean marker
+   */
+  <TInner, TResult> Enumerable<TResult> correlateLeftMarkJoin(
+      Function1<TSource, Enumerable<TInner>> inner,
+      NullablePredicate2<TSource, TInner> predicate,
+      Function2<TSource, @Nullable Boolean, TResult> resultSelector);
 
   /**
    * For each row of the current enumerable returns the correlated rows
@@ -1004,6 +1096,12 @@ public interface ExtendedEnumerable<TSource> {
   Enumerable<TSource> skip(int count);
 
   /**
+   * Bypasses a specified number of elements in a
+   * sequence and then returns the remaining elements.
+   */
+  Enumerable<TSource> skip(BigDecimal count);
+
+  /**
    * Bypasses elements in a sequence as long as a
    * specified condition is true and then returns the remaining
    * elements.
@@ -1017,6 +1115,14 @@ public interface ExtendedEnumerable<TSource> {
    * predicate function.
    */
   Enumerable<TSource> skipWhile(Predicate2<TSource, Integer> predicate);
+
+  /**
+   * Bypasses elements in a sequence as long as a
+   * specified condition is true and then returns the remaining
+   * elements. The element's index is used in the logic of the
+   * predicate function.
+   */
+  Enumerable<TSource> skipWhileBigDecimal(Predicate2<TSource, BigDecimal> predicate);
 
   /**
    * Computes the sum of the sequence of Decimal values
@@ -1095,6 +1201,12 @@ public interface ExtendedEnumerable<TSource> {
   Enumerable<TSource> take(int count);
 
   /**
+   * Returns a specified number of contiguous elements
+   * from the start of a sequence.
+   */
+  Enumerable<TSource> take(BigDecimal count);
+
+  /**
    * Returns elements from a sequence as long as a
    * specified condition is true.
    */
@@ -1106,6 +1218,13 @@ public interface ExtendedEnumerable<TSource> {
    * logic of the predicate function.
    */
   Enumerable<TSource> takeWhile(Predicate2<TSource, Integer> predicate);
+
+  /**
+   * Returns elements from a sequence as long as a
+   * specified condition is true. The element's index is used in the
+   * logic of the predicate function.
+   */
+  Enumerable<TSource> takeWhileBigDecimal(Predicate2<TSource, BigDecimal> predicate);
 
   /**
    * Creates a {@code Map<TKey, TValue>} from an

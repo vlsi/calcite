@@ -76,6 +76,36 @@ public abstract class BuiltInMetadata {
     }
   }
 
+  /**
+   * Metadata that identifies which columns of its inputs are referenced by a
+   * relational expression.
+   */
+  public interface InputFieldsUsed extends Metadata {
+    MetadataDef<InputFieldsUsed> DEF =
+        MetadataDef.of(InputFieldsUsed.class, InputFieldsUsed.Handler.class,
+            BuiltInMethod.INPUT_FIELDS_USED.method);
+
+    /**
+     * Returns which columns of its inputs are referenced by this relational
+     * expression.
+     *
+     * @return an {@link ImmutableBitSet} where bits correspond to input column
+     *         ordinals from the first input to the last
+     */
+    ImmutableBitSet getInputFieldsUsed();
+
+    /** Handler API. */
+    @FunctionalInterface
+    interface Handler extends MetadataHandler<InputFieldsUsed> {
+      ImmutableBitSet getInputFieldsUsed(RelNode r,
+          RelMetadataQuery mq);
+
+      @Override default MetadataDef<InputFieldsUsed> getDef() {
+        return DEF;
+      }
+    }
+  }
+
   /** Metadata about which combinations of columns are unique identifiers. */
   public interface UniqueKeys extends Metadata {
     MetadataDef<UniqueKeys> DEF =

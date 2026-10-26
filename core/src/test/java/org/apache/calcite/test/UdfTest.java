@@ -190,6 +190,18 @@ class UdfTest {
         + "'\n"
         + "         },\n"
         + "         {\n"
+        + "           name: 'BYTEARRAY',\n"
+        + "           className: '"
+        + Smalls.ByteArrayFunction.class.getName()
+        + "'\n"
+        + "         },\n"
+        + "         {\n"
+        + "           name: 'BYTEARRAY_LENGTH',\n"
+        + "           className: '"
+        + Smalls.ByteArrayLengthFunction.class.getName()
+        + "'\n"
+        + "         },\n"
+        + "         {\n"
         + "           name: 'CHARACTERARRAY',\n"
         + "           className: '"
         + Smalls.CharacterArrayFunction.class.getName()
@@ -233,6 +245,78 @@ class UdfTest {
         "P=110");
     final int after = c.get();
     assertThat(after, is(before + 1));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6245">[CALCITE-6245]
+   * A ValidationError occurs when a named parameter is used on a
+   * ScalarFunction or AggregateFunction</a>. */
+  @Test void testScalarFunctionWithParameter() {
+    final String sql = "select \"adhoc\".my_det_plus(x => \"deptno\", y => 100) as p\n"
+        + "from \"adhoc\".EMPLOYEES";
+    final AtomicInteger c = Smalls.MyDeterministicPlusFunction.INSTANCE_COUNT.get();
+    final int before = c.get();
+    withUdf()
+        .with("caseSensitive", false)
+        .query(sql).returnsUnordered("P=110",
+        "P=120",
+        "P=110",
+        "P=110");
+    final int after = c.get();
+    assertThat(after, is(before + 1));
+    // Unquoted argument names in reverse order: the parser upper-cases 'x' and
+    // 'y' to 'X' and 'Y', and the arguments must still be permuted into the
+    // formal parameter order (x first, y second).
+    final String reverseSql = "select \"adhoc\".my_det_plus(y => 100, x => \"deptno\") as p\n"
+        + "from \"adhoc\".EMPLOYEES";
+    withUdf()
+        .with("caseSensitive", false)
+        .query(reverseSql).returnsUnordered("P=110",
+        "P=120",
+        "P=110",
+        "P=110");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6245">[CALCITE-6245]
+   * A ValidationError occurs when a named parameter is used on a
+   * ScalarFunction or AggregateFunction</a>. */
+  @Test void testAggFunctionWithParameter() {
+    final String empDept = JdbcTest.EmpDeptTableFactory.class.getName();
+    final String sum = Smalls.MyStaticSumFunction.class.getName();
+    final String sum2 = Smalls.MySumFunction.class.getName();
+    final CalciteAssert.AssertThat with = CalciteAssert.model("{\n"
+        + "  version: '1.0',\n"
+        + "   schemas: [\n"
+        + "     {\n"
+        + "       name: 'adhoc',\n"
+        + "       tables: [\n"
+        + "         {\n"
+        + "           name: 'EMPLOYEES',\n"
+        + "           type: 'custom',\n"
+        + "           factory: '" + empDept + "',\n"
+        + "           operand: {'foo': true, 'bar': 345}\n"
+        + "         }\n"
+        + "       ],\n"
+        + "       functions: [\n"
+        + "         {\n"
+        + "           name: 'MY_SUM',\n"
+        + "           className: '" + sum + "'\n"
+        + "         },\n"
+        + "         {\n"
+        + "           name: 'MY_SUM2',\n"
+        + "           className: '" + sum2 + "'\n"
+        + "         }\n"
+        + "       ]\n"
+        + "     }\n"
+        + "   ]\n"
+        + "}")
+        .withDefaultSchema("adhoc")
+        .with("caseSensitive", false);
+    with.withDefaultSchema(null)
+        .query(
+            "select \"adhoc\".my_sum(arg1  => \"deptno\") as p from \"adhoc\".EMPLOYEES\n")
+        .returns("P=50\n");
   }
 
   @Test void testUserDefinedFunctionB() {
@@ -519,6 +603,26 @@ class UdfTest {
         .returns("EXPR$0=0\n");
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7686">[CALCITE-7686]
+   * Named argument should not be resolved as a column</a>.
+   *
+   * <p>The parameter name of a {@code name => value} argument must not be
+   * resolved as a column reference by the roll-up check. */
+  @Test void testUdfArgumentNameInSelectFromTable() {
+    final CalciteAssert.AssertThat with = withUdf();
+    // Named-arg call as a SELECT item over a table scope (unlike VALUES, this
+    // routes through checkRollUpInSelectList). The parameter names "s" and "n"
+    // must not be resolved as columns of the FROM source.
+    with.query("select \"adhoc\".my_left(\"s\" => 'hello', \"n\" => 3) as c\n"
+            + "from \"adhoc\".\"EMPLOYEES\"")
+        .returnsCount(4);
+    // reverse order
+    with.query("select \"adhoc\".my_left(\"n\" => 3, \"s\" => 'hello') as c\n"
+            + "from \"adhoc\".\"EMPLOYEES\"")
+        .returnsCount(4);
+  }
+
   /** Tests calling a user-defined function some of whose parameters are
    * optional. */
   @Test void testUdfArgumentOptional() {
@@ -726,6 +830,49 @@ class UdfTest {
     with.query("select \"adhoc\".my_sum2(\"empid\",0.0) as p\n"
         + "from \"adhoc\".EMPLOYEES\n")
         .returns("P=560\n");
+  }
+
+  /**
+   * Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7686">[CALCITE-7686]
+   * Named argument should not be resolved as a column</a>.
+   *
+   * <p>Tests calling a user-defined aggregate function by named arguments over a
+   * table scope. The parameter names must not be resolved as columns during
+   * sql-to-rel conversion. */
+  @Test void testUserDefinedAggregateFunctionWithNamedArguments() {
+    final String empDept = JdbcTest.EmpDeptTableFactory.class.getName();
+    final String namedSum = Smalls.MyNamedSumFunction.class.getName();
+    final CalciteAssert.AssertThat with = CalciteAssert.model("{\n"
+        + "  version: '1.0',\n"
+        + "   schemas: [\n"
+        + "     {\n"
+        + "       name: 'adhoc',\n"
+        + "       tables: [\n"
+        + "         {\n"
+        + "           name: 'EMPLOYEES',\n"
+        + "           type: 'custom',\n"
+        + "           factory: '" + empDept + "',\n"
+        + "           operand: {'foo': true, 'bar': 345}\n"
+        + "         }\n"
+        + "       ],\n"
+        + "       functions: [\n"
+        + "         {\n"
+        + "           name: 'MY_NAMED_SUM',\n"
+        + "           className: '" + namedSum + "'\n"
+        + "         }\n"
+        + "       ]\n"
+        + "     }\n"
+        + "   ]\n"
+        + "}")
+        .withDefaultSchema("adhoc");
+    // named arguments in physical order
+    with.query("select \"adhoc\".my_named_sum(\"v1\" => \"commission\", \"v2\" => 250) as p\n"
+            + "from \"adhoc\".EMPLOYEES\n")
+        .returns("P=1500\n");
+    // named arguments in reverse order
+    with.query("select \"adhoc\".my_named_sum(\"v2\" => 250, \"v1\" => \"commission\") as p\n"
+            + "from \"adhoc\".EMPLOYEES\n")
+        .returns("P=1500\n");
   }
 
   /** Test for
@@ -1105,6 +1252,29 @@ class UdfTest {
     final String sql2 = "select \"adhoc\".unbase64(cast('" + testBase64
         + "' as varchar)) = x'" + testHex + "' as C\n";
     withUdf().query(sql2).returns("C=true\n");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7187">[CALCITE-7187]
+   * Java UDF byte arrays cannot be mapped to VARBINARY</a>. */
+  @Test void testByteArrayDirectComparison() {
+    final String testString = "test";
+    final String testHex = "74657374";
+
+    final String sql = "values \"adhoc\".bytearray('" + testString + "')";
+    withUdf().query(sql).typeIs("[EXPR$0 VARBINARY]");
+
+    final String sql2 = "select \"adhoc\".bytearray(cast('" + testString
+        + "' as varchar)) = x'" + testHex + "' as C\n";
+    withUdf().query(sql2).returns("C=true\n");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7187">[CALCITE-7187]
+   * Java UDF byte arrays cannot be mapped to VARBINARY</a>. */
+  @Test void testByteArrayParameter() {
+    withUdf().query("values \"adhoc\".bytearray_length(x'74657374')")
+        .returns("EXPR$0=4\n");
   }
 
   /**

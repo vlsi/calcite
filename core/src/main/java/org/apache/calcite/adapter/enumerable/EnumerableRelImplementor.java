@@ -78,6 +78,9 @@ import static java.util.Objects.requireNonNull;
  * operators of {@link EnumerableConvention} calling convention.
  */
 public class EnumerableRelImplementor extends JavaRelImplementor {
+  public static final String FETCH_OFFSET_ROUNDING_POLICY =
+      "_fetchOffsetRoundingPolicy";
+
   public final Map<String, Object> map;
   private final Map<String, RexToLixTranslator.InputGetter> corrVars =
       new HashMap<>();
@@ -486,6 +489,13 @@ public class EnumerableRelImplementor extends JavaRelImplementor {
   @Override public SqlConformance getConformance() {
     return (SqlConformance) map.getOrDefault("_conformance",
         SqlConformanceEnum.DEFAULT);
+  }
+
+  /** Returns the table of code-generation implementors to use, defaulting to
+   * the built-in {@link RexImpTable#instance()}. */
+  public RexImplementorTable getRexImplementorTable() {
+    return (RexImplementorTable) map.getOrDefault("_rexImplementorTable",
+        RexImpTable.INSTANCE);
   }
 
   /** Visitor that finds types in an {@link Expression} tree. */

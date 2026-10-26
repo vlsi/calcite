@@ -146,6 +146,313 @@ select
 
 !ok
 
+# [CALCITE-7311] Support the syntax ROW(*) to create a nested ROW type with all columns
+select row(*) from emp limit 1;
++----------------------------------------------------------+
+| EXPR$0                                                   |
++----------------------------------------------------------+
+| {7369, SMITH, CLERK, 7902, 1980-12-17, 800.00, null, 20} |
++----------------------------------------------------------+
+(1 row)
 
+!ok
+
+select row(emp.*) from emp limit 1;
++----------------------------------------------------------+
+| EXPR$0                                                   |
++----------------------------------------------------------+
+| {7369, SMITH, CLERK, 7902, 1980-12-17, 800.00, null, 20} |
++----------------------------------------------------------+
+(1 row)
+
+!ok
+
+select row(emp.*, dept.*) from emp join dept on emp.deptno = dept.deptno limit 1;
++---------------------------------------------------------------------------------------+
+| EXPR$0                                                                                |
++---------------------------------------------------------------------------------------+
+| {7782, CLARK, MANAGER, 7839, 1981-06-09, 2450.00, null, 10, 10, ACCOUNTING, NEW YORK} |
++---------------------------------------------------------------------------------------+
+(1 row)
+
+!ok
+
+select row(d.*, row(d.*)) from dept d limit 1;
++--------------------------------------------------------+
+| EXPR$0                                                 |
++--------------------------------------------------------+
+| {10, ACCOUNTING, NEW YORK, {10, ACCOUNTING, NEW YORK}} |
++--------------------------------------------------------+
+(1 row)
+
+!ok
+
+# [CALCITE-7364] Support the syntax ROW(T.* EXCLUDE cols) for creating nested ROW values
+select row(* exclude(empno)) from emp order by empno limit 1;
++----------------------------------------------------+
+| EXPR$0                                             |
++----------------------------------------------------+
+| {SMITH, CLERK, 7902, 1980-12-17, 800.00, null, 20} |
++----------------------------------------------------+
+(1 row)
+
+!ok
+
+select row(emp.* exclude(emp.empno)) from emp order by empno limit 1;
++----------------------------------------------------+
+| EXPR$0                                             |
++----------------------------------------------------+
+| {SMITH, CLERK, 7902, 1980-12-17, 800.00, null, 20} |
++----------------------------------------------------+
+(1 row)
+
+!ok
+
+select row(* exclude(empno, mgr)) from emp order by empno limit 1;
++----------------------------------------------+
+| EXPR$0                                       |
++----------------------------------------------+
+| {SMITH, CLERK, 1980-12-17, 800.00, null, 20} |
++----------------------------------------------+
+(1 row)
+
+!ok
+
+select row(emp.* exclude(emp.empno), dept.*) from emp join dept on emp.deptno = dept.deptno order by emp.empno limit 1;
++--------------------------------------------------------------------------+
+| EXPR$0                                                                   |
++--------------------------------------------------------------------------+
+| {SMITH, CLERK, 7902, 1980-12-17, 800.00, null, 20, 20, RESEARCH, DALLAS} |
++--------------------------------------------------------------------------+
+(1 row)
+
+!ok
+
+select row(emp.* exclude(emp.empno), dept.* exclude(dept.deptno)) from emp join dept on emp.deptno = dept.deptno order by emp.empno limit 1;
++----------------------------------------------------------------------+
+| EXPR$0                                                               |
++----------------------------------------------------------------------+
+| {SMITH, CLERK, 7902, 1980-12-17, 800.00, null, 20, RESEARCH, DALLAS} |
++----------------------------------------------------------------------+
+(1 row)
+
+!ok
+
+# [CALCITE-7603] Support ROW constructors that name fields
+select row(1 as a, 'hello' as b);
++------------+
+| EXPR$0     |
++------------+
+| {1, hello} |
++------------+
+(1 row)
+
+!ok
+
+# Test cases for [CALCITE-7606] ROW field names should be used to infer column names
+# Named field access: .field selects a field from a named-field ROW
+select row(1 as a, 'hello' as b).a;
++---+
+| A |
++---+
+| 1 |
++---+
+(1 row)
+
+!ok
+
+# Named field access on a column expression
+select row(empno as eno, ename as en).eno from emp order by empno limit 3;
++------+
+| ENO  |
++------+
+| 7369 |
+| 7499 |
+| 7521 |
++------+
+(3 rows)
+
+!ok
+
+# Nested named-field ROW, and access to inner field
+select row(row(1 as x, 2 as y) as inner_row, 'hello' as name).inner_row.x;
++---+
+| X |
++---+
+| 1 |
++---+
+(1 row)
+
+!ok
+
+# [CALCITE-7602] ROW(*), ROW(T.*) and ROW(T.* EXCLUDE(cols)) preserve original column names
+
+# Field access by original column name on ROW(*)
+select row(*).empno from emp order by empno limit 3;
++-------+
+| EMPNO |
++-------+
+|  7369 |
+|  7499 |
+|  7521 |
++-------+
+(3 rows)
+
+!ok
+
+# Field access by original column name on ROW(T.*)
+select row(emp.*).ename from emp order by empno limit 3;
++-------+
+| ENAME |
++-------+
+| SMITH |
+| ALLEN |
+| WARD  |
++-------+
+(3 rows)
+
+!ok
+
+# Field access on ROW(* EXCLUDE(col)) using a preserved name
+select row(* exclude(empno)).ename from emp order by empno limit 3;
++-------+
+| ENAME |
++-------+
+| SMITH |
+| ALLEN |
+| WARD  |
++-------+
+(3 rows)
+
+!ok
+
+# ROW(T1.*, T2.*): shared column DEPTNO is renamed to DEPTNO0 for the second table
+select row(emp.*, dept.*).deptno0 from emp join dept on emp.deptno = dept.deptno order by emp.empno limit 1;
++---------+
+| DEPTNO0 |
++---------+
+|      20 |
++---------+
+(1 row)
+
+!ok
+
+# [CALCITE-7720] Scalar subquery with ROW ARRAY fails in code generation.
+
+# A scalar sub-query that returns an element of an array of ROW.
+select (select t.arr[1] from (values (0))) as v
+from (select ARRAY[ROW(1, 2)] as arr) as t;
++--------+
+| V      |
++--------+
+| {1, 2} |
++--------+
+(1 row)
+
+!ok
+
+# The same element access, without a sub-query
+select t.arr[1] as v from (select ARRAY[ROW(1, 2)] as arr) as t;
++--------+
+| V      |
++--------+
+| {1, 2} |
++--------+
+(1 row)
+
+!ok
+
+# A CASE whose result is a ROW
+select case when x = 1 then ROW(1, 2) else ROW(3, 4) end as v
+from (values (1)) as t(x);
++--------+
+| V      |
++--------+
+| {1, 2} |
++--------+
+(1 row)
+
+!ok
+
+# A CASE whose result is an element of an array of ROW
+select case when x = 1 then arr[1] else arr[2] end as v
+from (values (1)) as t(x), (select ARRAY[ROW(1, 2), ROW(3, 4)] as arr) as u;
++--------+
+| V      |
++--------+
+| {1, 2} |
++--------+
+(1 row)
+
+!ok
+
+# A field access that returns a ROW
+select t.arr[1]."EXPR$0" as v from (select ARRAY[ROW(ROW(1, 2), 3)] as arr) as t;
++--------+
+| V      |
++--------+
+| {1, 2} |
++--------+
+(1 row)
+
+!ok
+
+# A field access on a ROW column that returns a ROW
+select t.r."EXPR$0" as v from (select ROW(ROW(1, 2), 3) as r) as t;
++--------+
+| V      |
++--------+
+| {1, 2} |
++--------+
+(1 row)
+
+!ok
+
+# A CASE that returns a ROW obtained by a field access
+select case when x = 1 then t.arr[1]."EXPR$0" else ROW(9, 9) end as v
+from (values (1)) as t2(x), (select ARRAY[ROW(ROW(1, 2), 3)] as arr) as t;
++--------+
+| V      |
++--------+
+| {1, 2} |
++--------+
+(1 row)
+
+!ok
+
+# [CALCITE-7721] CAST of a ROW ARRAY element raises NullPointerException.
+select cast(t.arr[1] as row(x integer, y integer)) as v
+from (select ARRAY[ROW(1, 2)] as arr) as t;
++--------+
+| V      |
++--------+
+| {1, 2} |
++--------+
+(1 row)
+
+!ok
+
+# The previous test using COALESCE, which casts both of its arguments to the
+# least restrictive type
+select coalesce(t.arr[1], ROW(9, 9)) as v from (select ARRAY[ROW(1, 2)] as arr) as t;
++--------+
+| V      |
++--------+
+| {1, 2} |
++--------+
+(1 row)
+
+!ok
+
+# COALESCE over a ROW
+select coalesce(t.r, ROW(9, 9)) as v from (select ROW(1, 2) as r) as t;
++--------+
+| V      |
++--------+
+| {1, 2} |
++--------+
+(1 row)
+
+!ok
 
 # End struct.iq

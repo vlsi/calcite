@@ -34,6 +34,7 @@ import org.apache.calcite.sql.SqlFunction;
 import org.apache.calcite.sql.SqlFunctionCategory;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlNodeList;
 import org.apache.calcite.sql.SqlOperator;
@@ -47,6 +48,7 @@ import org.apache.calcite.sql.fun.SqlLibraryOperators;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParseException;
 import org.apache.calcite.sql.parser.SqlParser;
+import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.ArraySqlType;
 import org.apache.calcite.sql.type.OperandTypes;
 import org.apache.calcite.sql.type.ReturnTypes;
@@ -63,6 +65,7 @@ import org.apache.calcite.sql.validate.SqlMonotonicity;
 import org.apache.calcite.sql.validate.SqlValidator;
 import org.apache.calcite.sql.validate.SqlValidatorCatalogReader;
 import org.apache.calcite.sql.validate.SqlValidatorImpl;
+import org.apache.calcite.sql.validate.SqlValidatorScope;
 import org.apache.calcite.sql.validate.SqlValidatorUtil;
 import org.apache.calcite.test.catalog.CountingFactory;
 import org.apache.calcite.test.catalog.MockCatalogReaderSimple;
@@ -70,6 +73,7 @@ import org.apache.calcite.test.catalog.MustFilterMockCatalogReader;
 import org.apache.calcite.testlib.annotations.LocaleEnUs;
 import org.apache.calcite.util.Bug;
 import org.apache.calcite.util.ImmutableBitSet;
+import org.apache.calcite.util.Util;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -101,12 +105,15 @@ import java.util.function.Consumer;
 
 import static org.apache.calcite.test.Matchers.isCharset;
 
+import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.is;
+import static org.hamcrest.CoreMatchers.notNullValue;
 import static org.hamcrest.CoreMatchers.nullValue;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.hasToString;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -299,7 +306,7 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     expr("^TIMESTAMP WITH LOCAL TIME ZONE '12-21-99, 12:30:00'^")
         .fails("(?s).*Illegal TIMESTAMP WITH LOCAL TIME ZONE literal.*");
     expr("^TIMESTAMP WITH TIME ZONE '12-21-99, 12:30:00'^")
-        .fails("(?s).*Illegal TIMESTAMP literal.*");
+        .fails("(?s).*Illegal TIMESTAMP WITH TIME ZONE literal.*");
   }
 
   /**
@@ -540,7 +547,7 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
             + "'<BINARY.1. ARRAY> = <INTEGER ARRAY>'.*");
     expr("^MAP[x'a4', 1] = MAP[1, 1]^")
         .fails("(?s).*Cannot apply '=' to arguments of type "
-            + "'<.BINARY.1., INTEGER. MAP> = <.INTEGER, INTEGER. MAP>'.*");
+            + "'<MAP<BINARY.1., INTEGER>> = <MAP<INTEGER, INTEGER>>'.*");
     expr("^array[x'a4'] = 1^")
         .fails("(?s).*Cannot apply '=' to arguments of type '<BINARY.1. ARRAY> = <INTEGER>'.*");
     expr("^multiset[x'a4'] = multiset[1]^")
@@ -865,8 +872,11 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
   @Test void testConcatFails() {
     wholeExpr("'a'||x'ff'")
         .fails("(?s).*Cannot apply '\\|\\|' to arguments of type "
-            + "'<CHAR.1.> \\|\\| <BINARY.1.>'.*Supported form.s.: "
-            + "'<STRING> \\|\\| <STRING>.*'");
+            + "'<CHAR\\(1\\)> \\|\\| <BINARY\\(1\\)>'.*"
+            + "Supported form\\(s\\): "
+            + "'<CHARACTER> \\|\\| <CHARACTER>'\\s*"
+            + "'<BINARY> \\|\\| <BINARY>'\\s*"
+            + "'<EQUIVALENT_TYPE> \\|\\| <EQUIVALENT_TYPE>'.*");
   }
 
   /** Tests the CONCAT function, which unlike the concat operator ('||') is not
@@ -878,6 +888,17 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     s.withExpr("concat('a', 'b')").ok();
     s.withExpr("concat(x'12', x'34')").ok();
     s.withExpr("concat(_UTF16'a', _UTF16'b', _UTF16'c')").ok();
+    // Test case for [CALCITE-7063]
+    // Result type inferred for CONCAT_FUNCTION is incorrect for BINARY arguments
+    // The PostgreSQL variant produces a character result; binary arguments
+    // are implicitly cast to character strings
+    s.withExpr("concat(x'12', x'34')").columnType("VARCHAR NOT NULL");
+    s.withExpr("concat('a', x'12')").columnType("VARCHAR NOT NULL");
+    s.withExpr("concat(x'12', x'34')")
+        .withWhole(true)
+        .withTypeCoercion(false)
+        .fails("(?s)Cannot apply 'CONCAT' to arguments of type "
+            + "'CONCAT\\(<BINARY\\(1\\)>, <BINARY\\(1\\)>\\)'\\. .*");
     s.withExpr("concat('aabbcc', 'ab', '+-')")
         .columnType("VARCHAR(10) NOT NULL");
     s.withExpr("concat('aabbcc', CAST(NULL AS VARCHAR(20)), '+-')")
@@ -1023,6 +1044,30 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .fails("Parameters must be of the same type");
     wholeExpr("position(x'1234' in '110' from 3)")
         .fails("Parameters must be of the same type");
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7724">
+   * [CALCITE-7724] SqlUtil#lookupSubjectRoutines rejects a valid operator when its
+   * SqlKind is remapped by SqlKind#getFunctionKind() and two operator-table entries
+   * resolve to it</a>.
+   *
+   * <p>The kind-based fourth pass in {@code filterOperatorRoutinesByKind} maps only
+   * the candidate's kind through {@code getFunctionKind()}, not the call's own kind -
+   * so an operator whose kind is remapped (e.g. {@link SqlKind#POSITION}) can fail to
+   * match itself once a second candidate for the same name exists. */
+  @Test void testFunctionKindMismatchWithDuplicateOperatorTableEntry() {
+    // Chaining the operator table with itself ensures that each appears twice.
+    final SqlOperatorTable duplicated =
+        SqlOperatorTables.chain(SqlStdOperatorTable.instance(), SqlStdOperatorTable.instance());
+    expr("position('mouse' in 'house')")
+        .withOperatorTable(duplicated)
+        .ok();
+    expr("char_length('string')")
+        .withOperatorTable(duplicated)
+        .ok();
+    expr("character_length('string')")
+        .withOperatorTable(duplicated)
+        .ok();
   }
 
   @Test void testTrim() {
@@ -1322,13 +1367,20 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     expr("values 1.0 + ^NULL^")
         .withTypeCoercion(false)
         .fails("(?s).*Illegal use of .NULL.*");
+    // SELECT produces DECIMAL(3, 1) because inferUnknownTypes infers
+    // NULL as DECIMAL(2, 1) via FIRST_KNOWN, and DECIMAL(2,1) + DECIMAL(2,1)
+    // = DECIMAL(3, 1)
+    sql("select 1.0 + NULL from (values (0)) as t(x)")
+        .columnType("DECIMAL(3, 1)");
     expr("values 1.0 + NULL")
-        .columnType("DECIMAL(2, 1)");
+        .columnType("DECIMAL(3, 1)");
     expr("1.0 + ^NULL^")
         .withTypeCoercion(false)
         .fails("(?s).*Illegal use of .NULL.*");
+    sql("select 1.0 + NULL from (values (0)) as t(x)")
+        .columnType("DECIMAL(3, 1)");
     expr("1.0 + NULL")
-        .columnType("DECIMAL(2, 1)");
+        .columnType("DECIMAL(3, 1)");
 
     // FIXME: SQL:2003 does not allow raw NULL in IN clause
     expr("1 in (1, null, 2)").ok();
@@ -1515,7 +1567,11 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     expr("cast(ARRAY[1,2,3] AS VARIANT ARRAY)")
         .columnType("VARIANT NOT NULL ARRAY NOT NULL");
     expr("cast(MAP['a','b','c','d'] AS MAP<VARCHAR, VARIANT>)")
-        .columnType("(VARCHAR NOT NULL, VARIANT) MAP NOT NULL");
+        .columnType("(VARCHAR NOT NULL, VARIANT NOT NULL) MAP NOT NULL");
+    // Test case for [CALCITE-7293] https://issues.apache.org/jira/browse/CALCITE-7293
+    // MAP constructor cannot handle VARIANT values that need casts
+    expr("MAP['a', CAST('x' AS VARIANT), 'b', CAST(NULL AS VARIANT)]")
+        .columnType("(CHAR(1) NOT NULL, VARIANT) MAP NOT NULL");
   }
 
   @Test void testAccessVariant() {
@@ -1525,6 +1581,27 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .columnType("VARIANT");
     expr("cast(1 as variant)[0]")
         .columnType("VARIANT");
+  }
+
+  @Test void testColonFieldAccess() {
+    final SqlConformance colonMode =
+        new SqlDelegatingConformance(SqlConformanceEnum.DEFAULT) {
+          @Override public boolean isColonFieldAccessAllowed() {
+            return true;
+          }
+        };
+
+    expr("cast(1 as variant):a.b[0].c")
+        .withConformance(colonMode)
+        .columnType("VARIANT");
+
+    sql("select ^skill^:type from dept_nested")
+        .withConformance(colonMode)
+        .fails("(?s).*Incompatible types.*");
+
+    sql("select ^bogus^:field from dept_nested")
+        .withConformance(colonMode)
+        .fails("(?s).*Column 'BOGUS' not found.*");
   }
 
   @Test void testCastRegisteredType() {
@@ -1577,9 +1654,14 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     expr("LOCALTIME").ok(); // fix sqlcontext later.
     wholeExpr("LOCALTIME(1+2)")
         .fails("Argument to function 'LOCALTIME' must be a literal");
-    wholeExpr("LOCALTIME(NULL)")
+    // With type coercion disabled, inferUnknownTypes rejects NULL before
+    // LOCALTIME can validate. SELECT produces the same error.
+    sql("select LOCALTIME(^NULL^) from (values (0)) as t(x)")
         .withTypeCoercion(false)
-        .fails("Argument to function 'LOCALTIME' must not be NULL");
+        .fails("(?s).*Illegal use of .NULL.*");
+    expr("LOCALTIME(^NULL^)")
+        .withTypeCoercion(false)
+        .fails("(?s).*Illegal use of .NULL.*");
     wholeExpr("LOCALTIME(NULL)")
         .fails("Argument to function 'LOCALTIME' must not be NULL");
     wholeExpr("LOCALTIME(CAST(NULL AS INTEGER))")
@@ -1937,12 +2019,28 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .ok();
     // test multiple partition keys for input table with set semantic
     sql("select * from table(topn(table orders partition by (orderId, productid), 3))")
+        .rewritesTo("SELECT *\n"
+            + "FROM TABLE(TOPN((SELECT *\n"
+            + "FROM `ORDERS`) PARTITION BY (`ORDERID`, `PRODUCTID`), 3))")
+        .ok();
+    sql("select * from table(topn(table orders partition by (orderId), 3))")
+        .rewritesTo("SELECT *\n"
+            + "FROM TABLE(TOPN((SELECT *\n"
+            + "FROM `ORDERS`) PARTITION BY `ORDERID`, 3))")
         .ok();
     // test one order key for input table with set semantic
     sql("select * from table(topn(table orders order by orderId, 3))")
         .ok();
+    sql("select * from table(topn(table orders order by (orderId), 3))")
+        .rewritesTo("SELECT *\n"
+            + "FROM TABLE(TOPN((SELECT *\n"
+            + "FROM `ORDERS`) ORDER BY `ORDERID`, 3))")
+        .ok();
     // test multiple order keys for input table with set semantic
     sql("select * from table(topn(table orders order by (orderId, productid), 3))")
+        .rewritesTo("SELECT *\n"
+            + "FROM TABLE(TOPN((SELECT *\n"
+            + "FROM `ORDERS`) ORDER BY (`ORDERID`, `PRODUCTID`), 3))")
         .ok();
     // test complex order-by clause for input table with set semantic
     sql("select * from table(topn(table orders order by (orderId desc, productid asc), 3))")
@@ -1960,6 +2058,21 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         + "  table emp partition by deptno order by empno,\n"
         + "  table emp_b partition by deptno order by empno))")
         .ok();
+
+    // Test cases for [CALCITE-7575] https://issues.apache.org/jira/browse/CALCITE-7575
+    // Parser can not parse unparsed polymorphic table functions with several table args
+    final String emp = "(SELECT `EMP`.`EMPNO`, `EMP`.`ENAME`, `EMP`.`JOB`, `EMP`.`MGR`, "
+        + "`EMP`.`HIREDATE`, `EMP`.`SAL`, `EMP`.`COMM`, `EMP`.`DEPTNO`, `EMP`.`SLACKER`\n"
+        + "FROM `CATALOG`.`SALES`.`EMP` AS `EMP`) PARTITION BY `DEPTNO`";
+    final String rewritten = "SELECT `EXPR$0`.`VAL`\n"
+        + "FROM TABLE(SIMILARLITY("
+        + emp + ", " + emp + ")) AS `EXPR$0`";
+    sql("select * from table(SIMILARLITY(\n"
+        + "  table emp partition by deptno,\n"
+        + "  table emp partition by deptno))")
+        .withValidatorIdentifierExpansion(true)
+        .rewritesTo(rewritten);
+    sql(rewritten).withParserConfig(c -> c.withQuoting(Quoting.BACK_TICK)).ok();
   }
 
   @Test void testUnknownFunctionHandling() {
@@ -2065,10 +2178,8 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .type("RecordType(BOOLEAN NOT NULL EXPR$0) NOT NULL");
     sql("^values ('1'),(2)^")
         .fails("Values passed to VALUES operator must have compatible types");
-    if (TODO) {
-      sql("values (1),(2.0),(3)")
-          .columnType("ROWTYPE(DOUBLE)");
-    }
+    sql("values (1),(2.0),(3)")
+        .columnType("DECIMAL(11, 1) NOT NULL");
   }
 
   @Test void testRow() {
@@ -2097,12 +2208,168 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .columnType("INTEGER NOT NULL");
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7311">[CALCITE-7311]
+   * Support the syntax ROW(*) to create a nested ROW type with all columns</a>. */
+  @Test void testRowWildcardExpansion() {
+    sql("select row(*) from emp").ok();
+    sql("select row(emp.*) from emp").ok();
+    sql("select row(emp.*, dept.*) from emp join dept on emp.deptno = dept.deptno").ok();
+    // Nested ROW with star
+    sql("select row(row(*)) from emp").ok();
+    sql("select row(row(emp.*)) from emp").ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7364">[CALCITE-7364]
+   * Support the syntax ROW(T.* EXCLUDE cols) for creating nested ROW values</a>. */
+  @Test void testRowWildcardExclude() {
+    sql("select row(* exclude(empno)) from emp").ok();
+    sql("select row(* exclude(empno, deptno)) from emp").ok();
+    sql("select row(emp.* exclude(emp.empno)) from emp").ok();
+    // EXCEPT is a synonym for EXCLUDE
+    sql("select row(emp.* except(emp.empno)) from emp").ok();
+    sql("select row(emp.* exclude(emp.empno), dept.*)"
+        + " from emp join dept on emp.deptno = dept.deptno").ok();
+    // Nested ROW with EXCLUDE
+    sql("select row(row(* exclude(empno))) from emp").ok();
+    sql("select row(row(emp.* exclude(emp.empno))) from emp").ok();
+    // Multiple nested ROWs, one with EXCLUDE
+    sql("select row(row(* exclude(empno)), row(dept.*)) "
+        + "from emp join dept on emp.deptno = dept.deptno").ok();
+    // Unknown column in exclude list
+    sql("select row(* exclude(^foo^)) from emp")
+        .fails("ROW\\(\\* EXCLUDE/EXCEPT list\\) contains unknown column\\(s\\): FOO");
+    // Unknown column in nested ROW exclude list
+    sql("select row(row(* exclude(^foo^))) from emp")
+        .fails("ROW\\(\\* EXCLUDE/EXCEPT list\\) contains unknown column\\(s\\): FOO");
+    // Unknown column in table-qualified exclude list
+    sql("select row(emp.* exclude(^emp.foo^)) from emp")
+        .fails("ROW\\(\\* EXCLUDE/EXCEPT list\\) contains unknown column\\(s\\): EMP\\.FOO");
+    // Excluding all columns from a ROW expression is not allowed
+    sql("select row(^*^ exclude(empno, ename, job, mgr, hiredate, sal, comm,"
+        + " deptno, slacker)) from emp")
+        .fails("ROW\\(\\* EXCLUDE/EXCEPT list\\) cannot exclude all columns");
+    // Excluding all columns via qualified name is not allowed
+    sql("select row(^emp.*^ exclude(emp.empno, emp.ename, emp.job, emp.mgr,"
+        + " emp.hiredate, emp.sal, emp.comm, emp.deptno, emp.slacker)) from emp")
+        .fails("ROW\\(\\* EXCLUDE/EXCEPT list\\) cannot exclude all columns");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7602">[CALCITE-7602]
+   * ROW(*) loses column names</a>. */
+  @Test void testRowWildcardColumnNames() {
+    // ROW(*) should produce a struct with the original column names
+    sql("select row(*) from emp")
+        .columnType(EMP_RECORD_TYPE);
+    // ROW(T.*) should also preserve column names
+    sql("select row(emp.*) from emp")
+        .columnType(EMP_RECORD_TYPE);
+    // ROW(col, T.*) where the star repeats a column already named: the duplicate
+    // gets a compiler-assigned suffix (EMPNO0) rather than losing all names
+    sql("select row(empno, emp.*) from emp")
+        .columnType("RecordType(INTEGER NOT NULL EMPNO,"
+            + " INTEGER NOT NULL EMPNO0,"
+            + " VARCHAR(20) NOT NULL ENAME,"
+            + " VARCHAR(10) NOT NULL JOB,"
+            + " INTEGER MGR,"
+            + " TIMESTAMP(0) NOT NULL HIREDATE,"
+            + " INTEGER NOT NULL SAL,"
+            + " INTEGER NOT NULL COMM,"
+            + " INTEGER NOT NULL DEPTNO,"
+            + " BOOLEAN NOT NULL SLACKER) NOT NULL");
+    // ROW(T1.*, T2.*) with a shared column name (DEPTNO): the second DEPTNO
+    // gets the suffix DEPTNO0 while all other names are preserved
+    sql("select row(emp.*, dept.*) from emp join dept on emp.deptno = dept.deptno")
+        .columnType("RecordType(INTEGER NOT NULL EMPNO,"
+            + " VARCHAR(20) NOT NULL ENAME,"
+            + " VARCHAR(10) NOT NULL JOB,"
+            + " INTEGER MGR,"
+            + " TIMESTAMP(0) NOT NULL HIREDATE,"
+            + " INTEGER NOT NULL SAL,"
+            + " INTEGER NOT NULL COMM,"
+            + " INTEGER NOT NULL DEPTNO,"
+            + " BOOLEAN NOT NULL SLACKER,"
+            + " INTEGER NOT NULL DEPTNO0,"
+            + " VARCHAR(10) NOT NULL NAME) NOT NULL");
+    // ROW(* EXCLUDE(col)) should preserve names of the remaining columns
+    sql("select row(* exclude(empno)) from emp")
+        .columnType("RecordType(VARCHAR(20) NOT NULL ENAME,"
+            + " VARCHAR(10) NOT NULL JOB,"
+            + " INTEGER MGR,"
+            + " TIMESTAMP(0) NOT NULL HIREDATE,"
+            + " INTEGER NOT NULL SAL,"
+            + " INTEGER NOT NULL COMM,"
+            + " INTEGER NOT NULL DEPTNO,"
+            + " BOOLEAN NOT NULL SLACKER) NOT NULL");
+    // ROW(T.* EXCLUDE(T.col)) should preserve names of the remaining columns
+    sql("select row(emp.* exclude(emp.empno)) from emp")
+        .columnType("RecordType(VARCHAR(20) NOT NULL ENAME,"
+            + " VARCHAR(10) NOT NULL JOB,"
+            + " INTEGER MGR,"
+            + " TIMESTAMP(0) NOT NULL HIREDATE,"
+            + " INTEGER NOT NULL SAL,"
+            + " INTEGER NOT NULL COMM,"
+            + " INTEGER NOT NULL DEPTNO,"
+            + " BOOLEAN NOT NULL SLACKER) NOT NULL");
+    // Named field combined with star expansion: explicit name takes precedence
+    sql("select row(empno as eno, emp.* exclude(emp.empno)) from emp")
+        .columnType("RecordType(INTEGER NOT NULL ENO,"
+            + " VARCHAR(20) NOT NULL ENAME,"
+            + " VARCHAR(10) NOT NULL JOB,"
+            + " INTEGER MGR,"
+            + " TIMESTAMP(0) NOT NULL HIREDATE,"
+            + " INTEGER NOT NULL SAL,"
+            + " INTEGER NOT NULL COMM,"
+            + " INTEGER NOT NULL DEPTNO,"
+            + " BOOLEAN NOT NULL SLACKER) NOT NULL");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7603">[CALCITE-7603]
+   * Support ROW constructors that name fields</a>. */
+  @Test void testRowWithFieldNames() {
+    // All fields named: the returned type should use the specified names
+    sql("select row(1 as a, 'hello' as b) from emp")
+        .columnType("RecordType(INTEGER NOT NULL A, CHAR(5) NOT NULL B) NOT NULL");
+    // Mixed: named and unnamed fields
+    sql("select row(empno as eno, ename) from emp")
+        .columnType("RecordType(INTEGER NOT NULL ENO, VARCHAR(20) NOT NULL EXPR$1) NOT NULL");
+    // No names: existing auto-generated behavior unchanged
+    sql("select row(empno, ename) from emp")
+        .columnType("RecordType(INTEGER NOT NULL EXPR$0, VARCHAR(20) NOT NULL EXPR$1) NOT NULL");
+    // Access a named field by name
+    sql("select row(empno as eno, ename as en).eno from emp")
+        .columnType("INTEGER NOT NULL");
+    // Nested ROW with named fields
+    sql("select row(row(1 as x, 2 as y) as inner_row) from emp")
+        .columnType("RecordType(RecordType(INTEGER NOT NULL X, INTEGER NOT NULL Y)"
+            + " NOT NULL INNER_ROW) NOT NULL");
+  }
+
   @Test void testRowWithValidDot() {
     sql("select ((1,2),(3,4,5)).\"EXPR$1\".\"EXPR$2\"\n from dept")
         .columnType("INTEGER NOT NULL");
     sql("select row(1,2).\"EXPR$1\" from dept")
         .columnType("INTEGER NOT NULL");
     sql("select t.a.\"EXPR$1\" from (select row(1,2) as a from (values (1))) as t")
+        .columnType("INTEGER NOT NULL");
+    // After star expansion the ROW carries real column names, so field access
+    // by original name works without quoting EXPR$N ordinals.
+    sql("select row(*).empno from emp")
+        .columnType("INTEGER NOT NULL");
+    sql("select row(emp.*).ename from emp")
+        .columnType("VARCHAR(20) NOT NULL");
+    sql("select row(* exclude(empno)).ename from emp")
+        .columnType("VARCHAR(20) NOT NULL");
+    // When two stars produce a duplicate name the second gets a suffix;
+    // both the original and the suffixed name are accessible.
+    sql("select row(emp.*, dept.*).deptno from emp"
+        + " join dept on emp.deptno = dept.deptno")
+        .columnType("INTEGER NOT NULL");
+    sql("select row(emp.*, dept.*).deptno0 from emp"
+        + " join dept on emp.deptno = dept.deptno")
         .columnType("INTEGER NOT NULL");
   }
 
@@ -2455,7 +2722,7 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     sql(sql).fails("In UNPIVOT, cannot derive type for axis 'A0'");
   }
 
-  @Test void testMatchRecognizeWithDistinctAggregation() {
+  @Test void testMatchRecognize() {
     final String sql = "SELECT *\n"
         + "FROM emp\n"
         + "MATCH_RECOGNIZE (\n"
@@ -2468,13 +2735,312 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         + ") AS T";
     sql(sql).fails("DISTINCT/ALL not allowed with "
         + "COUNT\\(DISTINCT `A`\\.`DEPTNO`\\) function");
+
+    // Test case for [CALCITE-7466] https://issues.apache.org/jira/browse/CALCITE-7466
+    // Unparse of `MATCH_RECOGNIZE` produces duplicate aliases
+    final String sql2 = "SELECT *\n"
+        + "FROM emp\n"
+        + "MATCH_RECOGNIZE (\n"
+        + "  MEASURES\n"
+        + "     FINAL COUNT(A.deptno) AS deptno\n"
+        + "  PATTERN (A B)\n"
+        + "  DEFINE\n"
+        + "    A AS A.empno = 123\n"
+        + ") AS T";
+
+    final String expected2 = "SELECT *\n"
+        + "FROM `EMP` MATCH_RECOGNIZE(\n"
+        + "MEASURES FINAL COUNT(`A`.`DEPTNO`) AS `DEPTNO`\n"
+        + "PATTERN (`A` `B`)\n"
+        + "DEFINE `A` AS PREV(`A`.`EMPNO`, 0) = 123) AS `T`";
+
+    sql(sql2)
+        .rewritesTo(expected2);
+
+    sql(expected2)
+        .withParserConfig(c -> c.withQuoting(Quoting.BACK_TICK)).ok();
+
+    // Test cases for [CALCITE-7467] https://issues.apache.org/jira/browse/CALCITE-7467
+    // `MATCH_RECOGNIZE` does not support alias for table before
+    final String sql3 = "SELECT *\n"
+        + "FROM sales.emp\n"
+        + "MATCH_RECOGNIZE (\n"
+        + "  MEASURES\n"
+        + "     FINAL COUNT(A.deptno) AS deptno\n"
+        + "  PATTERN (A B)\n"
+        + "  DEFINE\n"
+        + "    A AS A.empno = 123\n"
+        + ") AS T";
+    final String expected3 = "SELECT `T`.`DEPTNO`\n"
+        + "FROM `CATALOG`.`SALES`.`EMP` AS `EMP` MATCH_RECOGNIZE(\n"
+        + "MEASURES FINAL COUNT(`A`.`DEPTNO`) AS `DEPTNO`\n"
+        + "PATTERN (`A` `B`)\n"
+        + "DEFINE `A` AS PREV(`A`.`EMPNO`, 0) = 123) AS `T`";
+
+    sql(sql3)
+        .withValidatorConfig(c -> c.withIdentifierExpansion(true))
+        .rewritesTo(expected3);
+    sql(expected3)
+        .withParserConfig(c -> c.withQuoting(Quoting.BACK_TICK)).ok();
+
+    // Identifier with alias for table before MATCH_RECOGNIZE should pass parser
+    final String sql4 = "SELECT *\n"
+        + "FROM sales.emp AS emp_alias\n"
+        + "MATCH_RECOGNIZE (\n"
+        + "  MEASURES\n"
+        + "     FINAL COUNT(A.deptno) AS deptno\n"
+        + "  PATTERN (A B)\n"
+        + "  DEFINE\n"
+        + "    A AS A.empno = 123\n"
+        + ") AS T";
+
+    final String expected4 = "SELECT `T`.`DEPTNO`\n"
+        + "FROM `CATALOG`.`SALES`.`EMP` AS `EMP_ALIAS` MATCH_RECOGNIZE(\n"
+        + "MEASURES FINAL COUNT(`A`.`DEPTNO`) AS `DEPTNO`\n"
+        + "PATTERN (`A` `B`)\n"
+        + "DEFINE `A` AS PREV(`A`.`EMPNO`, 0) = 123) AS `T`";
+
+    sql(sql4)
+        .withValidatorConfig(c -> c.withIdentifierExpansion(true))
+        .rewritesTo(expected4);
+    sql(expected4)
+        .withParserConfig(c -> c.withQuoting(Quoting.BACK_TICK)).ok();
+
+    // Identifier with alias for table before MATCH_RECOGNIZE should pass parser
+    final String sql5 = "SELECT emp.empno, T.*\n"
+        + "FROM emp JOIN sales.emp AS emp_alias\n"
+        + "MATCH_RECOGNIZE (\n"
+        + "  MEASURES\n"
+        + "     FINAL COUNT(A.deptno) AS deptno\n"
+        + "  PATTERN (A B)\n"
+        + "  DEFINE\n"
+        + "    A AS A.empno = 123\n"
+        + ") AS T on emp.deptno = T.deptno";
+    final String expected5 =
+        "SELECT `EMP`.`EMPNO`, `T`.`DEPTNO`\n"
+            + "FROM `CATALOG`.`SALES`.`EMP` AS `EMP`\n"
+            + "INNER JOIN `CATALOG`.`SALES`.`EMP` AS `EMP_ALIAS` MATCH_RECOGNIZE(\n"
+            + "MEASURES FINAL COUNT(`A`.`DEPTNO`) AS `DEPTNO`\n"
+            + "PATTERN (`A` `B`)\n"
+            + "DEFINE `A` AS PREV(`A`.`EMPNO`, 0) = 123) AS `T` ON CAST(`EMP`.`DEPTNO` AS BIGINT) = `T`.`DEPTNO`";
+
+    sql(sql5)
+        .withValidatorConfig(c -> c.withIdentifierExpansion(true))
+        .rewritesTo(expected5);
+    sql(expected5)
+        .withParserConfig(c -> c.withQuoting(Quoting.BACK_TICK)).ok();
+
+    // Test cases for [CALCITE-7471] https://issues.apache.org/jira/browse/CALCITE-7471
+    // Alias is not auto generated for `MATCH_RECOGNIZE`
+    final String sql6 = "SELECT *\n"
+        + "FROM emp\n"
+        + "MATCH_RECOGNIZE (\n"
+        + "  MEASURES\n"
+        + "     FINAL COUNT(A.deptno) AS deptno\n"
+        + "  PATTERN (A B)\n"
+        + "  DEFINE\n"
+        + "    A AS A.empno = 123\n"
+        + ")";
+
+    final String expected6 = "SELECT `EXPR$0`.`DEPTNO`\n"
+        + "FROM `CATALOG`.`SALES`.`EMP` AS `EMP` MATCH_RECOGNIZE(\n"
+        + "MEASURES FINAL COUNT(`A`.`DEPTNO`) AS `DEPTNO`\n"
+        + "PATTERN (`A` `B`)\n"
+        + "DEFINE `A` AS PREV(`A`.`EMPNO`, 0) = 123) AS `EXPR$0`";
+
+    sql(sql6)
+        .withValidatorConfig(c -> c.withIdentifierExpansion(true))
+        .rewritesTo(expected6);
+
+    sql(expected6)
+        .withParserConfig(c -> c.withQuoting(Quoting.BACK_TICK)).ok();
+
+    // Test cases for [CALCITE-7480] https://issues.apache.org/jira/browse/CALCITE-7480
+    // Unparse of MATCH_RECOGNIZE with PARTITION BY or ORDER BY produces invalid SQL
+    // Accepted by BigQuery (both simple and expanded column name under ORDER BY, PARTITION BY)
+    // Oracle accepts only simple column name
+    final String sql7 = "SELECT *\n"
+        + "FROM sales.emp AS emp_alias\n"
+        + "MATCH_RECOGNIZE (\n"
+        + "  PARTITION BY empno\n"
+        + "  ORDER BY deptno\n"
+        + "  MEASURES\n"
+        + "     FINAL COUNT(A.deptno) AS deptno\n"
+        + "  PATTERN (A B)\n"
+        + "  DEFINE\n"
+        + "    A AS A.empno = 123\n"
+        + ") AS T";
+    final String expected7 = "SELECT `T`.`EMPNO`, `T`.`DEPTNO`\n"
+        + "FROM `CATALOG`.`SALES`.`EMP` AS `EMP_ALIAS` MATCH_RECOGNIZE(\n"
+        + "PARTITION BY `EMP_ALIAS`.`EMPNO`\n"
+        + "ORDER BY `EMP_ALIAS`.`DEPTNO`\n"
+        + "MEASURES FINAL COUNT(`A`.`DEPTNO`) AS `DEPTNO`\n"
+        + "PATTERN (`A` `B`)\n"
+        + "DEFINE `A` AS PREV(`A`.`EMPNO`, 0) = 123) AS `T`";
+
+    sql(sql7)
+        .withValidatorConfig(c -> c.withIdentifierExpansion(true))
+        .rewritesTo(expected7);
+    sql(expected7)
+        .withParserConfig(c -> c.withQuoting(Quoting.BACK_TICK)).ok();
+
+    final String sql8 = "SELECT *\n"
+        + "FROM (SELECT empno, deptno from sales.emp)\n"
+        + "MATCH_RECOGNIZE (\n"
+        + "  PARTITION BY empno\n"
+        + "  ORDER BY deptno\n"
+        + "  MEASURES\n"
+        + "     FINAL COUNT(A.deptno) AS deptno\n"
+        + "  PATTERN (A B)\n"
+        + "  DEFINE\n"
+        + "    A AS A.empno = 123\n"
+        + ")";
+    final String expected8 = "SELECT `EXPR$0`.`EMPNO`, `EXPR$0`.`DEPTNO`\n"
+        + "FROM (SELECT `EMP`.`EMPNO`, `EMP`.`DEPTNO`\n"
+        + "FROM `CATALOG`.`SALES`.`EMP` AS `EMP`) AS `EXPR$1` MATCH_RECOGNIZE(\n"
+        + "PARTITION BY `EXPR$1`.`EMPNO`\n"
+        + "ORDER BY `EXPR$1`.`DEPTNO`\n"
+        + "MEASURES FINAL COUNT(`A`.`DEPTNO`) AS `DEPTNO`\n"
+        + "PATTERN (`A` `B`)\n"
+        + "DEFINE `A` AS PREV(`A`.`EMPNO`, 0) = 123) AS `EXPR$0`";
+
+    sql(sql8)
+        .withValidatorConfig(c -> c.withIdentifierExpansion(true))
+        .rewritesTo(expected8);
+    sql(expected8)
+        .withParserConfig(c -> c.withQuoting(Quoting.BACK_TICK)).ok();
+
+    // Test cases for [CALCITE-7465] https://issues.apache.org/jira/browse/CALCITE-7465
+    // Unparse of MATCH_RECOGNIZE MEASURES might produce unparsable sql
+    // Accepted by Snowflake (it doesn't accept FINAL or RUNNING before non function measure)
+    final String sql9 = "SELECT *\n"
+        + "FROM emp\n"
+        + "MATCH_RECOGNIZE (\n"
+        + "  MEASURES\n"
+        + "    A.deptno AS deptno\n"
+        + "  PATTERN (A B)\n"
+        + "  DEFINE\n"
+        + "    A AS A.empno = 123\n"
+        + ")";
+    final String expected9 = "SELECT `EXPR$0`.`DEPTNO`\n"
+        + "FROM `CATALOG`.`SALES`.`EMP` AS `EMP` MATCH_RECOGNIZE(\n"
+        + "MEASURES FINAL `A`.`DEPTNO` AS `DEPTNO`\n"
+        + "PATTERN (`A` `B`)\n"
+        + "DEFINE `A` AS PREV(`A`.`EMPNO`, 0) = 123) AS `EXPR$0`";
+
+    sql(sql9)
+        .withValidatorConfig(c -> c.withIdentifierExpansion(true))
+        .rewritesTo(expected9);
+    sql(expected9)
+        .withParserConfig(c -> c.withQuoting(Quoting.BACK_TICK)).ok();
+
+    final String sql10 = "SELECT deptno\n"
+        + "FROM emp\n"
+        + "MATCH_RECOGNIZE (\n"
+        + "  MEASURES\n"
+        + "    A.deptno AS deptno\n"
+        + "ALL ROWS PER MATCH\n"
+        + "  PATTERN (A B)\n"
+        + "  DEFINE\n"
+        + "    A AS A.empno = 123\n"
+        + ")";
+    final String expected10 = "SELECT `EXPR$0`.`DEPTNO`\n"
+        + "FROM `CATALOG`.`SALES`.`EMP` AS `EMP` MATCH_RECOGNIZE(\n"
+        + "MEASURES RUNNING `A`.`DEPTNO` AS `DEPTNO`\n"
+        + "ALL ROWS PER MATCH\n"
+        + "PATTERN (`A` `B`)\n"
+        + "DEFINE `A` AS PREV(`A`.`EMPNO`, 0) = 123) AS `EXPR$0`";
+
+    sql(sql10)
+        .withValidatorConfig(c -> c.withIdentifierExpansion(true))
+        .rewritesTo(expected10);
+    sql(expected10)
+        .withParserConfig(c -> c.withQuoting(Quoting.BACK_TICK)).ok();
+
+    // Test cases for [CALCITE-7486] https://issues.apache.org/jira/browse/CALCITE-7486
+    // Operators in MATCH_RECOGNIZE don't support SqlLiterals
+    // Accepted by Snowflake
+    final String sql11 = "SELECT *\n"
+        + "FROM emp\n"
+        + "MATCH_RECOGNIZE (\n"
+        + "  MEASURES\n"
+        + "    FIRST(DOWN.empno + DOWN.deptno + 1) AS bottom_total"
+        + "  PATTERN (DOWN{2,})\n"
+        + "  DEFINE\n"
+        + "    DOWN AS PREV(EMP.EMPNO + 2, 0) < 1"
+        + ")";
+
+    final String expected11 = "SELECT `EXPR$0`.`BOTTOM_TOTAL`\n"
+        + "FROM `CATALOG`.`SALES`.`EMP` AS `EMP` MATCH_RECOGNIZE(\n"
+        + "MEASURES FINAL (FIRST(`DOWN`.`EMPNO` + `DOWN`.`DEPTNO`, 0) + FIRST(1, 0)) AS `BOTTOM_TOTAL`\n"
+        + "PATTERN (`DOWN` { 2, })\n"
+        + "DEFINE `DOWN` AS LAST(`EMP`.`EMPNO`, 0) + PREV(2, 0) < 1) AS `EXPR$0`";
+
+    sql(sql11)
+        .withValidatorConfig(c -> c.withIdentifierExpansion(true))
+        .rewritesTo(expected11);
+    sql(expected11)
+        .withParserConfig(c -> c.withQuoting(Quoting.BACK_TICK)).ok();
+
+    // Test cases for [CALCITE-7538] https://issues.apache.org/jira/browse/CALCITE-7538
+    // SqlValidatorImpl should reject MATCH_RECOGNIZE with duplicate MEASURE alias
+    final String sql12 = "SELECT *\n"
+        + "FROM emp\n"
+        + "MATCH_RECOGNIZE (\n"
+        + "  MEASURES\n"
+        + "    A.deptno AS deptno,\n"
+        + "    A.deptno AS deptno\n"
+        + "  PATTERN (A B)\n"
+        + "  DEFINE\n"
+        + "    A AS A.empno = 123\n"
+        + ")";
+
+    sql(sql12)
+        .fails("Duplicate name 'DEPTNO' in MATCH_RECOGNIZE MEASURE alias list");
+
+    final String sql13 = "SELECT *\n"
+        + "FROM emp\n"
+        + "MATCH_RECOGNIZE (\n"
+        + "  MEASURES\n"
+        + "    A.deptno AS deptno,\n"
+        + "    A.deptno AS DePtNo\n"
+        + "  PATTERN (A B)\n"
+        + "  DEFINE\n"
+        + "    A AS A.empno = 123\n"
+        + ")";
+
+    sql(sql13)
+        .fails("Duplicate name 'DEPTNO' in MATCH_RECOGNIZE MEASURE alias list");
+
+    final String sql14 = "SELECT *\n"
+        + "FROM emp\n"
+        + "MATCH_RECOGNIZE (\n"
+        + "  MEASURES\n"
+        + "    A.deptno AS deptno,\n"
+        + "    A.deptno AS \"DePtNo\"\n"
+        + "  PATTERN (A B)\n"
+        + "  DEFINE\n"
+        + "    A AS A.empno = 123\n"
+        + ")";
+
+    final String expected14 = "SELECT `EXPR$0`.`DEPTNO`, `EXPR$0`.`DePtNo`\n"
+        + "FROM `CATALOG`.`SALES`.`EMP` AS `EMP` MATCH_RECOGNIZE(\n"
+        + "MEASURES FINAL `A`.`DEPTNO` AS `DEPTNO`, FINAL `A`.`DEPTNO` AS `DePtNo`\n"
+        + "PATTERN (`A` `B`)\n"
+        + "DEFINE `A` AS PREV(`A`.`EMPNO`, 0) = 123) AS `EXPR$0`";
+
+    sql(sql14)
+        .withValidatorConfig(c -> c.withIdentifierExpansion(true))
+        .rewritesTo(expected14);
+    sql(expected14)
+        .withParserConfig(c -> c.withQuoting(Quoting.BACK_TICK)).ok();
   }
 
   @Test void testIntervalTimeUnitEnumeration() {
     // Since there is validation code relaying on the fact that the
     // enumerated time unit ordinals in SqlIntervalQualifier starts with 0
     // and ends with 5, this test is here to make sure that if someone
-    // changes how the time untis are setup, an early feedback will be
+    // changes how the time units are setup, an early feedback will be
     // generated by this test.
     assertThat(TimeUnit.YEAR.ordinal(), is(0));
     assertThat(TimeUnit.MONTH.ordinal(), is(1));
@@ -3094,17 +3660,20 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
    * <a href="https://issues.apache.org/jira/browse/CALCITE-820">[CALCITE-820]
    * Validate that window functions have OVER clause</a>, and
    * <a href="https://issues.apache.org/jira/browse/CALCITE-1340">[CALCITE-1340]
-   * Window aggregates give invalid errors</a>. */
+   * Window aggregates give invalid errors</a> and
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7485">[CALCITE-7485]
+   * FIRST_VALUE/LAST_VALUE should only be defined for window aggregates</a>.
+   * */
   @Test void testWindowFunctionsWithoutOver() {
     winSql("select sum(empno)\n"
         + "from emp\n"
         + "group by deptno\n"
         + "order by ^row_number()^")
-        .fails("OVER clause is necessary for window functions");
+        .fails("window function ROW_NUMBER requires an OVER clause");
 
     winSql("select ^rank()^\n"
         + "from emp")
-        .fails("OVER clause is necessary for window functions");
+        .fails("window function RANK requires an OVER clause");
 
     // With [CALCITE-1340], the validator would see RANK without OVER,
     // mistakenly think this is an aggregate query, and wrongly complain
@@ -3112,11 +3681,42 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     winSql("select cume_dist() over w , ^rank()^\n"
         + "from emp\n"
         + "window w as (partition by deptno order by deptno)")
-        .fails("OVER clause is necessary for window functions");
+        .fails("window function RANK requires an OVER clause");
 
     winSql("select ^nth_value(sal, 2)^\n"
         + "from emp")
-        .fails("OVER clause is necessary for window functions");
+        .fails("window function NTH_VALUE requires an OVER clause");
+
+    winSql("select ^first_value(sal)^\n"
+        + "from emp")
+        .fails("window function FIRST_VALUE requires an OVER clause");
+
+    winSql("select ^last_value(sal)^\n"
+        + "from emp")
+        .fails("window function LAST_VALUE requires an OVER clause");
+
+    // With alias, first_value and last_value without OVER should also fail
+    winSql("select ^first_value(sal)^ as sal_first\n"
+        + "from emp")
+        .fails("window function FIRST_VALUE requires an OVER clause");
+
+    winSql("select ^last_value(sal)^ as sal_last\n"
+        + "from emp")
+        .fails("window function LAST_VALUE requires an OVER clause");
+
+    // In GROUP BY context, first_value and last_value without OVER should fail
+    winSql("select sal, ^first_value(sal)^ as sal_first\n"
+        + "from emp group by sal, deptno")
+        .fails("window function FIRST_VALUE requires an OVER clause");
+
+    // first_value and last_value with OVER clause should succeed
+    winSql("select first_value(sal) over (order by empno)\n"
+        + "from emp")
+        .ok();
+
+    winSql("select last_value(sal) over (order by empno)\n"
+        + "from emp")
+        .ok();
   }
 
   @Test void testOverInPartitionBy() {
@@ -3134,11 +3734,31 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
    * Validator rejects FILTER in OVER windows</a>. */
   @Test void testOverFilter() {
     winSql("SELECT deptno,\n"
-        + "       ^COUNT(DISTINCT deptno) FILTER (WHERE deptno > 10)^\n"
+        + "       ^COUNT(DISTINCT deptno)^ FILTER (WHERE deptno > 10)\n"
         + "OVER win AS agg\n"
         + "FROM emp\n"
-         + "WINDOW win AS (PARTITION BY empno)")
+        + "WINDOW win AS (PARTITION BY empno)")
         .fails("OVER must be applied to aggregate function");
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7595">[CALCITE-7595]
+   * Support FILTER clause with window functions</a>. */
+  @Test void testFilterWithOver() {
+    winSql("SELECT SUM(sal) FILTER (WHERE sal > 100) OVER (PARTITION BY deptno) FROM emp")
+        .ok();
+  }
+
+  @Test void testFilterWithOverAndDistinct() {
+    winSql("SELECT SUM(DISTINCT sal) FILTER (WHERE sal > 100) OVER (ORDER BY deptno) FROM emp")
+        .ok();
+  }
+
+  @Test void testMultipleFiltersWithOver() {
+    winSql("SELECT "
+        + "COUNT(*) FILTER (WHERE empno > 100) OVER (PARTITION BY deptno), "
+        + "SUM(sal) FILTER (WHERE sal > 0) OVER (PARTITION BY deptno) "
+        + "FROM emp")
+        .ok();
   }
 
   @Test void testOverInOrderBy() {
@@ -3253,7 +3873,7 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     // rank function type
     if (defined.contains("DENSE_RANK")) {
       winExp("^dense_rank()^")
-          .fails("OVER clause is necessary for window functions");
+          .fails("window function DENSE_RANK requires an OVER clause");
     } else {
       checkWinFuncExpWithWinClause("^dense_rank()^",
           "Function 'DENSE_RANK\\(\\)' is not defined");
@@ -3465,6 +4085,39 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
   }
 
   /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6648">[CALCITE-6648]
+   * IGNORE NULLS / RESPECT NULLS window function option can result in a type
+   * validation error in SqlToRelConverter</a>.
+   *
+   * <p>When the input is a non-nullable type, the null treatment option is
+   * specified, and the window frame is ROWS with an offset-based bound (e.g.
+   * {@code n PRECEDING}), the window may be out of bounds, so the derived type
+   * must be nullable. Previously the null treatment wrapper caused the
+   * validation phase to derive a non-nullable type, which then diverged from
+   * the nullable type derived during conversion. */
+  @Test void testWindowNullTreatmentNullableWithOffsetRowsFrame() {
+    // EMPNO is non-nullable; with an offset-based ROWS frame the result may be
+    // null, so IGNORE NULLS / RESPECT NULLS must not force a non-nullable type.
+    winSql("select first_value(empno) ignore nulls over "
+        + "(order by empno rows 1 preceding)\n"
+        + "from emp")
+        .type("RecordType(INTEGER EXPR$0) NOT NULL");
+
+    winSql("select last_value(empno) respect nulls over "
+        + "(order by empno rows 1 preceding)\n"
+        + "from emp")
+        .type("RecordType(INTEGER EXPR$0) NOT NULL");
+
+    // A full-partition frame is always non-empty, so the result stays
+    // non-nullable even with null treatment.
+    winSql("select first_value(empno) ignore nulls over "
+        + "(order by empno rows between unbounded preceding "
+        + "and unbounded following)\n"
+        + "from emp")
+        .type("RecordType(INTEGER NOT NULL EXPR$0) NOT NULL");
+  }
+
+  /** Test case for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-1954">[CALCITE-1954]
    * Column from outer join should be null, whether or not it is aliased</a>. */
   @Test void testLeftOuterJoinWithAlias() {
@@ -3503,6 +4156,28 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
   }
 
   @Test void testAsOfJoin() {
+    sql("WITH "
+        + "   T2(id, intt) AS (VALUES(1, 0)),\n"
+        + "   T1(id, intt) as (VALUES(1, 0)),\n"
+        + "   T3(id) AS (VALUES(1))\n"
+        + "SELECT t1.id, t2.intt\n"
+        + "FROM T1 LEFT ASOF JOIN T2\n"
+        + "    MATCH_CONDITION t2.intt < t1.intt\n"
+        + "    ON t1.id = t2.id")
+        .ok();
+
+    // Test case for [CALCITE-7305]
+    // Subqueries in ASOF JOIN MATCH_CONDITION cause an assertion failure
+    sql("WITH T1(id, intt) as (VALUES(1, 0)),\n"
+        + "   T2(id, intt) AS (VALUES(1, 0)),\n"
+        + "   T3(id) AS (VALUES(1))\n"
+        + "SELECT t1.id, t2.intt\n"
+        + "FROM T1 LEFT ASOF JOIN T2\n"
+        + "    MATCH_CONDITION ^(t2.intt IN (SELECT id FROM T3))^\n"
+        + "    ON t1.id = t2.id")
+        .fails("ASOF JOIN MATCH_CONDITION must be a comparison between columns "
+            + "from the two inputs");
+
     final String type0 = "RecordType(INTEGER NOT NULL EMPNO, INTEGER NOT NULL DEPTNO) NOT NULL";
     final String sql0 = "select emp.empno, dept.deptno from emp asof join dept\n"
         + "match_condition emp.deptno <= dept.deptno\n"
@@ -3571,6 +4246,8 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         + "on emp.ename = dept.name")
         .fails(
             "ASOF JOIN MATCH_CONDITION must be a comparison between columns from the two inputs");
+    final String failMessage = "ASOF JOIN condition must be a conjunction of equality comparisons "
+        + "of columns from both sides";
     // match condition does not compare columns from both tables
     sql("select emp.empno from emp asof join dept\n"
         + "match_condition ^emp.deptno < 12^\n"
@@ -3581,29 +4258,29 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     sql("select emp.empno from emp asof join dept\n"
         + "match_condition emp.deptno < dept.deptno\n"
         + "on ^emp.ename < 'foo'^")
-        .fails("ASOF JOIN condition must be a conjunction of equality comparisons");
+        .fails(failMessage);
     // comparison contains an equality test that does not check both tables joined
     sql("select emp.empno from emp asof join dept\n"
         + "match_condition emp.deptno < dept.deptno\n"
         + "on ^emp.ename = 'foo'^")
-        .fails("ASOF JOIN condition must be a conjunction of equality comparisons");
+        .fails(failMessage);
     // comparison contains is not a conjunction
     sql("select emp.empno from emp asof join dept\n"
         + "match_condition emp.deptno < dept.deptno\n"
         + "on ^emp.ename = dept.name OR emp.deptno = dept.deptno^")
-        .fails("ASOF JOIN condition must be a conjunction of equality comparisons");
+        .fails(failMessage);
     // comparison is not a conjunction
     sql("select * from (VALUES(true, false)) AS T0(b0, b1)\n"
         + "asof join (VALUES(false, false)) AS T1(b0, b1)\n"
         + "match_condition T0.b0 < T1.b0\n"
         + "on ^T0.b1 AND T1.b1^")
-        .fails("ASOF JOIN condition must be a conjunction of equality comparisons");
+        .fails(failMessage);
     // Condition contains a cast that is not applied to a column
     sql("select * from (VALUES(true, false)) AS T0(b0, b1)\n"
         + "asof join (VALUES(false, 1)) AS T1(b0, b1)\n"
         + "match_condition T0.b0 < T1.b0\n"
         + "on ^T0.b1 = CAST(T1.b1 + 1 AS BOOLEAN)^")
-        .fails("ASOF JOIN condition must be a conjunction of equality comparisons");
+        .fails(failMessage);
   }
 
   /** Test case for
@@ -4862,6 +5539,16 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
   }
 
   /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7830">[CALCITE-7830]
+   *  UPDATE fails with IndexOutOfBoundsException when a SET value's
+   *  type doesn't match the column</a>. */
+  @Test void testUpdateTypeMismatchGetNthExprRepro() {
+    sql("UPDATE emp SET deptno = ^true^")
+        .fails("Cannot assign to target field 'DEPTNO' of type INTEGER "
+            + "from source field 'EXPR\\$0' of type BOOLEAN");
+  }
+
+  /** Test case for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-6584">[CALCITE-6584]
    * Validate prefixed column identifiers in SET clause of UPDATE
    * statement</a>. */
@@ -5563,6 +6250,67 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .ok()
         .withConformance(SqlConformanceEnum.ORACLE_12)
         .ok();
+
+    // Unqualified common column in SELECT should succeed even when
+    // identifier expansion is disabled.
+    sql("select deptno from emp join dept using (deptno)")
+        .withValidatorIdentifierExpansion(true)
+        .ok();
+
+    sql("select deptno from emp join dept using (deptno)")
+        .withValidatorIdentifierExpansion(false)
+        .ok();
+
+    sql("select deptno from emp natural join dept")
+        .withValidatorIdentifierExpansion(false)
+        .ok();
+  }
+
+  /** Tests that an unqualified common column in ORDER BY is valid for
+   * JOINs with USING and for NATURAL JOINs. */
+  @Test void testOrderByUnqualifiedCommonColumn() {
+    sql("select name from emp join dept using (deptno) order by deptno").ok();
+    sql("select name from emp natural join dept order by deptno").ok();
+    sql("select name from emp full join dept using (deptno) order by deptno").ok();
+    sql("select name from emp left join dept using (deptno) order by deptno").ok();
+    sql("select name from emp right join dept using (deptno) order by deptno").ok();
+    sql("select name from emp join dept using (deptno) order by deptno desc").ok();
+    sql("select name from emp join dept using (deptno)"
+        + " order by deptno nulls first").ok();
+    sql("select count(*) from emp join dept using (deptno)"
+        + " group by deptno").ok();
+    sql("select count(*) from emp join dept using (deptno)"
+        + " group by deptno order by deptno").ok();
+    sql("select deptno from emp join dept using (deptno)")
+        .withValidatorConfig(c -> c.withIdentifierExpansion(true))
+        .ok();
+    sql("select deptno from emp join dept using (deptno)"
+        + " order by deptno")
+        .withValidatorConfig(c -> c.withIdentifierExpansion(true))
+        .ok();
+    sql("select deptno as d from emp join dept using (deptno)"
+        + " order by deptno")
+        .withValidatorConfig(c -> c.withIdentifierExpansion(true))
+        .ok();
+
+    final String sql = "select name from emp join dept using (deptno) order by deptno";
+    final String expected = "SELECT `DEPT`.`NAME`\n"
+        + "FROM `CATALOG`.`SALES`.`EMP` AS `EMP`\n"
+        + "INNER JOIN `CATALOG`.`SALES`.`DEPT` AS `DEPT` USING (`DEPTNO`)\n"
+        + "ORDER BY `EMP`.`DEPTNO`";
+    sql(sql)
+        .withValidatorConfig(c -> c.withIdentifierExpansion(true))
+        .rewritesTo(expected);
+
+    final String fullSql =
+        "select name from emp full join dept using (deptno) order by deptno";
+    final String fullExpected = "SELECT `DEPT`.`NAME`\n"
+        + "FROM `CATALOG`.`SALES`.`EMP` AS `EMP`\n"
+        + "FULL JOIN `CATALOG`.`SALES`.`DEPT` AS `DEPT` USING (`DEPTNO`)\n"
+        + "ORDER BY COALESCE(`EMP`.`DEPTNO`, `DEPT`.`DEPTNO`)";
+    sql(fullSql)
+        .withValidatorConfig(c -> c.withIdentifierExpansion(true))
+        .rewritesTo(fullExpected);
   }
 
   /** Test case for
@@ -6008,12 +6756,17 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     sql("select * from (emp join bonus using (job))\n"
         + "join dept using (deptno)").ok();
 
-    // Cannot alias a JOIN (until
-    // [CALCITE-5168] Allow AS after parenthesized JOIN
-    // is fixed).
-    sql("select * from (emp ^join^ bonus using (job)) as x\n"
-        + "join dept using (deptno)")
-        .fails("Join expression encountered in illegal context");
+    // [CALCITE-5168] Allow AS after parenthesized JOIN.
+    sql("select x.empno from (emp cross join dept) as x").ok();
+    sql("select x.empno from (emp join bonus using (job)) as x").ok();
+    sql("select x.a from ((select empno from emp) cross join "
+        + "(select deptno from dept)) as x (a, c)")
+        .ok();
+    // Inner aliases are obscured by the new alias.
+    sql("select ^emp^.empno from (emp cross join dept) as x")
+        .fails("Table 'EMP' not found");
+    sql("select ^bonus^.job from (emp join bonus using (job)) as x")
+        .fails("Table 'BONUS' not found");
     sql("select * from (emp join bonus using (job))\n"
         + "join dept using (^dname^)")
         .fails("Column 'DNAME' not found in any table");
@@ -6095,7 +6848,7 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     final String sql = "select * from emp as e join dept d\n"
         + "on d.deptno = ^(select 1, 2 from emp where deptno < e.deptno)^";
     final String expected = "(?s)Cannot apply '\\$SCALAR_QUERY' to arguments "
-        + "of type '\\$SCALAR_QUERY\\(<RECORDTYPE\\(INTEGER EXPR\\$0, INTEGER "
+        + "of type '\\$SCALAR_QUERY\\(<ROW\\(INTEGER EXPR\\$0, INTEGER "
         + "EXPR\\$1\\)>\\)'\\. Supported form\\(s\\).*";
     sql(sql).fails(expected);
   }
@@ -6166,6 +6919,16 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     sql("select sum(sal + sal) from emp having sum(sal) > 10").ok();
     sql("SELECT deptno FROM emp GROUP BY deptno HAVING ^sal^ > 10")
         .fails("Expression 'SAL' is not being grouped");
+    sql("SELECT *\n"
+        + "FROM dept d\n"
+        + "INNER JOIN emp e\n"
+        + "  ON e.sal < (\n"
+        + "    SELECT MAX(e2.sal)\n"
+        + "    FROM emp e2\n"
+        + "    WHERE e2.job = e.job\n"
+        + "    GROUP BY e2.job\n"
+        + "    HAVING MIN(e2.deptno) = d.deptno\n"
+        + "  )").ok();
   }
 
   @Test void testHavingBetween() {
@@ -6224,7 +6987,130 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     f.withSql(qualifyOnMultipleWindowFunctions).ok();
   }
 
-  /** Negative tests for the {@code QUALIFY} clause. */
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-5406">[CALCITE-5406]
+   * Support the SELECT DISTINCT ON statement for PostgreSQL dialect</a>. */
+  @Test void testDistinctOnNotAllowed() {
+    // DISTINCT ON is not allowed under default SQL conformance
+    sql("^SELECT DISTINCT ON (deptno) empno FROM emp^ ORDER BY deptno")
+        .fails("SELECT DISTINCT ON is not supported under the current SQL conformance level");
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-5406">[CALCITE-5406]
+   * Support the SELECT DISTINCT ON statement for PostgreSQL dialect</a>. */
+  @Test void testDistinctOnPositive() {
+    final SqlValidatorFixture f =
+        fixture().withConformance(SqlConformanceEnum.LENIENT);
+
+    f.withSql("SELECT DISTINCT ON (deptno) empno, ename FROM emp ORDER BY deptno, empno")
+        .ok();
+
+    f.withSql("SELECT DISTINCT ON (deptno, job) empno FROM emp ORDER BY deptno, job, hiredate")
+        .ok();
+
+    f.withSql("SELECT DISTINCT ON (deptno) empno FROM emp ORDER BY deptno DESC")
+        .ok();
+
+    f.withSql("SELECT DISTINCT ON (deptno) empno FROM emp ORDER BY deptno NULLS FIRST")
+        .ok();
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-5406">[CALCITE-5406]
+   * Support the SELECT DISTINCT ON statement for PostgreSQL dialect</a>. */
+  @Test void testDistinctOnNegative() {
+    final SqlValidatorFixture f =
+        fixture().withConformance(SqlConformanceEnum.LENIENT);
+
+    // DISTINCT ON requires ORDER BY
+    f.withSql("^SELECT DISTINCT ON (deptno) empno FROM emp^")
+        .fails("SELECT DISTINCT ON requires an ORDER BY clause");
+
+    // ORDER BY must contain all DISTINCT ON expressions as prefix
+    f.withSql("SELECT DISTINCT ON (deptno, job) empno FROM emp ORDER BY ^deptno^")
+        .fails("SELECT DISTINCT ON expressions must match ORDER BY expressions");
+
+    // ORDER BY prefix must match exactly
+    f.withSql("SELECT DISTINCT ON (deptno, job) empno FROM emp ORDER BY ^job^, deptno")
+        .fails("SELECT DISTINCT ON expressions must match ORDER BY expressions");
+
+    // DISTINCT ON with extra ORDER BY is ok
+    f.withSql("SELECT DISTINCT ON (deptno) empno FROM emp ORDER BY deptno, job")
+        .ok();
+
+    // Duplicate expressions in DISTINCT ON are allowed but must be matched in ORDER BY
+    f.withSql("SELECT DISTINCT ON (deptno, deptno) deptno, empno FROM emp ORDER BY deptno, deptno")
+        .ok();
+
+    // DISTINCT ON with expression
+    f.withSql("SELECT DISTINCT ON (empno % 2) empno, ename FROM emp ORDER BY empno % 2")
+        .ok();
+
+    // Empty DISTINCT ON is not allowed (parse error)
+    f.withSql("SELECT DISTINCT ON ((^)^) deptno FROM emp")
+        .fails("(?s)Encountered \"\\)\" at .*");
+
+    // DISTINCT ON can reference alias (like ORDER BY)
+    f.withSql("SELECT DISTINCT ON (x) empno AS x, deptno FROM emp ORDER BY x")
+        .ok();
+
+    // DISTINCT ON with alias-column name clash: alias in SELECT takes precedence
+    f.withSql("SELECT DISTINCT ON (deptno) empno AS deptno, deptno AS d FROM emp ORDER BY deptno")
+        .ok();
+
+    // DISTINCT ON with qualified column reference
+    f.withSql("SELECT DISTINCT ON (e.deptno) e.deptno AS x, e.empno "
+            + "FROM emp AS e ORDER BY e.deptno")
+        .ok();
+
+    // Integer literal in both DISTINCT ON and ORDER BY matches at validator
+    // (ordinal resolution happens later in SqlToRelConverter)
+    f.withSql("SELECT DISTINCT ON (2) empno, ename FROM emp ORDER BY 2")
+        .ok();
+
+    // Expressions in DISTINCT ON (not ordinals)
+    f.withSql("SELECT DISTINCT ON (empno % 2, CHAR_LENGTH(ename)) empno, ename "
+            + "FROM emp ORDER BY empno % 2, CHAR_LENGTH(ename)")
+        .ok();
+
+    // DISTINCT ON referencing non-projected column requires ORDER BY
+    f.withSql("^SELECT DISTINCT ON (deptno) empno, ename FROM emp^")
+        .fails("SELECT DISTINCT ON requires an ORDER BY clause");
+
+    // DISTINCT ON with aggregate query
+    f.withSql("SELECT DISTINCT ON (deptno) deptno, SUM(sal) "
+            + "FROM emp GROUP BY deptno ORDER BY deptno")
+        .ok();
+
+    // DISTINCT ON with aggregate expression
+    f.withSql("SELECT DISTINCT ON (SUM(sal)) deptno, SUM(sal) "
+            + "FROM emp GROUP BY deptno ORDER BY SUM(sal)")
+        .ok();
+
+    // DISTINCT ON with aggregate query and alias
+    f.withSql("SELECT DISTINCT ON (sum_sal) deptno, SUM(sal) AS sum_sal "
+            + "FROM emp GROUP BY deptno ORDER BY sum_sal")
+        .ok();
+
+    // DISTINCT ON with USING join (requires qualified reference due to Calcite limitation)
+    f.withSql("SELECT DISTINCT ON (emp.deptno) * "
+            + "FROM emp JOIN dept USING (deptno) ORDER BY emp.deptno")
+        .ok();
+
+    // DISTINCT ON with NATURAL join (requires qualified reference due to Calcite limitation)
+    f.withSql("SELECT DISTINCT ON (emp.deptno) * FROM emp NATURAL JOIN dept ORDER BY emp.deptno")
+        .ok();
+
+    // DISTINCT ON with unqualified column reference - should work if column is unambiguous
+    f.withSql("SELECT DISTINCT ON (deptno) empno, deptno FROM emp ORDER BY deptno, empno")
+        .ok();
+
+    // DISTINCT ON with unqualified column in ORDER BY - should match
+    f.withSql("SELECT DISTINCT ON (deptno) empno, deptno FROM emp ORDER BY deptno")
+        .ok();
+  }
+
   @Test void testQualifyNegative() {
     final SqlValidatorFixture f =
         fixture().withConformance(SqlConformanceEnum.LENIENT);
@@ -6608,6 +7494,38 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .ok();
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7597">[CALCITE-7597]
+   * Support ORDER BY ALL</a>. */
+  @Test void testOrderByAll() {
+    // expands to all SELECT items, validates fine
+    sql("select deptno, sal from emp order by all").ok();
+    // direction applies to every expanded key
+    sql("select deptno, sal from emp order by all desc").ok();
+    // SELECT * validates with ORDER BY ALL; what the star expands to as sort
+    // keys is asserted explicitly by rewritesTo below.
+    sql("select * from emp order by all").ok();
+    sql("select * from emp order by all desc").ok();
+    // Multiple qualified stars validate together (no cross-expansion error).
+    sql("select emp.*, dept.* from emp, dept order by all desc").ok();
+    // Show the expanded sort keys.
+    sql("select * from dept order by all")
+        .rewritesTo("SELECT *\n"
+            + "FROM `DEPT`\n"
+            + "ORDER BY `DEPT`.`DEPTNO`, `DEPT`.`NAME`");
+    // Aliases that shadow other column names must not confuse expansion
+    sql("select empno as deptno, deptno as empno from emp order by all").ok();
+    // verify "x" still resolves and the two features coexist
+    sql("select sal as x, x + 1 as y from emp order by all")
+        .withValidatorIdentifierExpansion(true)
+        .withConformance(SqlConformanceEnum.BABEL)
+        .ok();
+    sql("select sal as x, x + 1 as y from emp order by all desc")
+        .withValidatorIdentifierExpansion(true)
+        .withConformance(SqlConformanceEnum.BABEL)
+        .ok();
+  }
+
   @Test void testOrder() {
     final SqlConformance conformance = fixture().conformance();
     sql("select empno as x from emp order by empno").ok();
@@ -6715,6 +7633,30 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
 
   @Test void testOrderJoin() {
     sql("select * from emp as e, dept as d order by e.empno").ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7761">[CALCITE-7761]
+   * Preserve OFFSET and FETCH when rewriting outer ORDER BY</a>. */
+  @Test void testOrderByPreservesFetchAddedByRewrite() {
+    final SqlValidatorFixture fixture = fixture()
+        .withFactory(f -> f.withValidator(RownumRewritingValidator::new));
+
+    fixture.withSql("select empno from emp where rownum <= 5 order by empno")
+        .rewritesTo("SELECT *\n"
+            + "FROM (SELECT `EMPNO`\n"
+            + "FROM `EMP`\n"
+            + "FETCH NEXT 5 ROWS ONLY)\n"
+            + "ORDER BY `EXPR$0`.`EMPNO`");
+
+    fixture.withSql("with e as (select deptno as empno from dept)\n"
+        + "select empno from e where rownum <= 5 order by empno")
+        .rewritesTo("SELECT *\n"
+            + "FROM (WITH `E` AS (SELECT `DEPTNO` AS `EMPNO`\n"
+            + "FROM `DEPT`) SELECT `EMPNO`\n"
+            + "FROM `E`\n"
+            + "FETCH NEXT 5 ROWS ONLY)\n"
+            + "ORDER BY `EXPR$0`.`EMPNO`");
   }
 
   /** Test case for
@@ -7040,6 +7982,44 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .withConformance(lenient).ok();
   }
 
+  @Test void testGroupByAll() {
+    // expands to every non-aggregate SELECT item - so listing a column besides
+    // an aggregate validates WITHOUT a "not being grouped" error
+    sql("select deptno, count(*) from emp group by all").ok();
+
+    // only aggregates -> global aggregation (one group), still valid
+    sql("select count(*) from emp group by all").ok();
+
+    // SELECT * validates with GROUP BY ALL; what the star expands to as
+    // grouping keys is asserted explicitly by rewritesTo below.
+    sql("select * from emp group by all").ok();
+    sql("select *, count(*) from emp group by all").ok();
+    sql("select * from emp natural join dept group by all").ok();
+    // Show the expanded grouping keys: GROUP BY ALL is replaced by the
+    // star's underlying columns (behavior validated against DuckDB).
+    sql("select * from dept group by all")
+        .rewritesTo("SELECT *\n"
+            + "FROM `DEPT`\n"
+            + "GROUP BY `DEPT`.`DEPTNO`, `DEPT`.`NAME`");
+
+    // contains-an-aggregate
+    sql("select deptno, substring(job, 1), count(*) + 1 as c, 'x' as x\n"
+        + "from emp group by all")
+        .ok();
+
+    //  GROUP BY ALL collects the non-aggregate exprs (sal, x + 1) as
+    // group keys and "x" still resolves, so the two features coexist.
+    sql("select sal as x, x + 1 as y, count(*) from emp group by all")
+        .withValidatorIdentifierExpansion(true)
+        .withConformance(SqlConformanceEnum.BABEL)
+        .ok();
+
+    // GROUP BY ALL is unaffected by isGroupByAlias
+    sql("select deptno as d, count(*) from emp group by all")
+        .withConformance(SqlConformanceEnum.LENIENT)
+        .ok();
+  }
+
   /** Test case for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-5507">[CALCITE-5507]
    * HAVING alias failed when aggregate function in condition</a>. */
@@ -7330,6 +8310,84 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         + "    grouping sets (deptno, ename),\n"
         + "      (ename)),\n"
         + "  ()").ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6537">[CALCITE-6537]
+   * Add syntax to allow non-aggregated rows to be used in GROUPING SETS</a>. */
+  @Test void testGroupingSetsStarConformance() {
+    // Under DEFAULT conformance, "*" is not a valid grouping element.
+    sql("select deptno, ename, sum(sal)\n"
+        + "from emp\n"
+        + "group by grouping sets ((deptno), (^*^))")
+        .fails("(?s).*Encountered.*\\*.*");
+
+    // Under LENIENT conformance, "*" expands to a ROW of every input column,
+    // so the non-aggregated SELECT columns are grouped in the detail set.
+    sql("select deptno, ename, sum(sal)\n"
+        + "from emp\n"
+        + "group by grouping sets ((deptno), (*))")
+        .withConformance(SqlConformanceEnum.LENIENT).ok();
+
+    // ROLLUP and CUBE accept "*" too.
+    sql("select deptno, ename, sum(sal) from emp\n"
+        + "group by rollup(deptno, *)")
+        .withConformance(SqlConformanceEnum.LENIENT).ok();
+    sql("select deptno, ename, sum(sal) from emp\n"
+        + "group by cube(deptno, *)")
+        .withConformance(SqlConformanceEnum.LENIENT).ok();
+  }
+
+  /** More tests for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6537">[CALCITE-6537]
+   * Add syntax to allow non-aggregated rows to be used in GROUPING SETS</a>.
+   *
+   * <p>Under LENIENT conformance, "*" is allowed as a complete grouping
+   * set, as an element of a grouping set, and as an argument of ROLLUP or
+   * CUBE, including grouping constructs nested within GROUPING SETS. It may
+   * not appear at the top level of GROUP BY, nor inside other expressions.
+   */
+  @Test void testGroupingSetsStarNested() {
+    // "*" as a complete grouping set
+    sql("select deptno, ename, sum(sal) from emp\n"
+        + "group by grouping sets (*)")
+        .withConformance(SqlConformanceEnum.LENIENT).ok();
+
+    // "*" as an element of a grouping set
+    sql("select deptno, ename, sum(sal) from emp\n"
+        + "group by grouping sets ((deptno, *))")
+        .withConformance(SqlConformanceEnum.LENIENT).ok();
+
+    // "*" as an argument of ROLLUP nested within GROUPING SETS
+    sql("select deptno, ename, sum(sal) from emp\n"
+        + "group by grouping sets ((deptno), rollup(ename, *))")
+        .withConformance(SqlConformanceEnum.LENIENT).ok();
+
+    // "*" inside a tuple that is a ROLLUP argument
+    sql("select deptno, ename, sum(sal) from emp\n"
+        + "group by rollup((deptno, *))")
+        .withConformance(SqlConformanceEnum.LENIENT).ok();
+
+    // "*" as a grouping set within GROUP BY DISTINCT
+    sql("select deptno, ename, sum(sal) from emp\n"
+        + "group by distinct grouping sets ((deptno), (*))")
+        .withConformance(SqlConformanceEnum.LENIENT).ok();
+
+    // "*" at the top level of GROUP BY is not allowed
+    sql("select deptno, ename, sum(sal) from emp\n"
+        + "group by ^*^")
+        .withConformance(SqlConformanceEnum.LENIENT)
+        .fails("(?s).*Encountered.*\\*.*");
+
+    // "*" inside another expression is not expanded; validation fails
+    sql("select sum(sal) from emp\n"
+        + "group by grouping sets (abs(^*^))")
+        .withConformance(SqlConformanceEnum.LENIENT)
+        .fails("(?s).*Unknown identifier '\\*'.*");
+    sql("select sum(sal) from emp\n"
+        + "group by grouping sets (deptno + ^*^)")
+        .withConformance(SqlConformanceEnum.LENIENT)
+        .fails("(?s).*Unknown identifier '\\*'.*");
   }
 
   @Test void testRollup() {
@@ -7694,6 +8752,44 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .columnType("INTEGER NOT NULL");
   }
 
+  @Test void testCorrelatedAggregateConformance() {
+    final String sql = "select (select ^sum(sal)^ from dept) from emp";
+    // LENIENT and BABEL allow the non-standard correlated-aggregate construct.
+    sql(sql).withConformance(SqlConformanceEnum.LENIENT).ok();
+    sql(sql).withConformance(SqlConformanceEnum.BABEL).ok();
+    // DEFAULT and STRICT_2003 do not.
+    final String err =
+        "Aggregate function referencing outer column is not allowed under the current SQL conformance level";
+    sql(sql).withConformance(SqlConformanceEnum.DEFAULT).fails(err);
+    sql(sql).withConformance(SqlConformanceEnum.STRICT_2003).fails(err);
+
+    // A non-numeric aggregate over an outer column (MAX of a VARCHAR) is also
+    // lifted to the outer query; the CASE-based rewrite is type-agnostic.
+    final String nonNumeric =
+        "select (select max(ename) from dept) from emp";
+    sql(nonNumeric).withConformance(SqlConformanceEnum.LENIENT).ok();
+    sql(nonNumeric).withConformance(SqlConformanceEnum.BABEL).ok();
+
+    // An expression over aggregates of outer columns is lifted to the outer
+    // query as a whole, and is subject to the same conformance rules as a bare
+    // aggregate.
+    final String twoAggs =
+        "select (select ^sum(sal) + sum(comm)^ from dept) from emp";
+    sql(twoAggs).withConformance(SqlConformanceEnum.LENIENT).ok();
+    sql(twoAggs).withConformance(SqlConformanceEnum.BABEL).ok();
+    sql(twoAggs).withConformance(SqlConformanceEnum.DEFAULT).fails(err);
+    sql(twoAggs).withConformance(SqlConformanceEnum.STRICT_2003).fails(err);
+
+    // Mixed case: an expression aggregating both an outer column (sal) and an
+    // inner column (deptno) references an inner column, so it is not lifted and
+    // is not rejected under any conformance level.
+    final String mixed =
+        "select (select sum(sal) + sum(deptno) from dept) from emp";
+    sql(mixed).withConformance(SqlConformanceEnum.LENIENT).ok();
+    sql(mixed).withConformance(SqlConformanceEnum.DEFAULT).ok();
+    sql(mixed).withConformance(SqlConformanceEnum.STRICT_2003).ok();
+  }
+
   @Test void testAggregateInOrderByFails() {
     sql("select empno from emp order by ^sum(empno)^")
         .fails(ERR_AGG_IN_ORDER_BY);
@@ -7774,6 +8870,33 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .type("RecordType(INTEGER NOT NULL C, INTEGER NOT NULL D) NOT NULL");
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6036">[CALCITE-6036]
+   * Support WITHIN GROUP (ORDER BY x) OVER (PARTITION BY y)</a>. Combining a
+   * WITHIN GROUP clause with an OVER clause is non-standard (Oracle) syntax that
+   * is only allowed under a conformance that enables it, such as BABEL. */
+  @Test void testPercentileWithinGroupOver() {
+    final String sql = "select\n"
+        + " percentile_cont(0.25) within group (order by sal)\n"
+        + "   over (partition by deptno) as c\n"
+        + "from emp";
+    // Enabled under BABEL conformance.
+    sql(sql)
+        .withConformance(SqlConformanceEnum.BABEL)
+        .type("RecordType(INTEGER NOT NULL C) NOT NULL");
+  }
+
+  @Test void testPercentileWithinGroupOverFailsInDefaultConformance() {
+    final String sql = "select\n"
+        + " ^percentile_cont(0.25) within group (order by sal)^\n"
+        + "   over (partition by deptno) as c\n"
+        + "from emp";
+    // Rejected under the default conformance, which does not allow WITHIN GROUP
+    // to be combined with an OVER clause.
+    sql(sql)
+        .fails("OVER must be applied to aggregate function");
+  }
+
   /** Tests that {@code PERCENTILE_CONT} only allows numeric fields. */
   @Test void testPercentileContMustOrderByNumeric() {
     final String sql = "select\n"
@@ -7832,7 +8955,10 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
 
   /** Test case for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-3679">[CALCITE-3679]
-   * Allow lambda expressions in SQL queries</a>. */
+   * Allow lambda expressions in SQL queries</a>.
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6242">[CALCITE-6242]
+   * Enhance lambda closure parsing</a>.
+   * */
   @Test void testHigherOrderFunction() {
     final SqlValidatorFixture s = fixture()
         .withOperatorTable(MockSqlOperatorTable.standard().extend());
@@ -7846,6 +8972,10 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .type("RecordType(INTEGER NOT NULL EXPR$0) NOT NULL");
     s.withSql("select HIGHER_ORDER_FUNCTION2(1, () -> 0.1)")
         .type("RecordType(INTEGER NOT NULL EXPR$0) NOT NULL");
+    s.withSql("select HIGHER_ORDER_FUNCTION(1, (x, y) -> x + 1 + ^emp.deptno^) from emp")
+        .ok();
+    s.withSql("select HIGHER_ORDER_FUNCTION(1, (x, y) -> x + 1 + ^deptno^) from emp")
+        .ok();
 
     // test for type check
     s.withSql("select HIGHER_ORDER_FUNCTION(1, (x, y) -> ^x + 1^)")
@@ -7863,13 +8993,119 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .fails("Cannot apply '(?s).*HIGHER_ORDER_FUNCTION' to arguments of type "
             + "'HIGHER_ORDER_FUNCTION\\(<INTEGER>, <FUNCTION\\(ANY, ANY, ANY\\) -> ANY>\\)'.*");
 
-    // test for illegal parameters
-    s.withSql("select HIGHER_ORDER_FUNCTION(1, (x, y) -> x + 1 + ^emp.deptno^) from emp")
-        .fails("Param 'EMP\\.DEPTNO' not found in lambda expression "
-            + "'\\(`X`, `Y`\\) -> `X` \\+ 1 \\+ `EMP`\\.`DEPTNO`'");
+  }
+
+  /** Test case for lambda closure conformance checking.
+   * Tests that lambda expressions can or cannot access variables from enclosing
+   * scopes based on the SQL conformance level.
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6242">[CALCITE-6242]
+   * Enhance lambda closure parsing</a>.
+   * */
+  @Test void testLambdaClosureConformance() {
+    final SqlValidatorFixture s = fixture()
+        .withOperatorTable(MockSqlOperatorTable.standard().extend());
+
+    // Lambda accessing outer scope variable (closure)
+    // In DEFAULT conformance, closure is allowed
+    s.withSql("select HIGHER_ORDER_FUNCTION(1, (x, y) -> x + 1 + deptno) from emp")
+        .withConformance(SqlConformanceEnum.DEFAULT)
+        .ok();
+
+    // In STRICT_92, closure is NOT allowed
     s.withSql("select HIGHER_ORDER_FUNCTION(1, (x, y) -> x + 1 + ^deptno^) from emp")
-        .fails("Param 'DEPTNO' not found in lambda expression "
-            + "'\\(`X`, `Y`\\) -> `X` \\+ 1 \\+ `DEPTNO`'");
+        .withConformance(SqlConformanceEnum.STRICT_92)
+        .fails("Lambda closure is not allowed in this conformance: "
+            + "reference to 'DEPTNO' from enclosing scope");
+
+    // In STRICT_99, closure is NOT allowed
+    s.withSql("select HIGHER_ORDER_FUNCTION(1, (x, y) -> x + 1 + ^deptno^) from emp")
+        .withConformance(SqlConformanceEnum.STRICT_99)
+        .fails("Lambda closure is not allowed in this conformance: "
+            + "reference to 'DEPTNO' from enclosing scope");
+
+    // In STRICT_2003, closure is NOT allowed
+    s.withSql("select HIGHER_ORDER_FUNCTION(1, (x, y) -> x + 1 + ^deptno^) from emp")
+        .withConformance(SqlConformanceEnum.STRICT_2003)
+        .fails("Lambda closure is not allowed in this conformance: "
+            + "reference to 'DEPTNO' from enclosing scope");
+
+    // In BABEL conformance, closure is allowed
+    s.withSql("select HIGHER_ORDER_FUNCTION(1, (x, y) -> x + 1 + deptno) from emp")
+        .withConformance(SqlConformanceEnum.BABEL)
+        .ok();
+
+    // In LENIENT conformance, closure is allowed
+    s.withSql("select HIGHER_ORDER_FUNCTION(1, (x, y) -> x + 1 + deptno) from emp")
+        .withConformance(SqlConformanceEnum.LENIENT)
+        .ok();
+
+    // Lambda using only its own parameters (no closure) - should always work
+    s.withSql("select HIGHER_ORDER_FUNCTION(1, (x, y) -> x + 1) from emp")
+        .withConformance(SqlConformanceEnum.STRICT_92)
+        .ok();
+
+    s.withSql("select HIGHER_ORDER_FUNCTION(1, (x, y) -> y) from emp")
+        .withConformance(SqlConformanceEnum.STRICT_92)
+        .ok();
+
+    // Test with qualified column name in closure
+    s.withSql("select HIGHER_ORDER_FUNCTION(1, (x, y) -> x + 1 + emp.deptno) from emp")
+        .withConformance(SqlConformanceEnum.DEFAULT)
+        .ok();
+
+    s.withSql("select HIGHER_ORDER_FUNCTION(1, (x, y) -> x + 1 + ^emp.deptno^) from emp")
+        .withConformance(SqlConformanceEnum.STRICT_92)
+        .fails("Lambda closure is not allowed in this conformance: "
+            + "reference to 'EMP.DEPTNO' from enclosing scope");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7654">[CALCITE-7654]
+   * Lambda functions handle incorrectly field accesses</a>.  */
+  @Test void testLambdaStructFieldAccess() {
+    SqlOperatorTable chain =
+        SqlOperatorTables.chain(
+            SqlOperatorTables.of(SqlLibraryOperators.EXISTS),
+            SqlStdOperatorTable.instance());
+    final SqlValidatorFixture s = fixture().withOperatorTable(chain);
+    // EMPLOYEES is ARRAY<ROW(EMPNO, ENAME, DETAIL)>.
+    // Parenthesized form: parses as DOT(e, empno).
+    s.withSql("select \"EXISTS\"(employees, e -> (e).empno > 0)\n"
+            + "from dept_nested")
+        .columnType("BOOLEAN");
+    // Unparenthesized form: parses as compound identifier e.empno.
+    s.withSql("select \"EXISTS\"(employees, e -> e.empno > 0)\n"
+            + "from dept_nested")
+        .columnType("BOOLEAN");
+    // Nested field access.
+    s.withSql("select \"EXISTS\"(employees, e -> (e).detail.skills is not null)\n"
+            + "from dept_nested")
+        .columnType("BOOLEAN");
+    // Field access through an array index: DETAIL.SKILLS is
+    // ARRAY<ROW(TYPE, DESC, OTHERS)>.
+    s.withSql("select \"EXISTS\"(employees,\n"
+            + "  e -> (e).detail.skills[1].\"TYPE\" = 'a')\n"
+            + "from dept_nested")
+        .columnType("BOOLEAN");
+    // Same, starting from a compound identifier.
+    s.withSql("select \"EXISTS\"(employees,\n"
+            + "  e -> e.detail.skills[1].\"TYPE\" = 'a')\n"
+            + "from dept_nested")
+        .columnType("BOOLEAN");
+    // A field that does not exist in the parameter's type.
+    s.withSql("select \"EXISTS\"(employees, e -> e.^bad^ > 0)\n"
+            + "from dept_nested")
+        .fails("Unknown field 'BAD'");
+    // An unknown field behind an array index produces an error.
+    s.withSql("select \"EXISTS\"(employees,\n"
+            + "  e -> e.detail.skills[1].^bad^ = 'a')\n"
+            + "from dept_nested")
+        .fails("Unknown field 'BAD'");
+    // Field access on an expression that is not a simple access chain.
+    s.withSql("select \"EXISTS\"(employees,\n"
+            + "  e -> coalesce((e).detail, e.detail).skills is not null)\n"
+            + "from dept_nested")
+        .columnType("BOOLEAN");
   }
 
   /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7193">[CALCITE-7193]
@@ -7885,6 +9121,198 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     sql(sql)
         .withOperatorTable(chain)
         .ok();
+  }
+
+  /**
+   * Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7457">[CALCITE-7457]
+   * VALUES and SELECT produce different validation results for the same expression</a>.
+   */
+  @Test void testSelectVsValuesValidation() {
+    sql("select 1.0 + NULL from (values (0)) as t(x)")
+        .columnType("DECIMAL(3, 1)");
+    expr("1.0 + NULL")
+        .columnType("DECIMAL(3, 1)");
+
+    sql("select 1 + ? from (values (0)) as t(x)").ok();
+    expr("1 + ?").ok();
+
+    sql("select 1 + ^NULL^ from (values (0)) as t(x)")
+        .withTypeCoercion(false)
+        .fails("(?s).*Illegal use of .NULL.*");
+    expr("1 + ^NULL^")
+        .withTypeCoercion(false)
+        .fails("(?s).*Illegal use of .NULL.*");
+
+    sql("select LOCALTIME(^NULL^) from (values (0)) as t(x)")
+        .withTypeCoercion(false)
+        .fails("(?s).*Illegal use of .NULL.*");
+    expr("LOCALTIME(^NULL^)")
+        .withTypeCoercion(false)
+        .fails("(?s).*Illegal use of .NULL.*");
+  }
+
+  /**
+   * Verifies that {@code inferUnknownTypes} works for all subqueries
+   * from {@link org.apache.calcite.sql.SqlKind#QUERY}.
+   */
+  @Test void testInferTypesForEveryQueryKindAsSubquery() {
+    // SELECT as scalar subquery
+    sql("select (select ? + 1 from (values (0)) as t(x))"
+        + " from (values (0)) as u(y)")
+        .assertBindType(is("RecordType(INTEGER ?0)"));
+
+    // VALUES as scalar subquery
+    sql("select (values (? + 1)) from (values (0)) as u(y)")
+        .assertBindType(is("RecordType(INTEGER ?0)"));
+
+    // UNION as subquery
+    sql("select * from (values (1)) as t(x)"
+        + " where x in (select ? + 1 from (values (0)) as u(y)"
+        + "             union all select ? + 1 from (values (0)) as v(z))")
+        .assertBindType(is("RecordType(INTEGER ?0, INTEGER ?1)"));
+
+    // INTERSECT as subquery
+    sql("select * from (values (1)) as t(x)"
+        + " where x in (select ? + 1 from (values (0)) as u(y)"
+        + "             intersect select ? + 1 from (values (0)) as v(z))")
+        .assertBindType(is("RecordType(INTEGER ?0, INTEGER ?1)"));
+
+    // EXCEPT as subquery
+    sql("select * from (values (1)) as t(x)"
+        + " where x in (select ? + 1 from (values (0)) as u(y)"
+        + "             except select ? + 1 from (values (0)) as v(z))")
+        .assertBindType(is("RecordType(INTEGER ?0, INTEGER ?1)"));
+
+    // WITH as scalar subquery
+    sql("select (with t(a) as (values (? + 1)) select a from t)"
+        + " from (values (0)) as u(y)")
+        .assertBindType(is("RecordType(INTEGER ?0)"));
+
+    // ORDER_BY as scalar subquery
+    sql("select (select ? + 1 as c from (values (0)) as t(x) order by c)"
+        + " from (values (0)) as u(y)")
+        .assertBindType(is("RecordType(INTEGER ?0)"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6242">[CALCITE-6242]
+   * Enhance lambda closure parsing</a>.
+   * Tests that nested lambda expressions validate correctly: in the
+   * expression {@code x -> EXISTS(arr, y -> x + y = 4)}, the inner lambda
+   * references 'x' from the outer lambda's scope. 'x' should not be treated
+   * like a table column name. */
+  @Test void testNestedLambdaClosure() {
+    final SqlOperatorTable opTable = operatorTableFor(SqlLibrary.SPARK);
+
+    // Nested lambda: inner lambda references outer lambda parameter
+    sql("select \"EXISTS\"(array(1,2,3), x -> \"EXISTS\"(array(1,2,3), y -> x + y = 4))")
+        .withOperatorTable(opTable)
+        .ok();
+
+    // Nested lambda with FROM clause: outer lambda parameter 'x' should resolve
+    // from the outer lambda scope, not as a table column
+    sql("select \"EXISTS\"(array(1,2,3), x -> \"EXISTS\"(array(1,2,3), y -> x + y > deptno))"
+        + " from emp")
+        .withOperatorTable(opTable)
+        .ok();
+
+    // In STRICT mode, inner lambda referencing outer lambda param is treated
+    // as closure and is rejected
+    sql("select \"EXISTS\"(array(1,2,3), x -> \"EXISTS\"(array(1,2,3), y -> ^x^ + y = 4))"
+        + " from emp")
+        .withOperatorTable(opTable)
+        .withConformance(SqlConformanceEnum.STRICT_2003)
+        .fails("Lambda closure is not allowed in this conformance: "
+            + "reference to 'X' from enclosing scope");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6242">[CALCITE-6242]
+   * Enhance lambda closure parsing</a>.
+   * Tests that lambda parameter names follow the same case-sensitivity
+   * rules as other identifiers, including quoting. */
+  @Test void testLambdaParameterCaseSensitivity() {
+    final SqlOperatorTable opTable = operatorTableFor(SqlLibrary.SPARK);
+
+    // Case-insensitive mode with UNCHANGED casing:
+    // parameter defined as 'x', referenced as 'X' should match
+    final SqlValidatorFixture insensitive = fixture()
+        .withCaseSensitive(false)
+        .withUnquotedCasing(Casing.UNCHANGED)
+        .withOperatorTable(opTable);
+
+    insensitive.withSql("select \"EXISTS\"(array(1,2,3), x -> x + 1 > 0)").ok();
+    insensitive.withSql("select \"EXISTS\"(array(1,2,3), x -> X + 1 > 0)").ok();
+    insensitive.withSql("select \"EXISTS\"(array(1,2,3), X -> x + 1 > 0)").ok();
+
+    // Nested lambda: inner lambda references outer parameter with different case
+    insensitive.withSql("select \"EXISTS\"(array(1,2,3),"
+        + " x -> \"EXISTS\"(array(1,2,3), y -> X + y = 4))").ok();
+
+    // Case-sensitive mode with UNCHANGED casing:
+    // parameter defined as 'x', referenced as 'X' should NOT match
+    final SqlValidatorFixture sensitive = fixture()
+        .withCaseSensitive(true)
+        .withUnquotedCasing(Casing.UNCHANGED)
+        .withQuoting(Quoting.DOUBLE_QUOTE)
+        .withOperatorTable(opTable);
+
+    // Same case: should work
+    sensitive.withSql("select \"EXISTS\"(array(1,2,3), x -> x + 1 > 0)").ok();
+
+    // Different case: should fail in case-sensitive mode
+    sensitive.withSql("select \"EXISTS\"(array(1,2,3), x -> ^X^ + 1 > 0)")
+        .fails("Column 'X' not found in any table");
+
+    // Quoted parameter names: quoting preserves case
+    // In default config (unquotedCasing=TO_UPPER), quoted lowercase stays lowercase
+    final SqlValidatorFixture defaultFixture = fixture()
+        .withOperatorTable(opTable);
+
+    // Unquoted parameter 'x' is converted to 'X', unquoted reference 'x' is also 'X'
+    defaultFixture.withSql("select \"EXISTS\"(array(1,2,3), x -> x + 1 > 0)").ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6242">[CALCITE-6242]
+   * Enhance lambda closure parsing</a>.
+   * Tests that duplicate lambda parameter names are rejected, both within
+   * a single lambda and across nested lambdas (shadowing). */
+  @Test void testLambdaDuplicateParameterName() {
+    final SqlOperatorTable opTable = operatorTableFor(SqlLibrary.SPARK);
+    final SqlValidatorFixture f = fixture().withOperatorTable(opTable);
+
+    // Same parameter name used twice in one lambda
+    f.withSql("select HIGHER_ORDER_FUNCTION(1, (x, ^x^) -> x + 1)")
+        .fails("Duplicate lambda parameter 'X'");
+
+    // Same parameter name in nested lambdas (shadowing)
+    f.withSql("select \"EXISTS\"(array(1,2,3),"
+        + " x -> \"EXISTS\"(array(1,2,3), ^x^ -> x + 1 > 0))")
+        .fails("Duplicate lambda parameter 'X'");
+
+    // Different parameter names: should work
+    f.withSql("select \"EXISTS\"(array(1,2,3),"
+        + " x -> \"EXISTS\"(array(1,2,3), y -> x + y = 4))").ok();
+
+    // Case-insensitive: x and X are same parameter (shadowing detected)
+    final SqlValidatorFixture insensitive = fixture()
+        .withCaseSensitive(false)
+        .withUnquotedCasing(Casing.UNCHANGED)
+        .withOperatorTable(opTable);
+    insensitive.withSql("select \"EXISTS\"(array(1,2,3),"
+        + " x -> \"EXISTS\"(array(1,2,3), ^X^ -> X + 1 > 0))")
+        .fails("Duplicate lambda parameter 'X'");
+
+    // Case-sensitive mode: x and X are different parameters (no shadowing)
+    final SqlValidatorFixture sensitive = fixture()
+        .withCaseSensitive(true)
+        .withUnquotedCasing(Casing.UNCHANGED)
+        .withQuoting(Quoting.DOUBLE_QUOTE)
+        .withOperatorTable(opTable);
+    sensitive.withSql("select \"EXISTS\"(array(1,2,3),"
+        + " x -> \"EXISTS\"(array(1,2,3), X -> X + 1 > 0))").ok();
   }
 
   @Test void testPercentileFunctionsBigQuery() {
@@ -8067,15 +9495,28 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         + "   overlaps (date '1-2-3', date '1-2-3')^\n"
         + "or false")
         .fails("(?s).*Cannot apply 'OVERLAPS' to arguments of type .*");
-    // row with 3 arguments as right argument to overlaps
+    // row with 3 arguments as right argument to overlaps.
+    // validateValues checks ROW structure before OVERLAPS validates,
+    // producing "Unequal number of entries in ROW expressions".
+    // SELECT produces the same error.
+    sql("select true or"
+        + " (date '1-2-3', date '1-2-3')"
+        + " overlaps ^(date '1-2-3', date '1-2-3', date '1-2-3')^"
+        + " or false from (values (0)) as t(x)")
+        .fails("(?s).*Unequal number of entries in ROW expressions.*");
     expr("true\n"
-        + "or ^(date '1-2-3', date '1-2-3')\n"
-        + "  overlaps (date '1-2-3', date '1-2-3', date '1-2-3')^\n"
+        + "or (date '1-2-3', date '1-2-3')\n"
+        + "  overlaps ^(date '1-2-3', date '1-2-3', date '1-2-3')^\n"
         + "or false")
-        .fails("(?s).*Cannot apply 'OVERLAPS' to arguments of type .*");
-    expr("^period (date '1-2-3', date '1-2-3')\n"
-        + "   overlaps (date '1-2-3', date '1-2-3', date '1-2-3')^")
-        .fails("(?s).*Cannot apply 'OVERLAPS' to arguments of type .*");
+        .fails("(?s).*Unequal number of entries in ROW expressions.*");
+    // SELECT produces the same error for mismatched ROW sizes
+    sql("select period (date '1-2-3', date '1-2-3')"
+        + " overlaps ^(date '1-2-3', date '1-2-3', date '1-2-3')^"
+        + " from (values (0)) as t(x)")
+        .fails("(?s).*Unequal number of entries in ROW expressions.*");
+    expr("period (date '1-2-3', date '1-2-3')\n"
+        + "   overlaps ^(date '1-2-3', date '1-2-3', date '1-2-3')^")
+        .fails("(?s).*Unequal number of entries in ROW expressions.*");
     expr("true\n"
         + "or ^(1, 2) overlaps (2, 3)^\n"
         + "or false")
@@ -8328,6 +9769,37 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
             + "\\('EMPNO', 'ENAME', 'DETAIL'\\), whereas alias list has 1 columns");
   }
 
+  /**
+   * Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7547">[CALCITE-7547]
+   * BIG_QUERY conformance should allow field access on
+   * UNNEST(array_of_struct) AS alias</a>.
+   */
+  @Test void testAliasUnnestMultipleArraysBigQuery() {
+    // for accessing a field in STRUCT type unnested from array
+    sql("select e.ENAME\n"
+        + "from dept_nested_expanded as d CROSS JOIN\n"
+        + " UNNEST(d.employees) as t(e)")
+        .withConformance(SqlConformanceEnum.BIG_QUERY).columnType("VARCHAR(10) NOT NULL");
+
+    // for unnesting multiple arrays at the same time
+    sql("select d.deptno, e, k.empno, l.\"unit\", l.\"X\" * l.\"Y\"\n"
+        + "from dept_nested_expanded as d CROSS JOIN\n"
+        + " UNNEST(d.admins, d.employees, d.offices) as t(e, k, l)")
+        .withConformance(SqlConformanceEnum.BIG_QUERY).ok();
+
+    // Make sure validation fails properly given illegal select items
+    sql("select d.deptno, ^e^.some_column, k.empno\n"
+        + "from dept_nested_expanded as d CROSS JOIN\n"
+        + " UNNEST(d.admins, d.employees) as t(e, k)")
+        .withConformance(SqlConformanceEnum.BIG_QUERY)
+        .fails("Table 'E' not found");
+    sql("select d.deptno, e.detail, ^unknown^.detail\n"
+        + "from dept_nested_expanded as d CROSS JOIN\n"
+        + " UNNEST(d.employees) as t(e)")
+        .withConformance(SqlConformanceEnum.BIG_QUERY).fails("Incompatible types");
+  }
+
   @Test void testUnnestArray() {
     sql("select*from unnest(array[1])")
         .columnType("INTEGER NOT NULL");
@@ -8451,16 +9923,16 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
   @Test void testCastMapType() {
     sql("select cast(\"int2IntMapType\" as map<int,int>) from COMPLEXTYPES.CTC_T1")
         .withExtendedCatalog()
-        .columnType("(INTEGER NOT NULL, INTEGER) MAP NOT NULL");
+        .columnType("(INTEGER NOT NULL, INTEGER NOT NULL) MAP NOT NULL");
     sql("select cast(\"int2varcharArrayMapType\" as map<int,varchar array>) "
         + "from COMPLEXTYPES.CTC_T1")
         .withExtendedCatalog()
-        .columnType("(INTEGER NOT NULL, VARCHAR ARRAY) MAP NOT NULL");
+        .columnType("(INTEGER NOT NULL, VARCHAR NOT NULL ARRAY NOT NULL) MAP NOT NULL");
     sql("select cast(\"varcharMultiset2IntIntMapType\" as map<varchar(5) multiset, map<int, int>>)"
         + " from COMPLEXTYPES.CTC_T1")
         .withExtendedCatalog()
-        .columnType("(VARCHAR(5) MULTISET NOT NULL, "
-            + "(INTEGER NOT NULL, INTEGER) MAP) MAP NOT NULL");
+        .columnType("(VARCHAR(5) NOT NULL MULTISET NOT NULL, "
+            + "(INTEGER NOT NULL, INTEGER NOT NULL) MAP NOT NULL) MAP NOT NULL");
   }
 
   @Test void testCastAsRowType() {
@@ -8600,6 +10072,21 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     sql(sql3).fails("Table 'D' not found");
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7614">[CALCITE-7614]
+   * UNNEST of an array field in a PEEK_FIELDS struct column fails when the table
+   * is not qualified</a>. */
+  @Test void testUnnestPeekFieldsArrayColumn() {
+    // Table-qualified form already works.
+    sql("select * from dept_nested_peek as r CROSS JOIN UNNEST(r.s.arr) as x").ok();
+    // Unqualified form must work too (used to fail with
+    // "Column 'S.S' not found in table 'DEPT_NESTED_PEEK'").
+    sql("select * from dept_nested_peek CROSS JOIN UNNEST(s.arr) as x").ok();
+    // Comma-join variants, for parity with testUnnestArrayColumn.
+    sql("select * from dept_nested_peek as r, UNNEST(r.s.arr) as x").ok();
+    sql("select * from dept_nested_peek, UNNEST(s.arr) as x").ok();
+  }
+
   @Test void testUnnestWithOrdinality() {
     sql("select*from unnest(array[1, 2]) with ordinality")
         .type("RecordType(INTEGER NOT NULL EXPR$0, INTEGER NOT NULL ORDINALITY) NOT NULL");
@@ -8633,6 +10120,30 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .fails("Column 'NAME' not found in any table");
     sql("select ^ordinality^ from unnest(array(select name from dept)) with ordinality as t(c, o)")
         .fails("Column 'ORDINALITY' not found in any table");
+  }
+
+  /** UNNEST is valid with INNER, LEFT, CROSS, and COMMA joins;
+   *  all other join kinds must be rejected by the validator. */
+  @Test void testUnnestJoinType() {
+    // Allowed join kinds — these must all validate without error.
+    sql("select * from dept inner join unnest(array[1, 2]) as u(x) on true").ok();
+    sql("select * from dept left join unnest(array[1, 2]) as u(x) on true").ok();
+    sql("select * from dept cross join unnest(array[1, 2]) as u(x)").ok();
+    sql("select * from dept, unnest(array[1, 2]) as u(x)").ok();
+
+    // LATERAL wrapping must also be allowed for valid join kinds.
+    sql("select * from dept cross join lateral unnest(array[1, 2]) as u(x)").ok();
+    sql("select * from dept left join lateral unnest(array[1, 2]) as u(x) on true").ok();
+
+    // Disallowed join kinds — validator must reject these.
+    sql("select * from dept right ^join^ unnest(array[1, 2]) as u(x) on true")
+        .fails("UNNEST is only supported with INNER, LEFT, CROSS, or COMMA join, not 'RIGHT'");
+    sql("select * from dept full ^join^ unnest(array[1, 2]) as u(x) on true")
+        .fails("UNNEST is only supported with INNER, LEFT, CROSS, or COMMA join, not 'FULL'");
+
+    // LATERAL wrapping must also be rejected for invalid join kinds.
+    sql("select * from dept right ^join^ lateral unnest(array[1, 2]) as u(x) on true")
+        .fails("UNNEST is only supported with INNER, LEFT, CROSS, or COMMA join, not 'RIGHT'");
   }
 
   @Test void unnestMapMustNameColumnsKeyAndValueWhenNotAliased() {
@@ -8778,6 +10289,35 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     sql("SELECT ARG_MAX(deptno, sal) FROM emp").ok();
     sql("SELECT ARG_MIN('a', 5.5) FROM emp").ok();
     sql("SELECT ARG_MAX('b', 5) FROM emp").ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7858">[CALCITE-7858]
+   * ARG_MIN, ARG_MAX, MIN_BY and MAX_BY should reject a non-comparable
+   * key</a>.
+   *
+   * <p>The type of column {@code HOME_ADDRESS} is a structured type whose
+   * comparability is {@code NONE}. */
+  @Test void testArgMinMaxNonComparableKey() {
+    final String expected = "Cannot apply '%s' to arguments of type "
+        + "'%s\\(<INTEGER>, <>\\)'\\. "
+        + "Supported form\\(s\\): %s\\(<ANY>, <COMPARABLE_TYPE>\\)";
+    sql("select ^arg_min(empno, home_address)^ from emp_address")
+        .fails(String.format(Locale.ROOT, expected, "ARG_MIN", "ARG_MIN", "ARG_MIN"));
+    sql("select ^arg_max(empno, home_address)^ from emp_address")
+        .fails(String.format(Locale.ROOT, expected, "ARG_MAX", "ARG_MAX", "ARG_MAX"));
+    sql("select ^max_by(empno, home_address)^ from emp_address")
+        .withOperatorTable(operatorTableFor(SqlLibrary.SPARK))
+        .fails(String.format(Locale.ROOT, expected, "MAX_BY", "MAX_BY", "MAX_BY"));
+    sql("select ^min_by(empno, home_address)^ from emp_address")
+        .withOperatorTable(operatorTableFor(SqlLibrary.SPARK))
+        .fails(String.format(Locale.ROOT, expected, "MIN_BY", "MIN_BY", "MIN_BY"));
+
+    // The value (the first argument) need not be comparable
+    sql("select arg_min(home_address, empno) from emp_address").ok();
+    sql("select max_by(home_address, empno) from emp_address")
+        .withOperatorTable(operatorTableFor(SqlLibrary.SPARK))
+        .ok();
   }
 
   @Test void testModeFunction() {
@@ -8974,6 +10514,47 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .fails("Object 'NONEXISTENT' not found");
   }
 
+  @Test void testExplicitTableWithOrderBy() {
+    final String empRecordType =
+        "RecordType(INTEGER NOT NULL EMPNO,"
+            + " VARCHAR(20) NOT NULL ENAME,"
+            + " VARCHAR(10) NOT NULL JOB,"
+            + " INTEGER MGR,"
+            + " TIMESTAMP(0) NOT NULL HIREDATE,"
+            + " INTEGER NOT NULL SAL,"
+            + " INTEGER NOT NULL COMM,"
+            + " INTEGER NOT NULL DEPTNO,"
+            + " BOOLEAN NOT NULL SLACKER) NOT NULL";
+
+    sql("table emp order by empno")
+        .type(empRecordType)
+        .rewritesTo("SELECT *\n"
+            + "FROM `EMP`\n"
+            + "ORDER BY `EMP`.`EMPNO`");
+
+    sql("table emp order by empno desc")
+        .type(empRecordType)
+        .rewritesTo("SELECT *\n"
+            + "FROM `EMP`\n"
+            + "ORDER BY `EMP`.`EMPNO` DESC");
+
+    sql("table emp order by empno offset 2 rows fetch next 5 rows only")
+        .type(empRecordType)
+        .rewritesTo("SELECT *\n"
+            + "FROM `EMP`\n"
+            + "ORDER BY `EMP`.`EMPNO`\n"
+            + "OFFSET 2 ROWS\n"
+            + "FETCH NEXT 5 ROWS ONLY");
+
+    sql("(select empno from emp fetch next 5 rows only) order by empno")
+        .type("RecordType(INTEGER NOT NULL EMPNO) NOT NULL")
+        .rewritesTo("SELECT *\n"
+            + "FROM (SELECT `EMPNO`\n"
+            + "FROM `EMP`\n"
+            + "FETCH NEXT 5 ROWS ONLY)\n"
+            + "ORDER BY `EXPR$0`.`EMPNO`");
+  }
+
   @Test void testCollectionTable() {
     sql("select * from table(ramp(3))")
         .type("RecordType(INTEGER NOT NULL I) NOT NULL");
@@ -9123,13 +10704,23 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
 
   /** Test case for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-7217">[CALCITE-7217]
-   * LATERAL is lost after validation</a>. */
+   * LATERAL is lost after validation</a> and
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7312">[CALCITE-7312]
+   * Alias is not auto generated for LATERAL TABLE</a>.
+   * */
   @Test void testCollectionTableWithLateralRewrite() {
     sql("select * from emp, lateral table(ramp(emp.deptno)), dept")
         .rewritesTo("SELECT *\n"
             + "FROM `EMP`,\n"
             + "LATERAL TABLE(RAMP(`EMP`.`DEPTNO`)),\n"
             + "`DEPT`");
+    // SELECT 1 to save space since test is verifying alias for the case of LATERAL TABLE
+    sql("select 1 from emp, lateral table(ramp(emp.deptno)), dept")
+        .withValidatorIdentifierExpansion(true)
+        .rewritesTo("SELECT 1\n"
+            + "FROM `CATALOG`.`SALES`.`EMP` AS `EMP`,\n"
+            + "LATERAL TABLE(RAMP(`EMP`.`DEPTNO`)) AS `EXPR$0`,\n"
+            + "`CATALOG`.`SALES`.`DEPT` AS `DEPT`");
     // As above, with alias
     sql("select * from emp, lateral table(ramp(emp.deptno)) as t(a), dept")
         .rewritesTo("SELECT *\n"
@@ -9170,13 +10761,50 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .rewritesTo("SELECT *\n"
             +  "FROM LATERAL TABLE(RAMP(1234)),\n"
             +  "`EMP`");
+    // SELECT 1 to save space since test is verifying alias for the case of LATERAL TABLE
+    sql("select 1 from lateral table(ramp(1234)), emp")
+        .withValidatorIdentifierExpansion(true)
+        .rewritesTo("SELECT 1\n"
+            + "FROM LATERAL TABLE(RAMP(1234)) AS `EXPR$0`,\n"
+            + "`CATALOG`.`SALES`.`EMP` AS `EMP`");
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-5261">[CALCITE-5261]
+   * UNION(ALL) inside of the CURSOR throws an exception while validating the query</a>.
+   * */
   @Test void testCollectionTableWithCursorParam() {
     sql("select * from table(dedup(cursor(select * from emp),'ename'))")
         .type("RecordType(VARCHAR(1024) NOT NULL NAME) NOT NULL");
     sql("select * from table(dedup(cursor(select * from ^bloop^),'ename'))")
         .fails("Object 'BLOOP' not found");
+    sql("select * from table(dedup(cursor(select ename from emp union all "
+        + "select ename from emp), 'ename'))")
+        .type("RecordType(VARCHAR(1024) NOT NULL NAME) NOT NULL");
+    sql("select * from table(dedup(cursor(select ename from emp union "
+        + "select ename from emp), 'ename'))")
+        .type("RecordType(VARCHAR(1024) NOT NULL NAME) NOT NULL");
+    sql("select * from table(dedup(cursor(values ('a'), ('b')), 'COLUMN0'))")
+        .type("RecordType(VARCHAR(1024) NOT NULL NAME) NOT NULL");
+    sql("select * from table(dedup(cursor(with cte as (select ename from emp) "
+        + "select * from cte), 'ENAME'))")
+        .type("RecordType(VARCHAR(1024) NOT NULL NAME) NOT NULL");
+  }
+
+  @Test void testDeclareCursorUnexpectedKind() {
+    final SqlValidator validator = fixture().factory.createValidator();
+    validator.pushFunctionCall();
+    final SqlCall query =
+        new SqlBasicCall(SqlStdOperatorTable.EXPLICIT_TABLE,
+        new SqlNodeList(
+            ImmutableList.of(SqlLiteral.createNull(SqlParserPos.ZERO)),
+            SqlParserPos.ZERO),
+        SqlParserPos.ZERO);
+    final SqlValidatorScope scope = validator.getEmptyScope();
+    final AssertionError error =
+        assertThrows(AssertionError.class, () ->
+            ((SqlValidatorImpl) validator).declareCursor(query, scope));
+    assertThat(error.getMessage(), containsString("EXPLICIT_TABLE"));
   }
 
   @Test void testTemporalTable() {
@@ -9215,13 +10843,38 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         + "on orders.productid = products_temporal.productid").ok();
   }
 
+  /** Test cases for [FRG-189]. */
+  @Test void testScalarSubQueryTypeInSelectList() {
+    sql("SELECT *, (SELECT * FROM (VALUES(1))) FROM (VALUES(2))")
+        .type("RecordType(INTEGER NOT NULL EXPR$0, INTEGER EXPR$1) NOT NULL");
+    sql("SELECT *, (SELECT * FROM (VALUES(CAST(10 as BIGINT))))\n"
+        + "FROM (VALUES(CAST(10 as bigint)))")
+        .type("RecordType(BIGINT NOT NULL EXPR$0, BIGINT EXPR$1) NOT NULL");
+    sql("SELECT *, (SELECT * FROM (VALUES(10.5))) FROM (VALUES(10.5))")
+        .type("RecordType(DECIMAL(3, 1) NOT NULL EXPR$0,"
+            + " DECIMAL(3, 1) EXPR$1) NOT NULL");
+    sql("SELECT *, (SELECT * FROM (VALUES('this is a char')))\n"
+        + "FROM (VALUES('this is a char too'))")
+        .type("RecordType(CHAR(18) NOT NULL EXPR$0, CHAR(14) EXPR$1) NOT NULL");
+    sql("SELECT *, (SELECT * FROM (VALUES(true))) FROM (values(false))")
+        .type("RecordType(BOOLEAN NOT NULL EXPR$0, BOOLEAN EXPR$1) NOT NULL");
+    sql("SELECT *, (SELECT * FROM (VALUES(cast('abcd' as varchar(10)))))\n"
+        + "FROM (VALUES(CAST('abcd' as varchar(10))))")
+        .type("RecordType(VARCHAR(10) NOT NULL EXPR$0,"
+            + " VARCHAR(10) EXPR$1) NOT NULL");
+    sql("SELECT *, (SELECT * FROM (VALUES(TIMESTAMP '2006-01-01 12:00:05')))\n"
+        + "FROM (VALUES(TIMESTAMP '2006-01-01 12:00:05'))")
+        .type("RecordType(TIMESTAMP(0) NOT NULL EXPR$0,"
+            + " TIMESTAMP(0) EXPR$1) NOT NULL");
+  }
+
   @Test void testScalarSubQuery() {
     sql("SELECT  ename,(select name from dept where deptno=1) FROM emp").ok();
     sql("SELECT ename,^(select losal, hisal from salgrade where grade=1)^ FROM emp")
         .fails("Cannot apply '\\$SCALAR_QUERY' to arguments of type "
-            + "'\\$SCALAR_QUERY\\(<RECORDTYPE\\(INTEGER LOSAL, "
+            + "'\\$SCALAR_QUERY\\(<ROW\\(INTEGER LOSAL, "
             + "INTEGER HISAL\\)>\\)'\\. Supported form\\(s\\): "
-            + "'\\$SCALAR_QUERY\\(<RECORDTYPE\\(SINGLE FIELD\\)>\\)'");
+            + "'\\$SCALAR_QUERY\\(<ROW\\(SINGLE FIELD\\)>\\)'");
 
     // Note that X is a field (not a record) and is nullable even though
     // EMP.NAME is NOT NULL.
@@ -9281,6 +10934,9 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     sql("SELECT dept_nested.employees[1].detail.skills[1].others.a as oa\n"
         + "from dept_nested")
         .type("RecordType(VARCHAR(10) OA) NOT NULL");
+    // Test case for [CALCITE-4353] Validator fails to expand order expression with dot operator
+    sql("select * from dept_nested order by employees[1].detail.skills[2+3].desc")
+        .ok();
   }
 
   @Test void testItemOperatorException() {
@@ -9289,7 +10945,7 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
             +  "<INTEGER>\\)'\\. Supported form\\(s\\): <ARRAY>\\[<INTEGER>\\]\n"
             + "<MAP>\\[<ANY>\\]\n"
             + "<ROW>\\[<CHARACTER>\\|<INTEGER>\\]\n"
-            + "<VARIANT>\\[<ANY>\\].*");
+            + "<VARIANT>\\[<CHARACTER>\\|<INTEGER>\\].*");
   }
 
   /** Test case for
@@ -9453,6 +11109,41 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .rewritesTo(expected);
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testFetchExpressionType() {
+    sql("select name from dept fetch next (^upper('x')^) rows only")
+        .fails("FETCH expression must have a numeric type; "
+            + "actual type is 'CHAR\\(1\\) NOT NULL'");
+    sql("select name from dept fetch next (^'x'^) rows only")
+        .fails("FETCH expression must have a numeric type; "
+            + "actual type is 'CHAR\\(1\\) NOT NULL'");
+    sql("select name from dept fetch next 1.5 rows only").ok();
+    sql("select name from dept "
+        + "fetch next (^row_number() over ()^) rows only")
+        .fails("Windowed aggregate expression is illegal in FETCH clause");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7662">[CALCITE-7662]
+   * Add expression support for OFFSET</a>. */
+  @Test void testOffsetExpressionType() {
+    sql("select name from dept offset ^upper('x')^ rows")
+        .fails("OFFSET expression must have a numeric type; "
+            + "actual type is 'CHAR\\(1\\) NOT NULL'");
+    sql("select name from dept offset ^'x'^ rows")
+        .fails("OFFSET expression must have a numeric type; "
+            + "actual type is 'CHAR\\(1\\) NOT NULL'");
+    sql("select name from dept offset 1.5 rows").ok();
+    sql("select name from dept offset ^deptno^ rows")
+        .fails("OFFSET expression cannot reference table column 'DEPTNO'");
+    sql("select name from dept offset ^cast(null as integer)^ rows")
+        .fails("OFFSET expression evaluated to NULL");
+    sql("select name from dept offset ^row_number() over ()^ rows")
+        .fails("Windowed aggregate expression is illegal in OFFSET clause");
+  }
+
   @Test void testRewriteWithOffsetWithoutOrderBy() {
     final String sql = "select name from dept offset 2";
     final String expected = "SELECT `NAME`\n"
@@ -9461,6 +11152,24 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     sql(sql)
         .withValidatorIdentifierExpansion(false)
         .rewritesTo(expected);
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7624">[CALCITE-7624]
+   * Support BigDecimal for FETCH and OFFSET in Enumerable</a>. */
+  @Test void testNegativeFetchOffsetLimit() {
+    sql("select name from dept limit ^-^1")
+        .fails("(?s).*Encountered \"-\".*");
+    sql("select name from dept offset ^-1^")
+        .fails("OFFSET must not be negative");
+    sql("select name from dept fetch next ^-^1 rows only")
+        .fails("(?s).*Encountered \"-\".*");
+    sql("select name from dept order by name limit ^-^1")
+        .fails("(?s).*Encountered \"-\".*");
+    sql("select name from dept order by name offset ^-1^")
+        .fails("OFFSET must not be negative");
+    sql("select name from dept order by name fetch next ^-^1 rows only")
+        .fails("(?s).*Encountered \"-\".*");
   }
 
   @Test void testRewriteWithUnionFetchWithoutOrderBy() {
@@ -10106,6 +11815,7 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         + "TABLE -\n"
         + "UNNEST -\n"
         + "\n"
+        + "COLON -\n"
         + "CURRENT_VALUE -\n"
         + "DEFAULT -\n"
         + "DOT -\n"
@@ -10162,6 +11872,7 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         + "> SOME left\n"
         + ">= ALL left\n"
         + ">= SOME left\n"
+        + ">> left\n"
         + "BETWEEN ASYMMETRIC -\n"
         + "BETWEEN SYMMETRIC -\n"
         + "IN left\n"
@@ -11540,6 +13251,14 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     sql("select * from table(tumble(table orders, descriptor(^column_not_exist^), "
         + "interval '2' hour))")
         .fails("Unknown identifier 'COLUMN_NOT_EXIST'");
+    // Test case for [CALCITE-7377] Validator should reject a DESCRIPTOR in a table
+    // function when it is not an identifier
+    sql("select * from table(tumble(table orders, descriptor(^1+2^), "
+        + "interval '2' hour))")
+        .fails("The argument of DESCRIPTOR must be an identifier");
+    sql("select * from table(tumble(table orders, descriptor(^orders.rowtime^), "
+        + "interval '2' hour))")
+        .fails("The argument of DESCRIPTOR must be an identifier");
   }
 
   @Test void testTumbleTableFunction() {
@@ -11565,7 +13284,7 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     sql("select rowtime, productid, orderid, 'window_start', 'window_end'\n"
         + "from table(\n"
         + "^tumble(table orders, descriptor(productid), interval '2' hour)^)")
-        .fails("Cannot apply 'TUMBLE' to arguments of type 'TUMBLE\\(<RECORDTYPE\\"
+        .fails("Cannot apply 'TUMBLE' to arguments of type 'TUMBLE\\(<ROW\\"
             + "(TIMESTAMP\\(0\\) ROWTIME, INTEGER PRODUCTID, INTEGER ORDERID\\)>, <COLUMN_LIST>, "
             + "<INTERVAL HOUR>\\)'\\. Supported form\\(s\\): TUMBLE\\(TABLE table_name, "
             + "DESCRIPTOR\\(timecol\\), datetime interval\\[, datetime interval\\]\\)");
@@ -11575,7 +13294,7 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         + "data => table orders,\n"
         + "timecol => descriptor(productid),\n"
         + "size => interval '2' hour)^)")
-        .fails("Cannot apply 'TUMBLE' to arguments of type 'TUMBLE\\(<RECORDTYPE\\"
+        .fails("Cannot apply 'TUMBLE' to arguments of type 'TUMBLE\\(<ROW\\"
             + "(TIMESTAMP\\(0\\) ROWTIME, INTEGER PRODUCTID, INTEGER ORDERID\\)>, <COLUMN_LIST>, "
             + "<INTERVAL HOUR>\\)'\\. Supported form\\(s\\): TUMBLE\\(TABLE table_name, "
             + "DESCRIPTOR\\(timecol\\), datetime interval\\[, datetime interval\\]\\)");
@@ -11590,21 +13309,21 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .fails("Invalid number of arguments to function 'TUMBLE'. Was expecting 3 arguments");
     sql("select * from table(\n"
         + "^tumble(table orders, descriptor(rowtime), 'test')^)")
-        .fails("Cannot apply 'TUMBLE' to arguments of type 'TUMBLE\\(<RECORDTYPE\\"
+        .fails("Cannot apply 'TUMBLE' to arguments of type 'TUMBLE\\(<ROW\\"
             + "(TIMESTAMP\\(0\\) ROWTIME, INTEGER PRODUCTID, INTEGER ORDERID\\)>, <COLUMN_LIST>,"
             + " <CHAR\\(4\\)>\\)'\\. Supported form\\(s\\): TUMBLE\\(TABLE "
             + "table_name, DESCRIPTOR\\(timecol\\), datetime interval"
             + "\\[, datetime interval\\]\\)");
     sql("select * from table(\n"
         + "^tumble(table orders, 'test', interval '2' hour)^)")
-        .fails("Cannot apply 'TUMBLE' to arguments of type 'TUMBLE\\(<RECORDTYPE\\"
+        .fails("Cannot apply 'TUMBLE' to arguments of type 'TUMBLE\\(<ROW\\"
             + "(TIMESTAMP\\(0\\) ROWTIME, INTEGER PRODUCTID, INTEGER ORDERID\\)>, <CHAR\\"
             + "(4\\)>, <INTERVAL HOUR>\\)'\\. Supported form\\(s\\): TUMBLE\\(TABLE "
             + "table_name, DESCRIPTOR\\(timecol\\), datetime interval"
             + "\\[, datetime interval\\]\\)");
     sql("select rowtime, productid, orderid, 'window_start', 'window_end' from table(\n"
         + "^tumble(table orders, descriptor(rowtime), interval '2' hour, 'test')^)")
-        .fails("Cannot apply 'TUMBLE' to arguments of type 'TUMBLE\\(<RECORDTYPE\\"
+        .fails("Cannot apply 'TUMBLE' to arguments of type 'TUMBLE\\(<ROW\\"
             + "(TIMESTAMP\\(0\\) ROWTIME, INTEGER PRODUCTID, INTEGER ORDERID\\)>, <COLUMN_LIST>,"
             + " <INTERVAL HOUR>, <CHAR\\(4\\)>\\)'\\. Supported form\\(s\\): TUMBLE\\(TABLE "
             + "table_name, DESCRIPTOR\\(timecol\\), datetime interval"
@@ -11652,7 +13371,7 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     sql("select rowtime, productid, orderid, 'window_start', 'window_end'\n"
         + "from table(\n"
         + "^hop(table orders, descriptor(productid), interval '2' hour, interval '1' hour)^)")
-        .fails("Cannot apply 'HOP' to arguments of type 'HOP\\(<RECORDTYPE\\"
+        .fails("Cannot apply 'HOP' to arguments of type 'HOP\\(<ROW\\"
             + "(TIMESTAMP\\(0\\) ROWTIME, INTEGER PRODUCTID, INTEGER ORDERID\\)>, <COLUMN_LIST>, "
             + "<INTERVAL HOUR>, <INTERVAL HOUR>\\)'\\. Supported form\\(s\\): "
             + "HOP\\(TABLE table_name, DESCRIPTOR\\(timecol\\), "
@@ -11664,7 +13383,7 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         + "timecol => descriptor(productid),\n"
         + "size => interval '2' hour,\n"
         + "slide => interval '1' hour)^)")
-        .fails("Cannot apply 'HOP' to arguments of type 'HOP\\(<RECORDTYPE\\"
+        .fails("Cannot apply 'HOP' to arguments of type 'HOP\\(<ROW\\"
             + "(TIMESTAMP\\(0\\) ROWTIME, INTEGER PRODUCTID, INTEGER ORDERID\\)>, <COLUMN_LIST>, "
             + "<INTERVAL HOUR>, <INTERVAL HOUR>\\)'\\. Supported form\\(s\\): "
             + "HOP\\(TABLE table_name, DESCRIPTOR\\(timecol\\), "
@@ -11680,31 +13399,36 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         .fails("Invalid number of arguments to function 'HOP'. Was expecting 4 arguments");
     sql("select * from table(\n"
         + "^hop(table orders, descriptor(rowtime), interval '2' hour, 'test')^)")
-        .fails("Cannot apply 'HOP' to arguments of type 'HOP\\(<RECORDTYPE\\(TIMESTAMP\\(0\\) "
+        .fails("Cannot apply 'HOP' to arguments of type 'HOP\\(<ROW\\(TIMESTAMP\\(0\\) "
             + "ROWTIME, INTEGER PRODUCTID, INTEGER ORDERID\\)>, <COLUMN_LIST>, <INTERVAL HOUR>, "
             + "<CHAR\\(4\\)>\\)'. Supported form\\(s\\): HOP\\(TABLE table_name, DESCRIPTOR\\("
             + "timecol\\), datetime interval, datetime interval\\[, datetime interval\\]\\)");
     sql("select * from table(\n"
         + "^hop(table orders, descriptor(rowtime), 'test', interval '2' hour)^)")
-        .fails("Cannot apply 'HOP' to arguments of type 'HOP\\(<RECORDTYPE\\(TIMESTAMP\\(0\\) "
+        .fails("Cannot apply 'HOP' to arguments of type 'HOP\\(<ROW\\(TIMESTAMP\\(0\\) "
             + "ROWTIME, INTEGER PRODUCTID, INTEGER ORDERID\\)>, <COLUMN_LIST>, <CHAR\\(4\\)>, "
             + "<INTERVAL HOUR>\\)'. Supported form\\(s\\): HOP\\(TABLE table_name, DESCRIPTOR\\("
             + "timecol\\), datetime interval, datetime interval\\[, datetime interval\\]\\)");
     sql("select * from table(\n"
         + "^hop(table orders, 'test', interval '2' hour, interval '2' hour)^)")
-        .fails("Cannot apply 'HOP' to arguments of type 'HOP\\(<RECORDTYPE\\(TIMESTAMP\\(0\\) "
+        .fails("Cannot apply 'HOP' to arguments of type 'HOP\\(<ROW\\(TIMESTAMP\\(0\\) "
             + "ROWTIME, INTEGER PRODUCTID, INTEGER ORDERID\\)>, <CHAR\\(4\\)>, <INTERVAL HOUR>, "
             + "<INTERVAL HOUR>\\)'. Supported form\\(s\\): HOP\\(TABLE table_name, DESCRIPTOR\\("
             + "timecol\\), datetime interval, datetime interval\\[, datetime interval\\]\\)");
     sql("select * from table(\n"
         + "^hop(table orders, descriptor(rowtime), interval '2' hour, interval '1' hour, 'test')^)")
-        .fails("Cannot apply 'HOP' to arguments of type 'HOP\\(<RECORDTYPE\\(TIMESTAMP\\(0\\) "
+        .fails("Cannot apply 'HOP' to arguments of type 'HOP\\(<ROW\\(TIMESTAMP\\(0\\) "
             + "ROWTIME, INTEGER PRODUCTID, INTEGER ORDERID\\)>, <COLUMN_LIST>, <INTERVAL HOUR>, "
             + "<INTERVAL HOUR>, <CHAR\\(4\\)>\\)'. Supported form\\(s\\): HOP\\(TABLE table_name, "
             + "DESCRIPTOR\\(timecol\\), datetime interval, datetime interval\\[, datetime interval\\]\\)");
     sql("select * from table(\n"
         + "hop(TABLE ^tabler_not_exist^, descriptor(rowtime), interval '2' hour, interval '1' hour))")
         .fails("Object 'TABLER_NOT_EXIST' not found");
+    // Test case for [CALCITE-7377] Validator should reject a DESCRIPTOR in a table function
+    // when it is not an identifier
+    sql("select * from table(\n"
+        + "hop(table orders, descriptor(^1 + 2^), interval '2' hour, interval '1' hour))")
+        .fails("The argument of DESCRIPTOR must be an identifier");
   }
 
   @Test void testSessionTableFunction() {
@@ -11734,25 +13458,25 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         + "data => table orders,\n"
         + "key => descriptor(productid),\n"
         + "size => interval '1' hour)^)")
-        .fails("Cannot apply 'SESSION' to arguments of type 'SESSION\\(<RECORDTYPE\\(TIMESTAMP\\("
+        .fails("Cannot apply 'SESSION' to arguments of type 'SESSION\\(<ROW\\(TIMESTAMP\\("
             + "0\\) ROWTIME, INTEGER PRODUCTID, INTEGER ORDERID\\)>, <COLUMN_LIST>, "
             + "<INTERVAL HOUR>\\)'. Supported form\\(s\\): SESSION\\(TABLE table_name, DESCRIPTOR\\("
             + "timecol\\), DESCRIPTOR\\(key\\) optional, datetime interval\\)");
     sql("select * from table(\n"
         + "^session(table orders, descriptor(rowtime), descriptor(productid), 'test')^)")
-        .fails("Cannot apply 'SESSION' to arguments of type 'SESSION\\(<RECORDTYPE\\(TIMESTAMP\\("
+        .fails("Cannot apply 'SESSION' to arguments of type 'SESSION\\(<ROW\\(TIMESTAMP\\("
             + "0\\) ROWTIME, INTEGER PRODUCTID, INTEGER ORDERID\\)>, <COLUMN_LIST>, <COLUMN_LIST>, "
             + "<CHAR\\(4\\)>\\)'. Supported form\\(s\\): SESSION\\(TABLE table_name, DESCRIPTOR\\("
             + "timecol\\), DESCRIPTOR\\(key\\) optional, datetime interval\\)");
     sql("select * from table(\n"
         + "^session(table orders, descriptor(rowtime), 'test', interval '2' hour)^)")
-        .fails("Cannot apply 'SESSION' to arguments of type 'SESSION\\(<RECORDTYPE\\(TIMESTAMP\\("
+        .fails("Cannot apply 'SESSION' to arguments of type 'SESSION\\(<ROW\\(TIMESTAMP\\("
             + "0\\) ROWTIME, INTEGER PRODUCTID, INTEGER ORDERID\\)>, <COLUMN_LIST>, <CHAR\\(4\\)>, "
             + "<INTERVAL HOUR>\\)'. Supported form\\(s\\): SESSION\\(TABLE table_name, DESCRIPTOR\\("
             + "timecol\\), DESCRIPTOR\\(key\\) optional, datetime interval\\)");
     sql("select * from table(\n"
         + "^session(table orders, 'test', descriptor(productid), interval '2' hour)^)")
-        .fails("Cannot apply 'SESSION' to arguments of type 'SESSION\\(<RECORDTYPE\\(TIMESTAMP\\("
+        .fails("Cannot apply 'SESSION' to arguments of type 'SESSION\\(<ROW\\(TIMESTAMP\\("
             + "0\\) ROWTIME, INTEGER PRODUCTID, INTEGER ORDERID\\)>, <CHAR\\(4\\)>, <COLUMN_LIST>, "
             + "<INTERVAL HOUR>\\)'. Supported form\\(s\\): SESSION\\(TABLE table_name, DESCRIPTOR\\("
             + "timecol\\), DESCRIPTOR\\(key\\) optional, datetime interval\\)");
@@ -13035,6 +14759,68 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
     assertThat(cast.getParserPosition().getLineNum(), is(1));
   }
 
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-6743">
+   * [CALCITE-6743] Type inference for ARRAY_INSERT function produces an
+   * inconsistent result</a>. */
+  @Test void testArrayFunctionAdjustedOperandTypes() throws SqlParseException {
+    // The array constructor is rewritten to ARRAY(CAST(1 AS DOUBLE), ...);
+    // its registered type must be DOUBLE ARRAY, not INTEGER ARRAY
+    final SqlCall call =
+        checkArrayOperandType("select array_insert(array(1, 2, 3), 3, cast(4 as double))",
+            "DOUBLE ARRAY NOT NULL", "DOUBLE", "DOUBLE NOT NULL");
+    // The inserted element already has the target type; it must keep the
+    // user's cast, without a redundant second cast around it
+    assertThat(Util.last(call.getOperandList()),
+        hasToString("CAST(4 AS DOUBLE)"));
+    checkArrayOperandType(
+        "select array_append(array(1, 2, 3), cast(4 as double))",
+        "DOUBLE NOT NULL ARRAY NOT NULL", "DOUBLE NOT NULL",
+        "DOUBLE NOT NULL");
+    checkArrayOperandType(
+        "select array_prepend(array(1, 2, 3), cast(4 as double))",
+        "DOUBLE NOT NULL ARRAY NOT NULL", "DOUBLE NOT NULL",
+        "DOUBLE NOT NULL");
+    // Only the inserted element is cast (to the array component type);
+    // the array constructor keeps its original type
+    checkArrayOperandType(
+        "select array_append(array(1, 2, 3), cast(4 as tinyint))",
+        "INTEGER NOT NULL ARRAY NOT NULL", "INTEGER NOT NULL",
+        "INTEGER NOT NULL");
+  }
+
+  /** Validates a query whose select list is a single call to an array
+   * function with an array constructor as its first argument; checks the
+   * validated types of the array argument, of the elements of the
+   * constructor, and of the inserted element after the function's type
+   * inference has adjusted them. Returns the validated call. */
+  private SqlCall checkArrayOperandType(String sql, String expectedArrayType,
+      String expectedElementType, String expectedInsertedType)
+      throws SqlParseException {
+    final SqlParser parser = SqlParser.create(sql, SqlParser.config());
+    final SqlNode node = parser.parseQuery();
+    final SqlValidator validator = fixture()
+        .withOperatorTable(operatorTableFor(SqlLibrary.SPARK))
+        .factory.createValidator();
+    final SqlSelect select = (SqlSelect) validator.validate(node);
+    final SqlCall call = (SqlCall) select.getSelectList().get(0);
+    final SqlNode array = call.getOperandList().get(0);
+    final RelDataType arrayType = validator.getValidatedNodeType(array);
+    assertThat(arrayType.getFullTypeString(), is(expectedArrayType));
+    final RelDataType componentType = arrayType.getComponentType();
+    assertThat(componentType, notNullValue());
+    for (SqlNode element : ((SqlCall) array).getOperandList()) {
+      final RelDataType elementType = validator.getValidatedNodeType(element);
+      assertThat(elementType.getFullTypeString(), is(expectedElementType));
+      assertThat(elementType, is(componentType));
+    }
+    // The last operand is the inserted element; its type may differ from
+    // the array component type only in nullability
+    final SqlNode inserted = Util.last(call.getOperandList());
+    assertThat(validator.getValidatedNodeType(inserted).getFullTypeString(),
+        is(expectedInsertedType));
+    return call;
+  }
+
   @Test void testValidateParameterizedExpression() throws SqlParseException {
     final SqlParser.Config config = SqlParser.config();
     final SqlValidator validator = fixture().factory.createValidator();
@@ -13628,7 +15414,7 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
   @Test void testAccessingNestedFieldsOfNullableRecord() {
     sql("select ROW_COLUMN_ARRAY[0].NOT_NULL_FIELD from NULLABLEROWS.NR_T1")
         .withExtendedCatalog()
-        .type("RecordType(BIGINT EXPR$0) NOT NULL");
+        .type("RecordType(BIGINT NOT_NULL_FIELD) NOT NULL");
     sql("select ROW_COLUMN_ARRAY[0]['NOT_NULL_FIELD'] from NULLABLEROWS.NR_T1")
         .withExtendedCatalog()
         .type("RecordType(BIGINT EXPR$0) NOT NULL");
@@ -13720,5 +15506,86 @@ public class SqlValidatorTest extends SqlValidatorTestCase {
         return sqlIdentifier;
       }
     }
+  }
+
+  /** Validator that simulates a rewrite performed by an external application.
+   * Calcite's parser does not produce a {@link SqlSelect} with FETCH and a null
+   * order list, but an external rewrite such as replacing a ROWNUM predicate
+   * with FETCH can produce that tree shape. */
+  private static class RownumRewritingValidator extends SqlValidatorImpl {
+    RownumRewritingValidator(SqlOperatorTable opTab,
+        SqlValidatorCatalogReader catalogReader,
+        RelDataTypeFactory typeFactory, Config config) {
+      super(opTab, catalogReader, typeFactory, config);
+    }
+
+    @Override protected SqlNode performUnconditionalRewrites(SqlNode node,
+        boolean underFrom) {
+      node = super.performUnconditionalRewrites(node, underFrom);
+      if (node instanceof SqlSelect) {
+        final SqlSelect select = (SqlSelect) node;
+        final SqlNode where = select.getWhere();
+        if (where instanceof SqlCall
+            && where.getKind() == SqlKind.LESS_THAN_OR_EQUAL) {
+          final SqlCall call = (SqlCall) where;
+          final SqlNode left = call.operand(0);
+          if (left instanceof SqlIdentifier
+              && ((SqlIdentifier) left).isSimple()
+              && ((SqlIdentifier) left).getSimple().equalsIgnoreCase("ROWNUM")) {
+            select.setWhere(null);
+            select.setFetch(call.operand(1));
+          }
+        }
+      }
+      return node;
+    }
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7582">[CALCITE-7582]
+   * Type validation errors should use SQL type names</a>. */
+  @Test public void testErrorMessage() {
+    sql("SELECT ^(DATE '2020-02-02', DATE '2021-01-01') CONTAINS TIME '10:00:00'^")
+        .fails(".*Cannot apply 'CONTAINS' to arguments of type '<ROW\\(DATE EXPR\\$0, "
+              + "DATE EXPR\\$1\\)> "
+              + "CONTAINS <TIME\\(0\\)>'\\. Supported form\\(s\\): '\\(<DT>, <DT>\\) "
+              + "CONTAINS \\(<DT>, <DT>\\)'\\n"
+              + "'\\(<DT>, <DT>\\) CONTAINS \\(<DT>, <INTERVAL>\\)'\n"
+              + "'\\(<DT>, <INTERVAL>\\) CONTAINS \\(<DT>, <DT>\\)'\n"
+              + "'\\(<DT>, <INTERVAL>\\) CONTAINS \\(<DT>, <INTERVAL>\\)'\n"
+              + "'\\(<DT>, <DT>\\) CONTAINS <DT>'\n"
+              + "'\\(<DT>, <INTERVAL>\\) CONTAINS <DT>'\\n"
+              + "Where 'DT' is one of 'DATE', 'TIME', or 'TIMESTAMP', "
+              + "the same for all arguments\\.");
+    sql("SELECT ^MAP['x', ARRAY[3]] = "
+        + "MAP[CAST(ROW(1, 2) AS ROW(X INT, Y BIGINT)), ROW(ARRAY['a'])]^")
+        .fails("Cannot apply '=' to arguments of type '<MAP<CHAR\\(1\\), INTEGER ARRAY>> = "
+            + "<MAP<ROW\\(INTEGER X, BIGINT Y\\), ROW\\(CHAR\\(1\\) ARRAY EXPR\\$0\\)>>'\\. "
+            + "Supported form\\(s\\): '<COMPARABLE_TYPE> = <COMPARABLE_TYPE>'");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7583">[CALCITE-7583]
+   * UNNEST with multiple array arguments returns wrong result</a>.
+   *
+   * <p>When UNNEST is given multiple collection arguments, zip (positional)
+   * semantics pad shorter collections with NULL, so all output columns must be
+   * nullable even when the element types of the input arrays are not nullable. */
+  @Test void testUnnestMultiArgNullability() {
+    // Single-arg UNNEST: element type is NOT NULL, result column is NOT NULL.
+    sql("select * from unnest(array[1, 2])")
+        .type("RecordType(INTEGER NOT NULL EXPR$0) NOT NULL");
+    // Multi-arg UNNEST: result columns are nullable (padded with NULL when lengths differ).
+    sql("select * from unnest(array[1, 2], array[3, 4])")
+        .type("RecordType(INTEGER EXPR$0, INTEGER EXPR$1) NOT NULL");
+    // Ordinality column itself is always NOT NULL.
+    sql("select * from unnest(array[1, 2], array[3, 4]) with ordinality")
+        .type("RecordType(INTEGER EXPR$0, INTEGER EXPR$1,"
+            + " INTEGER NOT NULL ORDINALITY) NOT NULL");
+    // Different element types: both result columns are nullable.
+    sql("select * from unnest(array['a', 'b'], array[1, 2])")
+        .type("RecordType(CHAR(1) EXPR$0, INTEGER EXPR$1) NOT NULL");
+    // Struct array + scalar array: all result columns (including struct fields) are nullable.
+    sql("select * from unnest(array[(1, 'a'), (2, 'b')], array[10, 20]) as t(p, q, r)")
+        .type("RecordType(INTEGER P, CHAR(1) Q, INTEGER R) NOT NULL");
   }
 }

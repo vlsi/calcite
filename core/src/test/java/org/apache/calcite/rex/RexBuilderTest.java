@@ -357,6 +357,10 @@ class RexBuilderTest {
     final TimestampString ts10 = TimestampString.fromCalendarFields(c);
     assertThat(ts10, hasToString("1969-02-26 19:06:00.987"));
     assertThat(ts10.getMillisSinceEpoch(), is(c.getTimeInMillis()));
+
+    // TimestampString with all zeros fraction
+    final TimestampString ts11 = new TimestampString("2016-02-26 19:06:00.000");
+    assertThat(ts11, hasToString("2016-02-26 19:06:00"));
   }
 
   @Test void testTimeString() {
@@ -766,6 +770,26 @@ class RexBuilderTest {
     RexLiteral rexLiteralHalfUp = builder.makeLiteral(new BigDecimal("12355"), type);
     assertThat(rexLiteralHalfUp.getValue() instanceof BigDecimal, is(true));
     assertThat(rexLiteralHalfUp.getValue(), hasToString("12300"));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7731">[CALCITE-7731]
+   * Bound plain-notation expansion of DECIMAL literals to prevent parse-time
+   * OutOfMemoryError</a>. Casting to a DECIMAL type whose (dialect-permitted)
+   * negative scale would make the plain-notation expansion exceed the
+   * configured bound must fail rather than attempt the expansion. */
+  @Test void testDecimalWithNegativeScaleExceedingPlainNotationBound() {
+    final RelDataTypeFactory typeFactory =
+        new SqlTypeFactoryImpl(
+            CustomTypeSystems.withMinScale(RelDataTypeSystem.DEFAULT,
+                typeName -> -20_000));
+    final RelDataType type = typeFactory.createSqlType(SqlTypeName.DECIMAL, 3, -20_000);
+    final RexBuilder builder = new RexBuilder(typeFactory);
+    final BigDecimal value = new BigDecimal("123");
+    final IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> {
+      builder.makeLiteral(value, type);
+    });
+    assertThat(e.getMessage(),
+        containsString("plain-notation expansion exceeds the configured bound"));
   }
 
   /** Tests {@link DateString} year range. */
@@ -1473,6 +1497,7 @@ class RexBuilderTest {
 
   /** Emulate a user defined type. */
   private static class UDT extends RelDataTypeImpl {
+    @SuppressWarnings("deprecation")
     UDT() {
       this.digest = "(udt)NOT NULL";
     }

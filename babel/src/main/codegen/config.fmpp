@@ -119,7 +119,7 @@ data: {
       "BOOLEAN"
       "BOTH"
       "BREADTH"
-      "BY"
+#     "BY"
 #     "CALL"
       "CALLED"
       "CARDINALITY"
@@ -617,6 +617,9 @@ data: {
     includePosixOperators: true
     includeParsingStringLiteralAsArrayLiteral: true
     includeIntervalWithoutQualifier: true
+    includeSelectBy: true
+    includeDistinctOn: true
+    includeSelectListTrailingComma: true
   }
 }
 

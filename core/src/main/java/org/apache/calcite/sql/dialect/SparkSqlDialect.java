@@ -72,6 +72,16 @@ public class SparkSqlDialect extends SqlDialect {
     return false;
   }
 
+  @Override public void quoteStringLiteral(StringBuilder buf,
+      @Nullable String charsetName, String val) {
+    // Spark SQL treats backslash as an escape character inside string
+    // literals, so a literal backslash must be doubled before the base
+    // method escapes the enclosing quote. Otherwise a value ending in a
+    // backslash terminates the literal early and the trailing text is
+    // parsed as SQL rather than data.
+    super.quoteStringLiteral(buf, charsetName, escapeBackslash(val));
+  }
+
   @Override public JoinType emulateJoinTypeForCrossJoin() {
     return JoinType.CROSS;
   }
@@ -168,6 +178,9 @@ public class SparkSqlDialect extends SqlDialect {
               SqlParserPos.ZERO), SqlParserPos.ZERO);
     case ARRAY:
       return RelToSqlConverterUtil.getCastSpecAngleBracketArrayType(this, type,
+          SqlParserPos.ZERO);
+    case MAP:
+      return RelToSqlConverterUtil.getCastSpecSparkSqlMapType(this, type,
           SqlParserPos.ZERO);
     case MULTISET:
       throw new UnsupportedOperationException("Spark dialect does not support cast to "

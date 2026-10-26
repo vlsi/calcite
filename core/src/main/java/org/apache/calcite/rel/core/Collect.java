@@ -21,6 +21,7 @@ import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelInput;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.RelShuttle;
 import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.SingleRel;
 import org.apache.calcite.rel.type.RelDataType;
@@ -28,8 +29,11 @@ import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.type.SqlTypeUtil;
+import org.apache.calcite.util.Litmus;
 
 import com.google.common.collect.Iterables;
+
+import org.checkerframework.checker.nullness.qual.Nullable;
 
 import java.util.List;
 
@@ -181,6 +185,35 @@ public class Collect extends SingleRel {
   public RelNode copy(RelTraitSet traitSet, RelNode input) {
     assert traitSet.containsIfApplicable(Convention.NONE);
     return new Collect(getCluster(), traitSet, input, rowType());
+  }
+
+  @Override public boolean isValid(Litmus litmus, @Nullable Context context) {
+    final RelDataTypeFactory typeFactory = getCluster().getTypeFactory();
+    final RelDataType inputRow = getInput().getRowType();
+    if (getCollectionType() == SqlTypeName.MAP && inputRow.getFieldCount() != 2) {
+      return litmus.fail("MAP requires an input with exactly two fields;"
+          + " input row type is {}", inputRow);
+    }
+    final RelDataType derived =
+        deriveRowType(typeFactory, getCollectionType(), getFieldName(), inputRow);
+    if (rowType().equals(derived)) {
+      return super.isValid(litmus, context);
+    }
+    // A Collect created for a collection query constructor derives its element
+    // type from the input row type; see #create(RelNode, SqlKind, String).
+    final RelDataType derivedForQuery =
+        deriveRowType(typeFactory, getCollectionType(), getFieldName(),
+            SqlTypeUtil.deriveCollectionQueryComponentType(typeFactory,
+                getCollectionType(), inputRow));
+    if (rowType().equals(derivedForQuery)) {
+      return super.isValid(litmus, context);
+    }
+    return litmus.fail("row type {} does not match the type {}"
+        + " derived from the input", rowType(), derived);
+  }
+
+  @Override public RelNode accept(RelShuttle shuttle) {
+    return shuttle.visit(this);
   }
 
   @Override public RelWriter explainTerms(RelWriter pw) {

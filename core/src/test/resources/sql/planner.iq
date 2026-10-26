@@ -54,7 +54,7 @@ select * from t as t2 where t2.i > 0;
 
 !ok
 
-EnumerableNestedLoopJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[semi])
+EnumerableHashJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[semi])
   EnumerableValues(tuples=[[{ 0 }, { 1 }]])
   EnumerableCalc(expr#0=[{inputs}], expr#1=[0], expr#2=[>($t0, $t1)], EXPR$0=[$t0], $condition=[$t2])
     EnumerableValues(tuples=[[{ 0 }, { 1 }]])
@@ -74,7 +74,7 @@ select * from t as t2 where t2.i > 0;
 
 !ok
 
-EnumerableNestedLoopJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[semi])
+EnumerableHashJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[semi])
   EnumerableValues(tuples=[[{ 0 }, { 1 }]])
   EnumerableCalc(expr#0=[{inputs}], expr#1=[0], expr#2=[>($t0, $t1)], EXPR$0=[$t0], $condition=[$t2])
     EnumerableValues(tuples=[[{ 0 }, { 1 }]])
@@ -147,6 +147,134 @@ EnumerableCalc(expr#0..2=[{inputs}], $f0=[$t1], $f1=[$t2])
 !plan
 !set planner-rules original
 
+# [CALCITE-7643] AggregateMinMaxToLimitRule drops FILTER condition for filtered MIN/MAX aggregates
+select min(v) filter (where p), max(v) filter (where p)
+from (values (10, false), (100, true), (200, true),
+    (300, false), (cast(null as integer), true)) as t(v, p);
++--------+--------+
+| EXPR$0 | EXPR$1 |
++--------+--------+
+|    100 |    200 |
++--------+--------+
+(1 row)
+
+!ok
+
+EnumerableAggregate(group=[{}], EXPR$0=[MIN($0) FILTER $1], EXPR$1=[MAX($0) FILTER $1])
+  EnumerableValues(tuples=[[{ 10, false }, { 100, true }, { 200, true }, { 300, false }, { null, true }]])
+!plan
+
+!set planner-rules "
++AGGREGATE_MIN_MAX_TO_LIMIT,
+-EnumerableRules.ENUMERABLE_AGGREGATE_RULE,
++PROJECT_SUB_QUERY_TO_CORRELATE"
+select min(v) filter (where p), max(v) filter (where p)
+from (values (10, false), (100, true), (200, true),
+    (300, false), (cast(null as integer), true)) as t(v, p);
++--------+--------+
+| EXPR$0 | EXPR$1 |
++--------+--------+
+|    100 |    200 |
++--------+--------+
+(1 row)
+
+!ok
+
+EnumerableCalc(expr#0..2=[{inputs}], $f0=[$t1], $f1=[$t2])
+  EnumerableNestedLoopJoin(condition=[true], joinType=[left])
+    EnumerableNestedLoopJoin(condition=[true], joinType=[left])
+      EnumerableValues(tuples=[[{ 1 }]])
+      EnumerableCalc(expr#0..1=[{inputs}], V=[$t0])
+        EnumerableLimit(fetch=[1])
+          EnumerableCalc(expr#0..1=[{inputs}], expr#2=[IS NOT NULL($t0)], expr#3=[AND($t1, $t2)], proj#0..1=[{exprs}], $condition=[$t3])
+            EnumerableValues(tuples=[[{ 10, false }, { 100, true }, { 200, true }, { 300, false }, { null, true }]])
+    EnumerableCalc(expr#0..1=[{inputs}], V=[$t0])
+      EnumerableLimit(fetch=[1])
+        EnumerableSort(sort0=[$0], dir0=[DESC])
+          EnumerableCalc(expr#0..1=[{inputs}], expr#2=[IS NOT NULL($t0)], expr#3=[AND($t1, $t2)], proj#0..1=[{exprs}], $condition=[$t3])
+            EnumerableValues(tuples=[[{ 10, false }, { 100, true }, { 200, true }, { 300, false }, { null, true }]])
+!plan
+!set planner-rules original
+!use blank
+
+# Test case for [CALCITE-7501] Assertion error in alias expansion for LEFT JOIN USING
+CREATE TABLE D(sk_cid INT, dt DATE, dm_sym VARCHAR, fhd DATE);
+(0 rows modified)
+
+!update
+
+CREATE TABLE F(sk_cid INT);
+(0 rows modified)
+
+!update
+
+CREATE TABLE S(sk_sid INT, sym VARCHAR);
+(0 rows modified)
+
+!update
+
+SELECT
+   d.dt as dtn,
+   fhd as sk_fhd
+FROM D
+JOIN S
+   ON S.sym = D.dm_sym
+LEFT JOIN F USING (sk_cid);
++-----+--------+
+| DTN | SK_FHD |
++-----+--------+
++-----+--------+
+(0 rows)
+
+!ok
+
+# Add tests for [CALCITE-6985] to verify AggregateMinMaxToLimitRule handles empty tables correctly
+create table t_empty (id int);
+(0 rows modified)
+
+!update
+
+select min(id), max(id) from t_empty;
++--------+--------+
+| EXPR$0 | EXPR$1 |
++--------+--------+
+|        |        |
++--------+--------+
+(1 row)
+
+!ok
+EnumerableAggregate(group=[{}], EXPR$0=[MIN($0)], EXPR$1=[MAX($0)])
+  EnumerableTableScan(table=[[BLANK, T_EMPTY]])
+!plan
+
+!set planner-rules "
++AGGREGATE_MIN_MAX_TO_LIMIT,
+-EnumerableRules.ENUMERABLE_AGGREGATE_RULE,
++PROJECT_SUB_QUERY_TO_CORRELATE"
+select min(id), max(id) from t_empty;
++--------+--------+
+| EXPR$0 | EXPR$1 |
++--------+--------+
+|        |        |
++--------+--------+
+(1 row)
+
+!ok
+EnumerableCalc(expr#0..2=[{inputs}], $f0=[$t1], $f1=[$t2])
+  EnumerableNestedLoopJoin(condition=[true], joinType=[left])
+    EnumerableNestedLoopJoin(condition=[true], joinType=[left])
+      EnumerableValues(tuples=[[{ 1 }]])
+      EnumerableLimit(fetch=[1])
+        EnumerableSort(sort0=[$0], dir0=[ASC])
+          EnumerableCalc(expr#0=[{inputs}], expr#1=[IS NOT NULL($t0)], ID=[$t0], $condition=[$t1])
+            EnumerableTableScan(table=[[BLANK, T_EMPTY]])
+    EnumerableLimit(fetch=[1])
+      EnumerableSort(sort0=[$0], dir0=[DESC])
+        EnumerableCalc(expr#0=[{inputs}], expr#1=[IS NOT NULL($t0)], ID=[$t0], $condition=[$t1])
+          EnumerableTableScan(table=[[BLANK, T_EMPTY]])
+!plan
+!set planner-rules original
+
 # [CALCITE-7000] Extend IntersectToSemiJoinRule to support n-way inputs
 !set planner-rules "
 -EnumerableRules.ENUMERABLE_INTERSECT_RULE,
@@ -167,15 +295,14 @@ select a from (values (1.0), (4.0), (null)) as t3 (a);
 !ok
 
 EnumerableAggregate(group=[{0}])
-  EnumerableNestedLoopJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[semi])
-    EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1)], A=[$t1])
-      EnumerableAggregate(group=[{0}])
-        EnumerableNestedLoopJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[semi])
-          EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1) NOT NULL], A=[$t1])
-            EnumerableValues(tuples=[[{ 1.0 }, { 2.0 }, { 3.0 }, { 4.0 }, { 5.0 }]])
-          EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1) NOT NULL], A=[$t1])
-            EnumerableValues(tuples=[[{ 1 }, { 2 }]])
-    EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1)], A=[$t1])
+  EnumerableHashJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[semi])
+    EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1) NOT NULL], A=[$t1])
+      EnumerableHashJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[semi])
+        EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1) NOT NULL], A=[$t1])
+          EnumerableValues(tuples=[[{ 1.0 }, { 2.0 }, { 3.0 }, { 4.0 }, { 5.0 }]])
+        EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1) NOT NULL], A=[$t1])
+          EnumerableValues(tuples=[[{ 1 }, { 2 }]])
+    EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1) NOT NULL], A=[$t1])
       EnumerableValues(tuples=[[{ 1.0 }, { 4.0 }, { null }]])
 !plan
 !set planner-rules original
@@ -224,16 +351,15 @@ select a from (values (1.0), (4.0), (null)) as t3 (a);
 
 !ok
 
-EnumerableCalc(expr#0..1=[{inputs}], expr#2=[CAST($t0):DECIMAL(11, 1)], A=[$t2])
+EnumerableAggregate(group=[{0}])
   EnumerableHashJoin(condition=[=($1, $3)], joinType=[anti])
-    EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1)], proj#0..1=[{exprs}])
-      EnumerableAggregate(group=[{0}])
-        EnumerableNestedLoopJoin(condition=[=(CAST($0):DECIMAL(11, 1) NOT NULL, CAST($1):DECIMAL(11, 1) NOT NULL)], joinType=[anti])
-          EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1) NOT NULL], A=[$t1])
-            EnumerableValues(tuples=[[{ 1.0 }, { 2.0 }, { 3.0 }, { 4.0 }, { 5.0 }]])
-          EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1) NOT NULL], A=[$t1])
-            EnumerableValues(tuples=[[{ 1 }, { 2 }]])
-    EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1)], A=[$t1], A0=[$t1])
+    EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1) NOT NULL], proj#0..1=[{exprs}])
+      EnumerableNestedLoopJoin(condition=[=(CAST($0):DECIMAL(11, 1) NOT NULL, CAST($1):DECIMAL(11, 1) NOT NULL)], joinType=[anti])
+        EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1) NOT NULL], A=[$t1])
+          EnumerableValues(tuples=[[{ 1.0 }, { 2.0 }, { 3.0 }, { 4.0 }, { 5.0 }]])
+        EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1) NOT NULL], A=[$t1])
+          EnumerableValues(tuples=[[{ 1 }, { 2 }]])
+    EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1)], expr#2=[CAST($t0):DECIMAL(11, 1) NOT NULL], A=[$t1], A0=[$t2])
       EnumerableValues(tuples=[[{ 1.0 }, { 4.0 }, { null }]])
 !plan
 !set planner-rules original
@@ -262,64 +388,6 @@ EnumerableMinus(all=[false])
   EnumerableCalc(expr#0=[{inputs}], expr#1=[CAST($t0):DECIMAL(11, 1)], A=[$t1])
     EnumerableValues(tuples=[[{ 1.0 }, { 4.0 }, { null }]])
 !plan
-
-# Test predicate push down with/without expand disjunction.
-with t1 (id1, col11, col12) as (values (1, 11, 111), (2, 12, 122), (3, 13, 133), (4, 14, 144), (5, 15, 155)),
-t2 (id2, col21, col22) as (values (1, 21, 211), (2, 22, 222), (3, 23, 233), (4, 24, 244), (5, 25, 255)),
-t3 (id3, col31, col32) as (values (1, 31, 311), (2, 32, 322), (3, 33, 333), (4, 34, 344), (5, 35, 355))
-select * from t1, t2, t3 where id1 = id2 and id1 = id3 and
-(
-(col11 > 11 and col31 <= 32)
-or
-(col22 < 255 and col32 >= 344)
-);
-+-----+-------+-------+-----+-------+-------+-----+-------+-------+
-| ID1 | COL11 | COL12 | ID2 | COL21 | COL22 | ID3 | COL31 | COL32 |
-+-----+-------+-------+-----+-------+-------+-----+-------+-------+
-|   2 |    12 |   122 |   2 |    22 |   222 |   2 |    32 |   322 |
-|   4 |    14 |   144 |   4 |    24 |   244 |   4 |    34 |   344 |
-+-----+-------+-------+-----+-------+-------+-----+-------+-------+
-(2 rows)
-
-!ok
-
-EnumerableMergeJoin(condition=[AND(=($0, $6), OR(AND(>($1, 11), <=($7, 32)), AND(<($5, 255), >=($8, 344))))], joinType=[inner])
-  EnumerableMergeJoin(condition=[=($0, $3)], joinType=[inner])
-    EnumerableValues(tuples=[[{ 1, 11, 111 }, { 2, 12, 122 }, { 3, 13, 133 }, { 4, 14, 144 }, { 5, 15, 155 }]])
-    EnumerableValues(tuples=[[{ 1, 21, 211 }, { 2, 22, 222 }, { 3, 23, 233 }, { 4, 24, 244 }, { 5, 25, 255 }]])
-  EnumerableValues(tuples=[[{ 1, 31, 311 }, { 2, 32, 322 }, { 3, 33, 333 }, { 4, 34, 344 }, { 5, 35, 355 }]])
-!plan
-
-!set planner-rules "
-+CoreRules.EXPAND_FILTER_DISJUNCTION_LOCAL"
-
-with t1 (id1, col11, col12) as (values (1, 11, 111), (2, 12, 122), (3, 13, 133), (4, 14, 144), (5, 15, 155)),
-t2 (id2, col21, col22) as (values (1, 21, 211), (2, 22, 222), (3, 23, 233), (4, 24, 244), (5, 25, 255)),
-t3 (id3, col31, col32) as (values (1, 31, 311), (2, 32, 322), (3, 33, 333), (4, 34, 344), (5, 35, 355))
-select * from t1, t2, t3 where id1 = id2 and id1 = id3 and
-(
-(col11 > 11 and col31 <= 32)
-or
-(col22 < 255 and col32 >= 344)
-);
-+-----+-------+-------+-----+-------+-------+-----+-------+-------+
-| ID1 | COL11 | COL12 | ID2 | COL21 | COL22 | ID3 | COL31 | COL32 |
-+-----+-------+-------+-----+-------+-------+-----+-------+-------+
-|   2 |    12 |   122 |   2 |    22 |   222 |   2 |    32 |   322 |
-|   4 |    14 |   144 |   4 |    24 |   244 |   4 |    34 |   344 |
-+-----+-------+-------+-----+-------+-------+-----+-------+-------+
-(2 rows)
-
-!ok
-
-EnumerableHashJoin(condition=[AND(=($0, $6), OR(AND(>($1, 11), <=($7, 32)), AND(<($5, 255), >=($8, 344))))], joinType=[inner])
-  EnumerableMergeJoin(condition=[AND(=($0, $3), OR(>($1, 11), <($5, 255)))], joinType=[inner])
-    EnumerableValues(tuples=[[{ 1, 11, 111 }, { 2, 12, 122 }, { 3, 13, 133 }, { 4, 14, 144 }, { 5, 15, 155 }]])
-    EnumerableValues(tuples=[[{ 1, 21, 211 }, { 2, 22, 222 }, { 3, 23, 233 }, { 4, 24, 244 }, { 5, 25, 255 }]])
-  EnumerableCalc(expr#0..2=[{inputs}], expr#3=[32], expr#4=[<=($t1, $t3)], expr#5=[344], expr#6=[>=($t2, $t5)], expr#7=[OR($t4, $t6)], proj#0..2=[{exprs}], $condition=[$t7])
-    EnumerableValues(tuples=[[{ 1, 31, 311 }, { 2, 32, 322 }, { 3, 33, 333 }, { 4, 34, 344 }, { 5, 35, 355 }]])
-!plan
-!set planner-rules original
 
 # [CALCITE-7086] Implement a rule that performs the inverse operation of AggregateCaseToFilterRule
 # Refer to RelToSqlConverterTest.testAggregateFilterToCase(). The following two SQL
@@ -549,6 +617,114 @@ EnumerableCalc(expr#0..2=[{inputs}], proj#0..1=[{exprs}])
           EnumerableTableScan(table=[[scott, DEPT]])
         EnumerableCalc(expr#0..7=[{inputs}], EMPNO=[$t0], DEPTNO=[$t7])
           EnumerableTableScan(table=[[scott, EMP]])
+!plan
+!set planner-rules original
+
+# [CALCITE-7125] Impossible to get a plan with partial aggregate push-down via IntersectToDistinctRule
+!set planner-rules "
+-EnumerableRules.ENUMERABLE_INTERSECT_RULE,
+-AGGREGATE_REMOVE"
+# AGGREGATE_REMOVE is disabled as it would remove the inner COUNTs
+# as the grouping columns are unique
+
+# Intersect rewrite as aggregation + union with partial aggregation pushdown
+select empno, ename from emp where deptno = 10
+intersect
+select empno, ename from emp where empno >= 150;
+
+EnumerableCalc(expr#0..2=[{inputs}], expr#3=[2:BIGINT], expr#4=[=($t2, $t3)], proj#0..1=[{exprs}], $condition=[$t4])
+  EnumerableAggregate(group=[{0, 1}], agg#0=[COUNT()])
+    EnumerableUnion(all=[true])
+      EnumerableAggregate(group=[{0, 1}], agg#0=[COUNT()])
+        EnumerableCalc(expr#0..7=[{inputs}], expr#8=[CAST($t7):INTEGER], expr#9=[10], expr#10=[=($t8, $t9)], proj#0..7=[{exprs}], $condition=[$t10])
+          EnumerableTableScan(table=[[scott, EMP]])
+      EnumerableAggregate(group=[{0, 1}], agg#0=[COUNT()])
+        EnumerableCalc(expr#0..7=[{inputs}], expr#8=[CAST($t0):INTEGER NOT NULL], expr#9=[150], expr#10=[>=($t8, $t9)], proj#0..7=[{exprs}], $condition=[$t10])
+          EnumerableTableScan(table=[[scott, EMP]])
+!plan
++-------+--------+
+| EMPNO | ENAME  |
++-------+--------+
+|  7782 | CLARK  |
+|  7839 | KING   |
+|  7934 | MILLER |
++-------+--------+
+(3 rows)
+
+!ok
+!set planner-rules original
+
+!set planner-rules "
+-CoreRules.INTERSECT_TO_DISTINCT,
+-EnumerableRules.ENUMERABLE_INTERSECT_RULE,
++CoreRules.INTERSECT_TO_DISTINCT_NO_AGGREGATE_PUSHDOWN"
+
+# Intersect rewrite as aggregation + union without partial aggregation pushdown
+select empno, ename from emp where deptno = 10
+intersect
+select empno, ename from emp where empno >= 150;
+
+EnumerableCalc(expr#0..3=[{inputs}], expr#4=[0], expr#5=[>($t2, $t4)], expr#6=[>($t3, $t4)], expr#7=[AND($t5, $t6)], proj#0..1=[{exprs}], $condition=[$t7])
+  EnumerableAggregate(group=[{0, 1}], count_i0=[COUNT() FILTER $2], count_i1=[COUNT() FILTER $3])
+    EnumerableCalc(expr#0..2=[{inputs}], expr#3=[0], expr#4=[=($t2, $t3)], expr#5=[1], expr#6=[=($t2, $t5)], proj#0..1=[{exprs}], $f3=[$t4], $f4=[$t6])
+      EnumerableUnion(all=[true])
+        EnumerableCalc(expr#0..7=[{inputs}], expr#8=[0], expr#9=[CAST($t7):INTEGER], expr#10=[10], expr#11=[=($t9, $t10)], proj#0..1=[{exprs}], i=[$t8], $condition=[$t11])
+          EnumerableTableScan(table=[[scott, EMP]])
+        EnumerableCalc(expr#0..7=[{inputs}], expr#8=[1], expr#9=[CAST($t0):INTEGER NOT NULL], expr#10=[150], expr#11=[>=($t9, $t10)], proj#0..1=[{exprs}], i=[$t8], $condition=[$t11])
+          EnumerableTableScan(table=[[scott, EMP]])
+!plan
++-------+--------+
+| EMPNO | ENAME  |
++-------+--------+
+|  7782 | CLARK  |
+|  7839 | KING   |
+|  7934 | MILLER |
++-------+--------+
+(3 rows)
+
+!ok
+!set planner-rules original
+
+# [CALCITE-7711] Add a rule to convert LEFT or RIGHT OUTER JOIN with IS NULL to ANTI JOIN
+!set planner-rules "
++CoreRules.OUTER_JOIN_TO_ANTI_JOIN"
+select l.id as left_id, r.id as right_id
+from (values (1), (2), (3)) as l(id)
+left join (values (1), (3)) as r(id) on l.id = r.id
+where r.id is null
+order by l.id;
++---------+----------+
+| LEFT_ID | RIGHT_ID |
++---------+----------+
+|       2 |          |
++---------+----------+
+(1 row)
+
+!ok
+EnumerableCalc(expr#0=[{inputs}], expr#1=[null:INTEGER], proj#0..1=[{exprs}])
+  EnumerableMergeJoin(condition=[=($0, $1)], joinType=[anti])
+    EnumerableValues(tuples=[[{ 1 }, { 2 }, { 3 }]])
+    EnumerableValues(tuples=[[{ 1 }, { 3 }]])
+!plan
+
+# RIGHT JOIN keeps the non-commutative join condition after swapping inputs.
+select l.id as left_id, r.id as right_id
+from (values (1), (3), (5)) as l(id)
+right join (values (0), (4), (6)) as r(id) on l.id > r.id
+where l.id is null
+order by r.id;
++---------+----------+
+| LEFT_ID | RIGHT_ID |
++---------+----------+
+|         |        6 |
++---------+----------+
+(1 row)
+
+!ok
+EnumerableCalc(expr#0=[{inputs}], expr#1=[null:INTEGER], ID=[$t1], ID0=[$t0])
+  EnumerableNestedLoopJoin(condition=[>($1, $0)], joinType=[anti])
+    EnumerableValues(tuples=[[{ 0 }, { 4 }, { 6 }]])
+    EnumerableValues(tuples=[[{ 1 }, { 3 }, { 5 }]])
 !plan
 !set planner-rules original
 

@@ -21,7 +21,9 @@ import org.apache.calcite.adapter.enumerable.EnumerableCalc;
 import org.apache.calcite.adapter.enumerable.EnumerableConvention;
 import org.apache.calcite.adapter.enumerable.EnumerableInterpretable;
 import org.apache.calcite.adapter.enumerable.EnumerableRel;
+import org.apache.calcite.adapter.enumerable.EnumerableRelImplementor;
 import org.apache.calcite.adapter.enumerable.EnumerableRules;
+import org.apache.calcite.adapter.enumerable.FetchOffsetRoundingPolicy;
 import org.apache.calcite.adapter.enumerable.RexToLixTranslator;
 import org.apache.calcite.adapter.java.JavaTypeFactory;
 import org.apache.calcite.avatica.AvaticaParameter;
@@ -107,8 +109,10 @@ import org.apache.calcite.sql.validate.SqlValidator;
 import org.apache.calcite.sql2rel.SqlRexConvertletTable;
 import org.apache.calcite.sql2rel.SqlToRelConverter;
 import org.apache.calcite.sql2rel.StandardConvertletTable;
+import org.apache.calcite.sql2rel.TopDownGeneralDecorrelator;
 import org.apache.calcite.tools.FrameworkConfig;
 import org.apache.calcite.tools.Frameworks;
+import org.apache.calcite.tools.RelBuilder;
 import org.apache.calcite.util.ImmutableIntList;
 import org.apache.calcite.util.Pair;
 import org.apache.calcite.util.Util;
@@ -1091,6 +1095,9 @@ public class CalcitePrepareImpl implements CalcitePrepare {
         SqlValidator validator,
         CatalogReader catalogReader,
         SqlToRelConverter.Config config) {
+      config =
+          config.withTopDownGeneralDecorrelationEnabled(
+              context.config().topDownGeneralDecorrelationEnabled());
       return new SqlToRelConverter(this, validator, catalogReader, cluster,
           convertletTable, config);
     }
@@ -1107,6 +1114,11 @@ public class CalcitePrepareImpl implements CalcitePrepare {
 
     @Override protected RelNode decorrelate(SqlToRelConverter sqlToRelConverter,
         SqlNode query, RelNode rootRel) {
+      if (context.config().topDownGeneralDecorrelationEnabled()) {
+        final RelBuilder relBuilder =
+            sqlToRelConverter.config().getRelBuilderFactory().create(rootRel.getCluster(), null);
+        return TopDownGeneralDecorrelator.decorrelateQuery(rootRel, relBuilder);
+      }
       return sqlToRelConverter.decorrelate(query, rootRel);
     }
 
@@ -1186,6 +1198,13 @@ public class CalcitePrepareImpl implements CalcitePrepare {
           CatalogReader.THREAD_LOCAL.set(catalogReader);
           final SqlConformance conformance = context.config().conformance();
           internalParameters.put("_conformance", conformance);
+          final FetchOffsetRoundingPolicy fetchOffsetRoundingPolicy =
+              planner.getContext().unwrap(FetchOffsetRoundingPolicy.class);
+          if (fetchOffsetRoundingPolicy != null) {
+            internalParameters.put(
+                EnumerableRelImplementor.FETCH_OFFSET_ROUNDING_POLICY,
+                fetchOffsetRoundingPolicy);
+          }
           bindable =
               EnumerableInterpretable.toBindable(internalParameters,
                   context.spark(), enumerable,

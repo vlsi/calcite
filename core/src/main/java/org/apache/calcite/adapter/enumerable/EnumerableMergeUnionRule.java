@@ -27,8 +27,8 @@ import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.logical.LogicalUnion;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
-import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.tools.RelBuilder;
 import org.apache.calcite.util.ImmutableBitSet;
 
@@ -88,12 +88,17 @@ public class EnumerableMergeUnionRule extends RelRule<EnumerableMergeUnionRule.C
     // Push down sort limit, if possible.
     RexNode inputFetch = null;
     if (sort.fetch != null) {
-      if (sort.offset == null) {
-        inputFetch = sort.fetch;
-      } else if (sort.fetch instanceof RexLiteral && sort.offset instanceof RexLiteral) {
-        inputFetch =
-            call.builder().literal(RexLiteral.longValue(sort.fetch)
-                + RexLiteral.longValue(sort.offset));
+      final boolean safeToReevaluate =
+          RexUtil.isDeterministic(sort.fetch)
+              && (sort.offset == null || RexUtil.isDeterministic(sort.offset));
+      if (safeToReevaluate) {
+        if (sort.offset == null) {
+          inputFetch = sort.fetch;
+        } else {
+          inputFetch =
+              RexUtil.makeOffsetFetchSum(
+                  sort.getCluster().getRexBuilder(), sort.offset, sort.fetch);
+        }
       }
     }
 

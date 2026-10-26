@@ -355,6 +355,22 @@ class InterpreterTest {
             "[Ringo, 1]");
   }
 
+  /** Tests ROLLUP, which is GROUPING SETS with an empty grouping set. */
+  @Test void testAggregateRollup() {
+    rootSchema().add("beatles", new ScannableTableTest.BeatlesTable());
+    sql("select \"j\", count(*) from \"beatles\" group by rollup(\"j\")")
+        .returnsRowsUnordered("[John, 1]", "[Paul, 1]", "[Ringo, 1]",
+            "[George, 1]", "[null, 4]");
+  }
+
+  /** As {@link #testAggregateRollup()}, but the input is empty. The empty
+   * grouping set yields one row, as a query with no GROUP BY does. */
+  @Test void testAggregateRollupOnEmptyInput() {
+    rootSchema().add("beatles", new ScannableTableTest.BeatlesTable());
+    sql("select \"j\", count(*) from \"beatles\" where false group by rollup(\"j\")")
+        .returnsRows("[null, 0]");
+  }
+
   /** Tests a GROUP BY query that uses
    * {@link org.apache.calcite.sql.fun.SqlInternalOperators#LITERAL_AGG}. */
   @Test void testAggregateLiteralAgg() {
@@ -369,6 +385,42 @@ class InterpreterTest {
     fixture().withRel(relFn)
         .returnsRows("[1940, 2, true, -3]", "[1942, 1, true, -3]",
             "[1943, 1, true, -3]");
+  }
+
+  /** Tests a GROUP BY query after replacing
+   * {@link org.apache.calcite.sql.fun.SqlInternalOperators#LITERAL_AGG}. */
+  @Test void testAggregateRemoveLiteralAggOnEmptyInput() {
+    rootSchema().add("beatles", new ScannableTableTest.BeatlesTable());
+    final Function<RelBuilder, RelNode> relFn =
+        b -> applyAggregateRemoveLiteralAggRule(b.scan("beatles")
+            .empty()
+            .aggregate(b.groupKey("k"),
+                b.literalAgg(true).as("t"))
+            .build());
+    fixture().withRel(relFn)
+        .returnsRows();
+  }
+
+  /** Tests a GROUP BY () query after replacing
+   * {@link org.apache.calcite.sql.fun.SqlInternalOperators#LITERAL_AGG}. */
+  @Test void testAggregateRemoveLiteralAggWithOnlyLiteralAgg() {
+    rootSchema().add("beatles", new ScannableTableTest.BeatlesTable());
+    final Function<RelBuilder, RelNode> relFn =
+        b -> applyAggregateRemoveLiteralAggRule(b.scan("beatles")
+            .aggregate(b.groupKey(),
+                b.literalAgg(true).as("t"))
+            .build());
+    fixture().withRel(relFn)
+        .returnsRows("[true]");
+  }
+
+  private static RelNode applyAggregateRemoveLiteralAggRule(RelNode rel) {
+    final HepProgram program = HepProgram.builder()
+        .addRuleInstance(CoreRules.AGGREGATE_REMOVE_LITERAL_AGG)
+        .build();
+    final HepPlanner hep = new HepPlanner(program);
+    hep.setRoot(rel);
+    return hep.findBestExp();
   }
 
   /** Tests executing a plan on a single-column
@@ -471,7 +523,7 @@ class InterpreterTest {
         + "(select x, y from (values (1, 'a'), (2, 'b'), (2, 'b'), (3, 'c')) as t(x, y))\n"
         + "except all\n"
         + "(select x, y from (values (1, 'a'), (2, 'c'), (4, 'x')) as t2(x, y))";
-    sql(sql).returnsRows("[2, b]", "[2, b]", "[3, c]");
+    sql(sql).returnsRowsUnordered("[2, b]", "[2, b]", "[3, c]");
   }
 
   @Test void testDuplicateRowInterpretMinusAll() {

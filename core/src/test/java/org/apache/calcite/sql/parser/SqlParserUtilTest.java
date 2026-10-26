@@ -17,12 +17,20 @@
 package org.apache.calcite.sql.parser;
 
 import org.apache.calcite.avatica.util.TimeUnit;
+import org.apache.calcite.runtime.CalciteContextException;
 import org.apache.calcite.sql.SqlIntervalQualifier;
+import org.apache.calcite.sql.SqlTimeTzLiteral;
+import org.apache.calcite.sql.SqlTimestampTzLiteral;
 
 import org.junit.jupiter.api.Test;
 
+import java.math.BigDecimal;
+
 import static org.hamcrest.CoreMatchers.equalTo;
+import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.hasToString;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Tests {@link SqlParserUtil}. Currently, this test focuses on tests for the methods that work
@@ -37,10 +45,117 @@ public class SqlParserUtilTest {
     assertThat(SqlParserUtil.intervalToMillis("2.1", qualifier), equalTo(2_100L));
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-4543">[CALCITE-4543]
+   * Interval literal loses a fractional second when it has scale greater
+   * than 3</a>. */
+  @Test void testSecondIntervalToExactMillis() {
+    final SqlIntervalQualifier qualifier =
+        new SqlIntervalQualifier(TimeUnit.SECOND, 1, TimeUnit.SECOND, 9,
+            POSITION);
+    assertThat(SqlParserUtil.intervalToMillis("1.123456789", qualifier),
+        equalTo(1_123L));
+    assertThat(SqlParserUtil.intervalToExactMillis("1.123456789", qualifier),
+        equalTo(new BigDecimal("1123.456789")));
+    assertThat(SqlParserUtil.intervalToExactMillis("-1.123456789", qualifier),
+        equalTo(new BigDecimal("-1123.456789")));
+  }
+
+  @Test void testDayToSecondIntervalToExactMillis() {
+    final SqlIntervalQualifier qualifier =
+        new SqlIntervalQualifier(TimeUnit.DAY, 2, TimeUnit.SECOND, 9, POSITION);
+    assertThat(
+        SqlParserUtil.intervalToExactMillis("1 02:03:04.123456789", qualifier),
+        equalTo(new BigDecimal("93784123.456789")));
+  }
+
+  @Test void testIntervalToExactMillisWithoutFraction() {
+    final SqlIntervalQualifier qualifier =
+        new SqlIntervalQualifier(TimeUnit.SECOND, null, POSITION);
+    assertThat(SqlParserUtil.intervalToExactMillis("2", qualifier),
+        equalTo(new BigDecimal("2000")));
+  }
+
   @Test void testMinuteIntervalToMillis() {
     final SqlIntervalQualifier qualifier =
         new SqlIntervalQualifier(TimeUnit.MINUTE, null, POSITION);
     assertThat(SqlParserUtil.intervalToMillis("2", qualifier), equalTo(120_000L));
+  }
+
+  @Test void testTimestampWithTimeZone() {
+    SqlParserPos pos = new SqlParserPos(2, 3);
+    SqlTimestampTzLiteral lit =
+        SqlParserUtil.parseTimestampTzLiteral("2020-01-01 10:10:10 GMT", pos);
+    assertThat(lit, hasToString("TIMESTAMP_TZ '2020-01-01 10:10:10 GMT'"));
+
+    lit = SqlParserUtil.parseTimestampTzLiteral("2020-01-01 10:10:10 UTC", pos);
+    assertThat(lit, hasToString("TIMESTAMP_TZ '2020-01-01 10:10:10 UTC'"));
+
+    lit = SqlParserUtil.parseTimestampTzLiteral("2020-01-01 10:10:10 America/Los_Angeles", pos);
+    assertThat(lit, hasToString("TIMESTAMP_TZ '2020-01-01 10:10:10 America/Los_Angeles'"));
+
+    lit = SqlParserUtil.parseTimestampTzLiteral("2020-01-01 10:10:10 +00:00", pos);
+    assertThat(lit, hasToString("TIMESTAMP_TZ '2020-01-01 10:10:10 UTC'"));
+
+    lit = SqlParserUtil.parseTimestampTzLiteral("2020-01-01 10:10:10 Z", pos);
+    assertThat(lit, hasToString("TIMESTAMP_TZ '2020-01-01 10:10:10 UTC'"));
+
+    lit = SqlParserUtil.parseTimestampTzLiteral("2020-01-01 10:10:10 -00:30", pos);
+    assertThat(lit, hasToString("TIMESTAMP_TZ '2020-01-01 10:10:10 GMT-00:30'"));
+
+    lit = SqlParserUtil.parseTimestampTzLiteral("2020-01-01 10:10:10 +05:45", pos);
+    assertThat(lit, hasToString("TIMESTAMP_TZ '2020-01-01 10:10:10 GMT+05:45'"));
+
+    // Test case for [CALCITE-7527] SqlParserUtil.parseTimestampTzLiteral does not validate timezone
+    // https://issues.apache.org/jira/browse/CALCITE-7527
+    try {
+      SqlParserUtil.parseTimestampTzLiteral("2020-06-21 14:23:44.123654+00:00", pos);
+      fail("Should be unreachable");
+    } catch (CalciteContextException ex) {
+      assertThat(
+          ex.getMessage(), is("At line 2, column 3: Illegal TIMESTAMP WITH TIME ZONE literal "
+              + "'2020-06-21 14:23:44.123654+00:00': not in format 'yyyy-MM-dd HH:mm:ss zone'"));
+    }
+
+    try {
+      SqlParserUtil.parseTimestampTzLiteral("2020-06-21 14:23:44.123654 incorrect_zone", pos);
+      fail("Should be unreachable");
+    } catch (CalciteContextException ex) {
+      assertThat(
+          ex.getMessage(), is("At line 2, column 3: Illegal TIMESTAMP WITH TIME ZONE literal "
+              + "'2020-06-21 14:23:44.123654 incorrect_zone': Unknown "
+              + "time-zone ID: incorrect_zone"));
+    }
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7559">[CALCITE-7559]
+   * SqlParserUtil.parseTimeTzLiteral should reject unknown time zones</a>. */
+  @Test void testTimeWithTimeZone() {
+    SqlParserPos pos = new SqlParserPos(2, 3);
+    SqlTimeTzLiteral lit =
+        SqlParserUtil.parseTimeTzLiteral("10:10:10 GMT", pos);
+    assertThat(lit, hasToString("TIME WITH TIME ZONE '10:10:10 UTC'"));
+
+    // Like parseTimestampTzLiteral, parseTimeTzLiteral should reject unknown
+    // time zones instead of silently falling back to GMT.
+    try {
+      SqlParserUtil.parseTimeTzLiteral("10:10:10 incorrect_zone", pos);
+      fail("Should be unreachable");
+    } catch (CalciteContextException ex) {
+      assertThat(
+          ex.getMessage(), is("At line 2, column 3: Illegal TIME WITH TIME ZONE literal "
+              + "'10:10:10 incorrect_zone': Unknown time-zone ID: incorrect_zone"));
+    }
+
+    try {
+      SqlParserUtil.parseTimeTzLiteral("10:10:10", pos);
+      fail("Should be unreachable");
+    } catch (CalciteContextException ex) {
+      assertThat(
+          ex.getMessage(), is("At line 2, column 3: Illegal TIME WITH TIME ZONE literal "
+              + "'10:10:10': not in format 'HH:mm:ss zone'"));
+    }
   }
 
   @Test void testMinuteToSecondIntervalToMillis() {

@@ -18,6 +18,8 @@ package org.apache.calcite.rex;
 
 import org.apache.calcite.DataContext;
 import org.apache.calcite.adapter.enumerable.EnumUtils;
+import org.apache.calcite.adapter.enumerable.RexImpTable;
+import org.apache.calcite.adapter.enumerable.RexImplementorTable;
 import org.apache.calcite.adapter.enumerable.RexToLixTranslator;
 import org.apache.calcite.adapter.enumerable.RexToLixTranslator.InputGetter;
 import org.apache.calcite.adapter.java.JavaTypeFactory;
@@ -43,6 +45,7 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Type;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -56,20 +59,29 @@ import java.util.List;
 public class RexExecutorImpl implements RexExecutor {
 
   private final DataContext dataContext;
+  private final RexImplementorTable implementorTable;
 
   public RexExecutorImpl(DataContext dataContext) {
+    this(dataContext, RexImpTable.INSTANCE);
+  }
+
+  public RexExecutorImpl(DataContext dataContext,
+      RexImplementorTable implementorTable) {
     this.dataContext = dataContext;
+    this.implementorTable = implementorTable;
   }
 
   private static String compile(RexBuilder rexBuilder, List<RexNode> constExps,
-      RexToLixTranslator.InputGetter getter) {
+      RexToLixTranslator.InputGetter getter,
+      RexImplementorTable implementorTable) {
     final RelDataTypeFactory typeFactory = rexBuilder.getTypeFactory();
     final RelDataType emptyRowType = typeFactory.builder().build();
-    return compile(rexBuilder, constExps, getter, emptyRowType);
+    return compile(rexBuilder, constExps, getter, emptyRowType, implementorTable);
   }
 
   private static String compile(RexBuilder rexBuilder, List<RexNode> constExps,
-      RexToLixTranslator.InputGetter getter, RelDataType rowType) {
+      RexToLixTranslator.InputGetter getter, RelDataType rowType,
+      RexImplementorTable implementorTable) {
     final RexProgramBuilder programBuilder =
         new RexProgramBuilder(rowType, rexBuilder);
     for (RexNode node : constExps) {
@@ -92,7 +104,8 @@ public class RexExecutorImpl implements RexExecutor {
     final RexProgram program = programBuilder.getProgram();
     final List<Expression> expressions =
         RexToLixTranslator.translateProjects(program, javaTypeFactory,
-            conformance, blockBuilder, null, null, root_, getter, null);
+            conformance, blockBuilder, null, null, root_, getter, null,
+            implementorTable);
     blockBuilder.add(
         Expressions.return_(null,
             Expressions.newArrayInit(Object[].class, expressions)));
@@ -120,7 +133,8 @@ public class RexExecutorImpl implements RexExecutor {
     final JavaTypeFactoryImpl typeFactory =
         new JavaTypeFactoryImpl(rexBuilder.getTypeFactory().getTypeSystem());
     final InputGetter getter = new DataContextInputGetter(rowType, typeFactory);
-    final String code = compile(rexBuilder, exps, getter, rowType);
+    final String code =
+        compile(rexBuilder, exps, getter, rowType, RexImpTable.INSTANCE);
     return new RexExecutable(code, "generated Rex code");
   }
 
@@ -136,14 +150,34 @@ public class RexExecutorImpl implements RexExecutor {
   @Override public void reduce(RexBuilder rexBuilder, List<RexNode> constExps,
       List<RexNode> reducedValues) {
     assert reducedValues.isEmpty();
+    final List<RexNode> exps = new ArrayList<>();
+    final List<Integer> ordinals = new ArrayList<>();
+    for (int i = 0; i < constExps.size(); i++) {
+      final RexNode constExp = constExps.get(i);
+      // Literals are already reduced. Keep them as Rex values instead of
+      // round-tripping through generated code.
+      if (!(constExp instanceof RexLiteral)) {
+        ordinals.add(i);
+        exps.add(constExp);
+      }
+    }
+    if (exps.isEmpty()) {
+      reducedValues.addAll(constExps);
+      return;
+    }
     try {
-      String code = compile(rexBuilder, constExps, (list, index, storageType) -> {
+      String code = compile(rexBuilder, exps, (list, index, storageType) -> {
         throw new UnsupportedOperationException();
-      });
+      }, implementorTable);
 
-      final RexExecutable executable = new RexExecutable(code, constExps);
+      final RexExecutable executable = new RexExecutable(code, exps);
       executable.setDataContext(dataContext);
-      executable.reduce(rexBuilder, constExps, reducedValues);
+      final List<RexNode> values = new ArrayList<>(exps.size());
+      executable.reduce(rexBuilder, exps, values);
+      reducedValues.addAll(constExps);
+      for (int i = 0; i < ordinals.size(); i++) {
+        reducedValues.set(ordinals.get(i), values.get(i));
+      }
     } catch (RuntimeException ex) {
       // Something went wrong during constant reduction (for example,
       // we may have attempted a division by zero).

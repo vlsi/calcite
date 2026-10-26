@@ -31,6 +31,7 @@ import org.apache.calcite.linq4j.Queryable;
 import org.apache.calcite.linq4j.function.Deterministic;
 import org.apache.calcite.linq4j.function.Parameter;
 import org.apache.calcite.linq4j.function.SemiStrict;
+import org.apache.calcite.linq4j.function.Strict;
 import org.apache.calcite.linq4j.tree.Expression;
 import org.apache.calcite.linq4j.tree.Expressions;
 import org.apache.calcite.linq4j.tree.MethodCallExpression;
@@ -69,6 +70,7 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 import java.io.IOException;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.sql.Date;
 import java.sql.Time;
 import java.sql.Timestamp;
@@ -109,6 +111,12 @@ public class Smalls {
   public static final Method MULTIPLICATION_TABLE_METHOD =
       Types.lookupMethod(Smalls.class, "multiplicationTable", int.class,
         int.class, Integer.class);
+  public static final Method SCALAR_QUERY_ARGUMENTS_TABLE_METHOD =
+      Types.lookupMethod(Smalls.class, "scalarQueryArgumentsTable",
+          Object.class, Integer.class, Integer.class);
+  public static final Method SCALAR_QUERY_ARGUMENTS_TABLE_WITHOUT_COLUMN_METHOD =
+      Types.lookupMethod(Smalls.class,
+          "scalarQueryArgumentsTableWithoutColumn", Object.class, int.class);
   public static final Method FIBONACCI_TABLE_METHOD =
       Types.lookupMethod(Smalls.class, "fibonacciTable");
   public static final Method FIBONACCI_LIMIT_100_TABLE_METHOD =
@@ -279,6 +287,65 @@ public class Smalls {
         return Linq4j.asEnumerable(table).asQueryable();
       }
     };
+  }
+
+  /** A one-row table containing the arguments passed to the function. */
+  public static QueryableTable scalarQueryArgumentsTable(
+      final @Nullable Object scalarValue,
+      final @Nullable Integer literalValue,
+      final @Nullable Integer columnValue) {
+    final @Nullable Integer normalizedScalarValue;
+    final @Nullable Integer rowValue0;
+    final @Nullable Integer rowValue1;
+    if (scalarValue == null) {
+      normalizedScalarValue = null;
+      rowValue0 = null;
+      rowValue1 = null;
+    } else if (scalarValue instanceof Number) {
+      normalizedScalarValue = ((Number) scalarValue).intValue();
+      rowValue0 = null;
+      rowValue1 = null;
+    } else if (scalarValue instanceof Object[]) {
+      final Object[] row = (Object[]) scalarValue;
+      if (row.length != 2
+          || !(row[0] instanceof Number)
+          || !(row[1] instanceof Number)) {
+        throw new IllegalArgumentException("expected ROW with two numbers");
+      }
+      normalizedScalarValue = null;
+      rowValue0 = ((Number) row[0]).intValue();
+      rowValue1 = ((Number) row[1]).intValue();
+    } else {
+      throw new IllegalArgumentException("expected a number or ROW");
+    }
+    return new AbstractQueryableTable(Object[].class) {
+      @Override public RelDataType getRowType(RelDataTypeFactory typeFactory) {
+        return typeFactory.builder()
+            .add("scalar_value", typeFactory.createJavaType(Integer.class))
+            .add("row_value_0", typeFactory.createJavaType(Integer.class))
+            .add("row_value_1", typeFactory.createJavaType(Integer.class))
+            .add("literal_value", typeFactory.createJavaType(Integer.class))
+            .add("column_value", typeFactory.createJavaType(Integer.class))
+            .build();
+      }
+
+      @Override public Queryable<Object[]> asQueryable(
+          QueryProvider queryProvider, SchemaPlus schema, String tableName) {
+        return Linq4j.asEnumerable(
+            Collections.singletonList(
+                new Object[] {
+                    normalizedScalarValue, rowValue0, rowValue1,
+                    literalValue, columnValue
+                }))
+            .asQueryable();
+      }
+    };
+  }
+
+  /** A two-argument version of {@link #scalarQueryArgumentsTable}. */
+  public static QueryableTable scalarQueryArgumentsTableWithoutColumn(
+      final @Nullable Object scalarValue, final int literalValue) {
+    return scalarQueryArgumentsTable(scalarValue, literalValue, null);
   }
 
   /** A function that generates the Fibonacci sequence.
@@ -907,6 +974,31 @@ public class Smalls {
     }
   }
 
+  /** Example of a UDAF with two named parameters (via {@code @Parameter}),
+   * so it can be called using named-argument notation. It sums {@code v1}
+   * for rows where {@code v1 > v2}. */
+  public static class MyNamedSumFunction {
+    public MyNamedSumFunction() {
+    }
+    public int init() {
+      return 0;
+    }
+    public int add(int accumulator,
+        @Parameter(name = "v1") int v1,
+        @Parameter(name = "v2") int v2) {
+      if (v1 > v2) {
+        return accumulator + v1;
+      }
+      return accumulator;
+    }
+    public int merge(int accumulator0, int accumulator1) {
+      return accumulator0 + accumulator1;
+    }
+    public int result(int accumulator) {
+      return accumulator;
+    }
+  }
+
   /** Example of a user-defined aggregate function (UDAF) with two parameters.
    * The constructor has an initialization parameter. */
   public static class MyTwoParamsSumFunctionFilter1 {
@@ -1490,6 +1582,22 @@ public class Smalls {
       } catch (Exception e) {
         return null;
       }
+    }
+  }
+
+  /** User-defined function with return type byte[]. */
+  @Strict
+  public static class ByteArrayFunction {
+    public static byte[] eval(String s) {
+      return s.getBytes(StandardCharsets.UTF_8);
+    }
+  }
+
+  /** User-defined function with parameter type byte[]. */
+  @Strict
+  public static class ByteArrayLengthFunction {
+    public static int eval(byte[] bytes) {
+      return bytes.length;
     }
   }
 

@@ -2,7 +2,7 @@
 **/.editorconfig
 **/.gitignore
 **/.gitattributes
-.github/workflows
+.github/**
 .ratignore
 **/META-INF/services/java.sql.Driver
 **/src/test/resources/**/*.csv
@@ -13,6 +13,9 @@
 **/data.txt
 **/data2.txt
 .idea/vcs.xml
+SECURITY.md
+AGENTS.md
+CLAUDE.md
 example/csv/src/test/resources/smoke_test.sql
 
 # TODO: remove when pom.xml files are removed
@@ -50,3 +53,7 @@ site/favicon.ico
 
 # jenv
 .jenv-version
+
+# Kotlin compiler session and log files
+**/.kotlin/sessions/kotlin-compiler*.salive
+**/.kotlin/errors/errors*.log

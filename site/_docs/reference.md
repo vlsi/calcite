@@ -191,32 +191,102 @@ query:
       |   query MINUS [ ALL | DISTINCT ] query
       |   query INTERSECT [ ALL | DISTINCT ] query
       }
-      [ ORDER BY orderItem [, orderItem ]* ]
+      [ ORDER BY { ALL [ ASC | DESC ] [ NULLS FIRST | NULLS LAST ] | orderItem [, orderItem]* } ]
       [ LIMIT [ start, ] { count | ALL } ]
-      [ OFFSET start { ROW | ROWS } ]
-      [ FETCH { FIRST | NEXT } [ count ] { ROW | ROWS } ONLY ]
+      [ OFFSET { start | expression } { ROW | ROWS } ]
+      [ FETCH { FIRST | NEXT } [ count | '(' expression ')' ] { ROW | ROWS } ONLY ]
 
 withItem:
       name
       [ '(' column [, column ]* ')' ]
       AS '(' query ')'
+      [ CYCLE column [, column ]* SET markColumn
+          [ TO cycleValue DEFAULT nonCycleValue ] USING pathColumn ]
 
 orderItem:
       expression [ ASC | DESC ] [ NULLS FIRST | NULLS LAST ]
 
 select:
-      SELECT [ hintComment ] [ STREAM ] [ ALL | DISTINCT ]
-          { * | projectItem [, projectItem ]* }
+      SELECT [ hintComment ] [ STREAM ] [ ALL | DISTINCT [ ON '(' expression [, expression ]* ')' ] ]
+          { starWithExclude | projectItem [, projectItem ]* }
+      [ BY expression [, expression ]* ]
       FROM tableExpression
       [ WHERE booleanExpression ]
-      [ GROUP BY [ ALL | DISTINCT ] { groupItem [, groupItem ]* } ]
+      [ GROUP BY { ALL | [ALL | DISTINCT ] groupItem [, groupiTEM ]* } ]
       [ HAVING booleanExpression ]
       [ WINDOW windowName AS windowSpec [, windowName AS windowSpec ]* ]
       [ QUALIFY booleanExpression ]
+      [ ORDER BY orderItem [, orderItem ]* ]
+      [ LIMIT expression [ OFFSET { start | expression } ] ]
+
+The optional, non-standard `BY` clause groups and orders the query by
+the specified expressions, and automatically adds them to the SELECT list
+for naming and positional reference. But `SELECT ... BY` cannot be combined
+with an explicit `GROUP BY` or `ORDER BY` clause in the same query.
+`SELECT ... BY` is recognized only when the Babel parser is enabled. It sets the generated parser configuration flag `includeSelectBy` to `true`.
+
+The optional `DISTINCT ON` clause is a PostgreSQL extension that allows you to
+eliminate duplicate rows based on specified expressions, keeping the first row
+in each group as determined by the `ORDER BY` clause. This is recognized only
+when the Babel parser is enabled. It sets the generated parser configuration flag
+`includeDistinctOn` to `true`. When using `DISTINCT ON`, the expressions in the
+`DISTINCT ON` clause must match the beginning of the `ORDER BY` clause.
+
+A trailing comma at the end of the SELECT list, as in GoogleSQL (BigQuery), is
+accepted for compatibility with programmatically generated queries. This is
+recognized only when the Babel parser is enabled. It sets the generated parser
+configuration flag `includeSelectListTrailingComma` to `true`. The trailing
+comma is not preserved in the parse tree. A trailing comma is likewise accepted
+at the end of the column definition list of a `CREATE TABLE` statement parsed
+by the Babel parser.
+
+For example:
+
+{% highlight sql %}
+SELECT ename, empno BY deptno FROM emp
+{% endhighlight %}
+
+is equivalent to:
+
+{% highlight sql %}
+SELECT deptno, ename, empno
+FROM emp
+GROUP BY deptno
+ORDER BY deptno
+{% endhighlight %}
+
+Example of `DISTINCT ON`:
+
+{% highlight sql %}
+SELECT DISTINCT ON (deptno) empno, ename, deptno
+FROM emp
+ORDER BY deptno, empno
+{% endhighlight %}
+
+This query keeps only the first employee (ordered by empno) in each department.
 
 selectWithoutFrom:
       SELECT [ ALL | DISTINCT ]
           { * | projectItem [, projectItem ]* }
+
+starWithExclude:
+      *
+  |   * EXCLUDE '(' column [, column ]* ')'
+
+starWithReplace:
+      *
+  |   * REPLACE '(' expression AS column [, expression AS column ]* ')'
+
+rowStarItem:
+      *
+  |   tableAlias . *
+  |   * { EXCLUDE | EXCEPT } '(' column [, column ]* ')'
+  |   tableAlias . * { EXCLUDE | EXCEPT } '(' column [, column ]* ')'
+
+Note:
+
+* `EXCLUDE` (or the alias `EXCEPT`) removes the specified columns from the star expansion; `REPLACE` substitutes the given expressions for the matching columns while keeping the original column order. For `REPLACE`, the column alias must either be a simple identifier or, for a table-qualified star such as `t.*`, a qualified identifier whose prefix matches the star's table alias.
+* `ROW(rowStarItem [, rowStarItem ]*)` creates a nested ROW from all columns (or all columns except the excluded ones) of one or more tables. `EXCEPT` is an alias for `EXCLUDE` in this context.
 
 projectItem:
       expression [ [ AS ] columnAlias ]
@@ -247,6 +317,7 @@ tablePrimary:
   |   tablePrimary [ hintComment ] [ EXTEND ] '(' columnDecl [, columnDecl ]* ')'
   |   [ LATERAL ] '(' query ')'
   |   UNNEST '(' expression ')' [ WITH ORDINALITY ]
+  |   [ LATERAL ] functionName '(' expression [, expression ]* ')'
   |   [ LATERAL ] TABLE '(' [ SPECIFIC ] functionName '(' expression [, expression ]* ')' ')'
 
 columnDecl:
@@ -361,8 +432,25 @@ in those same conformance levels, any *column* in *insert* may be replaced by
 In *orderItem*, if *expression* is a positive integer *n*, it denotes
 the <em>n</em>th item in the SELECT clause.
 
-In *query*, *count* and *start* may each be either an unsigned integer literal
-or a dynamic parameter whose value is an integer.
+`ORDER BY ALL` sorts by every expression in the SELECT clause,
+in the order that they appear in the list; for example:
+"SELECT x, y FROM t ORDER BY ALL" is equivalent to
+"SELECT x, y FROM t ORDER BY x, y"
+An optional trailing ASC / DESC and NULLS FIRST / NULLS LAST applies to all keys.
+A `*` in the SELECT clause is expanded to its underlying columns, each of which
+becomes a sort key; for example, "SELECT * FROM t ORDER BY ALL" sorts by every
+column of `t`.
+
+In *query*, *start* may be either an unsigned numeric literal or a dynamic
+parameter whose value is numeric. The *count* in a LIMIT clause may be either
+an unsigned numeric literal or a dynamic parameter whose value is numeric. An
+OFFSET clause may contain an unsigned numeric literal, a dynamic parameter whose
+value is numeric, or a scalar expression with optional parentheses. The *count*
+in a FETCH clause may also be a scalar expression, but it must be enclosed in
+parentheses. An OFFSET expression or FETCH *count* expression cannot reference
+columns from the query input, and cannot contain aggregate functions, window
+functions, or sub-queries.
+Support for decimal or non-integer values is adapter-dependent.
 
 An aggregate query is a query that contains a GROUP BY or a HAVING
 clause, or aggregate functions in the SELECT clause. In the SELECT,
@@ -388,7 +476,15 @@ may refer to tables in the FROM clause of an enclosing query.
 GROUP BY DISTINCT removes duplicate grouping sets (for example,
 "GROUP BY DISTINCT GROUPING SETS ((a), (a, b), (a))" is equivalent to
 "GROUP BY GROUPING SETS ((a), (a, b))");
-GROUP BY ALL is equivalent to GROUP BY.
+GROUP BY ALL followed by grouping items is equivalent to GROUP BY
+(ALL is the default set quantifier).
+GROUP BY ALL on its own groups by every expression in the SELECT clause
+that is not an aggregate function; for example,
+"SELECT deptno, SUM(sal) FROM emp GROUP BY ALL" is equivalent to
+"SELECT deptno, SUM(sal) FROM emp GROUP BY deptno".
+A `*` in the SELECT clause is expanded to its underlying columns, each of which
+becomes a grouping key; for example,
+"SELECT *, COUNT(*) FROM emp GROUP BY ALL" groups by every column of `emp`.
 
 *selectWithoutFrom* is equivalent to VALUES,
 but is not standard SQL and is only allowed in certain
@@ -435,6 +531,56 @@ FROM left_table LEFT ASOF JOIN right_table
 MATCH_CONDITION left_table.timecol <= right_table.timecol
 ON left_table.col = right_table.col
 ```
+
+### Cycle detection in recursive queries
+
+`CYCLE` tracks the specified columns along each path through a recursive
+common table expression. It adds two columns after the query's original
+columns: a cycle mark and a path, represented as an array of rows containing
+the key values. The path includes the current row. A row that repeats a key
+on its own path receives the cycle mark and is returned, but is not used in
+the next recursive iteration. Reaching the same key through a different
+path does not by itself constitute a cycle.
+
+For example, this graph contains the cycle A, B, C, A:
+
+```sql
+WITH RECURSIVE
+  edges(src, dst) AS (
+    VALUES ('A', 'B'), ('B', 'C'), ('C', 'A')
+  ),
+  walk(node) AS (
+    VALUES ('A')
+    UNION ALL
+    SELECT e.dst
+    FROM walk AS w JOIN edges AS e ON e.src = w.node
+  ) CYCLE node SET is_cycle TO 'Y' DEFAULT 'N' USING cycle_path
+SELECT node, is_cycle, cycle_path
+FROM walk;
+```
+
+The result contains A, B, C, and A again; only the last row is marked `Y`.
+Its path is `[{A}, {B}, {C}, {A}]`.
+
+Cycle columns must be distinct columns of the CTE. The generated mark and
+path names must be distinct from each other and from the original columns;
+they are not included in the CTE's explicit column list. Mark values must
+be distinct, non-null Boolean literals (`TRUE` and `FALSE`) or compatible
+character string literals of length one, such as `'Y'` and `'N'`.
+If `TO cycleValue DEFAULT nonCycleValue` is omitted, the mark values default
+to `TRUE` and `FALSE`, respectively: `CYCLE node SET is_cycle USING cycle_path`.
+Key comparisons use SQL row equality:
+a comparison that is UNKNOWN because of a null key does not close a cycle.
+
+In the current implementation, the generated mark and path columns cannot
+be referenced in the recursive term. They are available to queries that
+read the CTE's result, such as the outer `SELECT` in the example above.
+
+`CYCLE` requires `WITH RECURSIVE` and a binary `UNION` or `UNION ALL` whose
+recursive operand is a `SELECT` with exactly one direct reference to the
+CTE. That reference cannot be on the null-generating side of an outer join.
+Aggregation, `DISTINCT`, and window functions in the recursive `SELECT`
+are not supported. Enumerable execution supports both forms of `UNION`.
 
 ## Keywords
 
@@ -1214,7 +1360,7 @@ name will have been converted to upper case also.
 | TIMESTAMP [ WITHOUT TIME ZONE ] | Date and time | Example: TIMESTAMP '1969-07-20 20:17:40'
 | TIMESTAMP WITH LOCAL TIME ZONE | Date and time with local time zone | Example: TIMESTAMP WITH LOCAL TIME ZONE '1969-07-20 20:17:40'
 | TIMESTAMP WITH TIME ZONE | Date and time with time zone | Example: TIMESTAMP WITH TIME ZONE '1969-07-20 20:17:40 America/Los Angeles'
-| UUID        | An 128-bit UUID           | Example: UUID '123e4567-e89b-12d3-a456-426655440000'
+| UUID        | An 128-bit UUID           | Example: UUID '123e4567-e89b-12d3-a456-426655440000'. A string converts to a `UUID` if it holds 32 hexadecimal digits of either case, optionally enclosed in braces, optionally separated by a hyphen after any complete group of four digits; a binary converts if it is exactly 16 bytes. Anything else is an error. Blanks are not trimmed.
 | INTERVAL timeUnit [ TO timeUnit ] | Date time interval | Examples: INTERVAL '1-5' YEAR TO MONTH, INTERVAL '45' DAY, INTERVAL '1 2:34:56.789' DAY TO SECOND
 | GEOMETRY | Geometry | Examples: ST_GeomFromText('POINT (30 10)')
 
@@ -1288,6 +1434,12 @@ also offer the following operations:
   as equivalent to `variant['field']`.  Note, however, that the field notation
   is subject to the capitalization rules of the SQL dialect, so for correct
   operation the field may need to be quoted: `variant."field"`
+- path access using the colon notation: `variant:field`, with bracket
+  segments (`variant:['key']`, `variant:[0]`) and chains
+  (`variant:a.b['c'][0]`). The result is always a nullable `VARIANT`.
+  The colon operator is opt-in via the `isColonFieldAccessAllowed`
+  conformance flag; when enabled, JSON object constructors must use the
+  `KEY ... VALUE` form.
 
 The runtime types do not need to match exactly the compile-time types.
 As a compiler front-end, Calcite does not mandate exactly how the runtime types
@@ -1400,6 +1552,38 @@ comp:
   |   <=>
 {% endhighlight %}
 
+Note:
+
+* Comparing two `ROW` values with `=` or `<>` compares their fields pairwise,
+  using three-valued logic: the result is FALSE if some pair of fields is
+  unequal, UNKNOWN if some pair involves a null and no pair is unequal, and
+  TRUE otherwise. For example, `ROW(1, NULL) = ROW(1, NULL)` is UNKNOWN, but
+  `ROW(1, NULL) = ROW(2, NULL)` is FALSE.
+* `IS DISTINCT FROM` and `IS NOT DISTINCT FROM` treat nulls as equal, so on
+  `ROW` values they always return TRUE or FALSE. Two rows are distinct if some
+  pair of their fields is distinct.
+* `JOIN ON ROW(a, b) = ROW(c, d)` uses this definition of row equality.  This is
+  equivalent to expanding equality for rows to their corresponding fields recursively:
+  `JOIN a = c AND b = d`.
+* `IN` and `NOT IN` are defined in terms of `=`, and over `ROW` values they
+  inherit the same three-valued result.
+  `ROW(1, NULL) IN (ROW(1, NULL))` and the corresponding `NOT IN` expression
+  evaluate to UNKNOWN. The quantified comparisons
+  `SOME`, `ANY` and `ALL` currently do not accept `ROW` operands.
+* Comparing two collection values (`ARRAY`, `MULTISET`, `MAP`) treats NULL
+  elements as equal, so the result is never UNKNOWN. A `ROW` nested in a
+  collection is therefore compared the way `IS NOT DISTINCT FROM` compares it,
+  and a NULL inside a collection does *not* make a comparison of the enclosing
+  `ROW` value UNKNOWN.
+* A `MAP` value is an unordered mapping of keys to values: two maps are equal
+  exactly when they contain the same keys and map each key to equal values,
+  regardless of the order in which the entries were written. Keys and values
+  are compared using `<=>`, so a NULL value equals a NULL value, and the
+  result is never UNKNOWN. For example, `MAP[1, 2, 3, 4] = MAP[3, 4, 1, 2]`
+  is TRUE, and so is `MAP[1, NULL] = MAP[1, NULL]`.
+* `GROUP BY`, `DISTINCT` and the set operators (`UNION`, `INTERSECT`, `EXCEPT`)
+  compare values as `IS NOT DISTINCT FROM` does.
+
 ### Logical operators
 
 | Operator syntax        | Description
@@ -1499,6 +1683,8 @@ Not implemented:
 | EXTRACT(timeUnit FROM datetime) | Extracts and returns the value of a specified datetime field from a datetime value expression
 | FLOOR(datetime TO timeUnit) | Rounds *datetime* down to *timeUnit*
 | CEIL(datetime TO timeUnit) | Rounds *datetime* up to *timeUnit*
+| FLOOR(interval) | Rounds *interval* down to a multiple of its leading time unit; for example, `FLOOR(INTERVAL '3:04:05' HOUR TO SECOND)` returns `INTERVAL '3:00:00' HOUR TO SECOND`
+| CEIL(interval) | Rounds *interval* up to a multiple of its leading time unit
 | YEAR(date)                | Equivalent to `EXTRACT(YEAR FROM date)`. Returns an integer.
 | QUARTER(date)             | Equivalent to `EXTRACT(QUARTER FROM date)`. Returns an integer between 1 and 4.
 | MONTH(date)               | Equivalent to `EXTRACT(MONTH FROM date)`. Returns an integer between 1 and 12.
@@ -1519,12 +1705,6 @@ standard SQL. Calls with parentheses, such as `CURRENT_DATE()` are accepted in c
 
 Not implemented:
 
-* CEIL(interval)
-* FLOOR(interval)
-* \+ interval
-* \- interval
-* interval + interval
-* interval - interval
 * interval / interval
 
 ### System functions
@@ -1652,6 +1832,7 @@ charSet:
 
 timeZone:
       WITHOUT TIME ZONE
+  |   WITH TIME ZONE
   |   WITH LOCAL TIME ZONE
 {% endhighlight %}
 
@@ -1705,7 +1886,8 @@ i: implicit cast / e: explicit cast / x: not allowed
 * Binary comparison (`=`, `<`, `<=`, `<>`, `>`, `>=`):
   if operands are `STRING` and `TIMESTAMP`, promote to `TIMESTAMP`;
   make `1 = true` and `0 = false` always evaluate to `TRUE`;
-  if there is numeric type operand, find common type for both operands.
+  if there is numeric type operand, find common type for both operands;
+  if operands are `UUID` and `CHARACTER` or `BINARY`, promote to `UUID`.
 * `IN` sub-query: compare type of LHS and RHS, and find the common type;
   if it is struct type, find wider type for every field;
 * `IN` expression list: compare every expression to find the common type;
@@ -1749,16 +1931,17 @@ Implicit type coercion of following cases are ignored:
 
 ### Value constructors
 
-| Operator syntax | Description
-|:--------------- |:-----------
-| ROW (value [, value ]*)  | Creates a row from a list of values.
-| (value [, value ]* )     | Creates a row from a list of values.
-| row '[' index ']'        | Returns the element at a particular location in a row (1-based index).
-| row '[' name ']'         | Returns the element of a row with a particular name.
-| map '[' key ']'     | Returns the element of a map with a particular key.
-| array '[' index ']' | Returns the element at a particular location in an array (1-based index).
-| ARRAY '[' value [, value ]* ']' | Creates an array from a list of values.
-| MAP '[' key, value [, key, value ]* ']' | Creates a map from a list of key-value pairs.
+| Operator syntax                            | Description
+|:-------------------------------------------|:-----------
+| ROW (value [AS name] [, value [AS name]]*) | Creates a row from a list of values.
+| ROW (rowStarItem [, rowStarItem ]*)        | Creates a row from all columns, or all columns except those excluded, of one or more tables.
+| (value [, value ]* )                       | Creates a row from a list of values.
+| row '[' index ']'                          | Returns the element at a particular location in a row (1-based index).
+| row '[' name ']'                           | Returns the element of a row with a particular name.
+| map '[' key ']'                            | Returns the element of a map with a particular key.
+| array '[' index ']'                        | Returns the element at a particular location in an array (1-based index).
+| ARRAY '[' value [, value ]* ']'            | Creates an array from a list of values.
+| MAP '[' key, value [, key, value ]* ']'    | Creates a map from a list of key-value pairs.
 
 ### Value constructors by query
 
@@ -2067,9 +2250,11 @@ Syntax:
 windowedAggregateCall:
       agg '(' [ ALL | DISTINCT ] value [, value ]* ')'
       [ RESPECT NULLS | IGNORE NULLS ]
+      [ FILTER '(' WHERE condition ')' ]
       [ WITHIN GROUP '(' ORDER BY orderItem [, orderItem ]* ')' ]
       OVER window
   |   agg '(' '*' ')'
+      [ FILTER '(' WHERE condition ')' ]
       OVER window
 {% endhighlight %}
 
@@ -2084,6 +2269,37 @@ The *exclude* clause can be one of:
 
 `DISTINCT`, `FILTER` and `WITHIN GROUP` are as described for aggregate
 functions.
+
+#### WITHIN GROUP clause in window functions
+
+Combining a `WITHIN GROUP (ORDER BY ...)` clause with an `OVER` clause lets an
+aggregate function whose ordering is supplied by `WITHIN GROUP` be used as a
+window function, as in
+
+{% highlight sql %}
+LISTAGG(ename, ',') WITHIN GROUP (ORDER BY ename) OVER (PARTITION BY deptno)
+{% endhighlight %}
+
+The `WITHIN GROUP` order key orders the function's input but does not restrict
+the window frame: the function is computed over the whole partition and the
+result is broadcast to every row of that partition. Because the sort key is
+supplied by `WITHIN GROUP`, the `OVER` clause must not contain its own
+`ORDER BY` or frame specification.
+
+This is non-standard syntax (supported by Oracle) and is only allowed under a
+conformance that returns true for
+[SqlConformance.allowWithinGroupOverAggregate()]({{ site.apiRoot }}/org/apache/calcite/sql/validate/SqlConformance.html#allowWithinGroupOverAggregate--),
+such as `BABEL`; otherwise the validator reports "OVER must be applied to
+aggregate function".
+
+#### FILTER clause in window functions
+
+When `FILTER` is used with window functions, it is applied in the following order:
+
+1. Define window rows by `PARTITION BY` and `ORDER BY`
+2. Apply `ROWS`/`RANGE` bounds to determine the window frame
+3. Apply the `FILTER` condition to rows within that frame
+4. Calculate the aggregate function on the filtered rows
 
 | Operator syntax                           | Description
 |:----------------------------------------- |:-----------
@@ -2276,6 +2492,61 @@ completeness. Session is applied per product.
 each row in the original table to a window. The output table has all
 the same columns as the original table plus two additional columns `window_start`
 and `window_end`, which represent the start and end of the window interval, respectively.
+
+#### Polymorphic table functions
+
+A polymorphic table function (PTF) is a table function that takes one or more
+*table arguments* in addition to scalar and `DESCRIPTOR` arguments. Like any
+table function, it is invoked in the `FROM` clause; the examples below place the
+call inside the `TABLE( ... )` operator, as in `SELECT * FROM TABLE(funcName(...))`,
+which is the form used by the SQL standard, but Calcite also accepts the implicit
+form `SELECT * FROM funcName(...)`.
+
+A table argument is introduced by the `TABLE` keyword and is either a table
+reference or a query. A table argument with set semantics may be followed by a
+`PARTITION BY` clause, an `ORDER BY` clause, or both; each partition is then
+processed independently. A table argument with row semantics may not be
+partitioned or ordered.
+
+A PTF may have more than one table argument, each with its own semantics,
+partitioning and ordering; at most one of them may have row semantics.
+
+| Operator syntax      | Description
+|:-------------------- |:-----------
+| TABLE(funcName(tableArg [, tableArg ]* [, arg ]*))<br/>where tableArg is&nbsp;&nbsp;TABLE tableExpr [ PARTITION BY columns ] [ ORDER BY columns ] | Invokes polymorphic table function *funcName* over one or more table arguments, each optionally partitioned and ordered (set semantics), together with any scalar or `DESCRIPTOR` arguments.
+
+A PTF with a single table argument:
+
+{% highlight sql %}
+SELECT * FROM TABLE(
+topn(
+TABLE orders PARTITION BY product ORDER BY amount DESC,
+3));
+
+-- or with the named params
+SELECT * FROM TABLE(
+topn(
+DATA => TABLE orders PARTITION BY product ORDER BY amount DESC,
+COL => 3));
+{% endhighlight %}
+
+partitions the `orders` table by `product`, orders each partition by `amount`
+descending, and lets the function emit, say, the top 3 rows of each partition.
+
+A PTF with multiple table arguments:
+
+{% highlight sql %}
+SELECT * FROM TABLE(
+similarity(
+TABLE orders PARTITION BY product,
+TABLE returns PARTITION BY product));
+{% endhighlight %}
+
+passes two input tables, each partitioned by `product`, so the function can
+compare the matching partitions of `orders` and `returns`.
+
+The built-in window table functions `TUMBLE`, `HOP` and `SESSION` (described
+below) are concrete polymorphic table functions.
 
 ### Grouped window functions
 **warning**: grouped window functions are deprecated.
@@ -2519,7 +2790,7 @@ The following functions transform 2D geometries.
 Not implemented:
 
 * ST_Scale(geom, xFactor, yFactor [, zFactor ]) Scales *geom* by multiplying the ordinates by the indicated scale factors
-* ST_Translate(geom, x, y, [, z]) Translates *geom*
+* ST_Translate(geom, x, y [, z]) Translates *geom*
 
 #### Geometry editing functions (2D)
 
@@ -2828,7 +3099,8 @@ In the following:
 | * | BITAND(value1, value2)                         | Returns the bitwise AND of *value1* and *value2*. *value1* and *value2* must both be integer or binary values. Binary values must be of the same length.
 | * | BITOR(value1, value2)                          | Returns the bitwise OR of *value1* and *value2*. *value1* and *value2* must both be integer or binary values. Binary values must be of the same length.
 | * | BITXOR(value1, value2)                         | Returns the bitwise XOR of *value1* and *value2*. *value1* and *value2* must both be integer or binary values. Binary values must be of the same length.
-| * | LEFTSHIFT(value1, value2) | Returns the result of left-shifting *value1* by *value2* bits. *value1* can be integer, unsigned integer, or binary. For binary, the result has the same length as *value1*. The shift amount *value2* is normalized using modulo arithmetic based on the bit width of *value1*. For integers, this uses modulo 32; for binary types, it uses modulo (8 × byte_length). Negative shift amounts are converted to equivalent positive shifts through this modulo operation. For example, `LEFTSHIFT(1, -2)` returns `1073741824` (equivalent to `1 << 30`), and `LEFTSHIFT(8, -1)` returns `0` due to overflow.
+| * | LEFTSHIFT(value1, value2) | Returns the result of left-shifting *value1* by *value2* bits. *value1* can be integer, unsigned integer, or binary. For binary, the result has the same length as *value1*. The shift amount *value2* is normalized using modulo arithmetic: for signed integer types the modulus is 32 for `TINYINT`, `SMALLINT` and `INTEGER` (all backed by a 32-bit representation) and 64 for `BIGINT`; for unsigned integer types it matches the type's bit width (modulo 8, 16, 32 or 64); for binary types it is modulo (8 × N), where N is the actual length in bytes of the *value1* value — for a variable-length `VARBINARY` value this is the length of the value itself, not its declared maximum. For integer and unsigned types the sign of *value2* selects the direction: a non-negative amount shifts left and a negative amount shifts right by the normalized magnitude (for example, `LEFTSHIFT(1, -2)` returns `0`, a right shift by 30, and `LEFTSHIFT(8, -1)` returns `0`). For binary the shift is always to the left; a negative *value2* is simply folded into the range [0, 8 × N) by the same modulo.
+| * | RIGHTSHIFT(value1, value2) | Returns the result of right-shifting *value1* by *value2* bits. For signed integers the shift is arithmetic (the sign bit is preserved). *value1* can be integer or unsigned integer (binary right shift is not yet supported). The shift amount *value2* is normalized using modulo arithmetic: for signed integer types the modulus is 32 for `TINYINT`, `SMALLINT` and `INTEGER` (all backed by a 32-bit representation) and 64 for `BIGINT`; for unsigned integer types it matches the type's bit width (modulo 8, 16, 32 or 64). The sign of *value2* selects the direction: a non-negative amount shifts right and a negative amount shifts left by the normalized magnitude (for example, `RIGHTSHIFT(1024, 2)` returns `256`, `RIGHTSHIFT(-20, 2)` returns `-5`, and `RIGHTSHIFT(1, -2)` returns `1073741824`, a left shift by 30).
 | * | BITNOT(value)                                  | Returns the bitwise NOT of *value*. *value* must be either an integer type or a binary value.
 | f | BITAND_AGG(value)                              | Equivalent to `BIT_AND(value)`
 | f | BITOR_AGG(value)                               | Equivalent to `BIT_OR(value)`
@@ -2844,9 +3116,9 @@ In the following:
 | b o p r | CHR(integer)                             | Returns the character whose UTF-8 code is *integer*
 | b | CODE_POINTS_TO_BYTES(integers)                 | Converts *integers*, an array of integers between 0 and 255 inclusive, into bytes; throws error if any element is out of range
 | b | CODE_POINTS_TO_STRING(integers)                | Converts *integers*, an array of integers between 0 and 0xD7FF or between 0xE000 and 0x10FFFF inclusive, into string; throws error if any element is out of range
-| o r | CONCAT(string, string)                       | Concatenates two strings, returns null only when both string arguments are null, otherwise treats null as empty string
-| b m | CONCAT(string [, string ]*)                  | Concatenates one or more strings, returns null if any of the arguments is null
-| p q | CONCAT(string [, string ]*)                  | Concatenates one or more strings, null is treated as empty string
+| o r | CONCAT(string, string)                       | Concatenates two character or binary strings, returns null only when both string arguments are null, otherwise treats null as empty string
+| b m | CONCAT(string [, string ]*)                  | Concatenates one or more character or binary strings, returns null if any of the arguments is null; mixing character and binary arguments is not allowed
+| p q | CONCAT(string [, string ]*)                  | Concatenates one or more character strings, null is treated as empty string; binary arguments are implicitly cast to character strings
 | m | CONCAT_WS(separator, str1 [, string ]*)        | Concatenates one or more strings, returns null only when separator is null, otherwise treats null arguments as empty strings
 | p | CONCAT_WS(separator, any [, any ]*)            | Concatenates all but the first argument, returns null only when separator is null, otherwise treats null arguments as empty strings
 | q | CONCAT_WS(separator, str1, str2 [, string ]*)  | Concatenates two or more strings, requires at least 3 arguments (up to 254), treats null arguments as empty strings
@@ -2890,12 +3162,12 @@ In the following:
 | b | DATE_TRUNC(date, timeUnit)                     | Truncates *date* to the granularity of *timeUnit*, rounding to the beginning of the unit
 | o r s h | DECODE(value, value1, result1 [, valueN, resultN ]* [, default ]) | Compares *value* to each *valueN* value one by one; if *value* is equal to a *valueN*, returns the corresponding *resultN*, else returns *default*, or NULL if *default* is not specified
 | p r | DIFFERENCE(string, string)                   | Returns a measure of the similarity of two strings, namely the number of character positions that their `SOUNDEX` values have in common: 4 if the `SOUNDEX` values are same and 0 if the `SOUNDEX` values are totally different
-| f s | ENDSWITH(string1, string2)                   | Returns whether *string2* is a suffix of *string1*
+| f s i | ENDSWITH(string1, string2)                   | Returns whether *string2* is a suffix of *string1*
 | b | ENDS_WITH(string1, string2)                    | Equivalent to `ENDSWITH(string1, string2)`
 | s | EXISTS(array, func)                            | Returns whether a predicate *func* holds for one or more elements in the *array*
-| o | EXISTSNODE(xml, xpath, [, namespaces ])        | Determines whether traversal of a XML document using a specified xpath results in any nodes. Returns 0 if no nodes remain after applying the XPath traversal on the document fragment of the element or elements matched by the XPath expression. Returns 1 if any nodes remain. The optional namespace value that specifies a default mapping or namespace mapping for prefixes, which is used when evaluating the XPath expression.
-| o | EXTRACT(xml, xpath, [, namespaces ])           | Returns the XML fragment of the element or elements matched by the XPath expression. The optional namespace value that specifies a default mapping or namespace mapping for prefixes, which is used when evaluating the XPath expression
-| m | EXTRACTVALUE(xml, xpathExpr))                  | Returns the text of the first text node which is a child of the element or elements matched by the XPath expression.
+| o | EXISTSNODE(xml, xpath [, namespaces ])         | Determines whether traversal of a XML document using a specified xpath results in any nodes. Returns 0 if no nodes remain after applying the XPath traversal on the document fragment of the element or elements matched by the XPath expression. Returns 1 if any nodes remain. The optional namespace value that specifies a default mapping or namespace mapping for prefixes, which is used when evaluating the XPath expression.
+| o | EXTRACT(xml, xpath [, namespaces ])            | Returns the XML fragment of the element or elements matched by the XPath expression. The optional namespace value that specifies a default mapping or namespace mapping for prefixes, which is used when evaluating the XPath expression
+| m | EXTRACTVALUE(xml, xpathExpr)                   | Returns the text of the first text node which is a child of the element or elements matched by the XPath expression.
 | h s | FACTORIAL(integer)                           | Returns the factorial of *integer*, the range of *integer* is [0, 20]. Otherwise, returns NULL
 | h s | FIND_IN_SET(matchStr, textStr)               | Returns the index (1-based) of the given *matchStr* in the comma-delimited *textStr*. Returns 0, if the given *matchStr* is not found or if the *matchStr* contains a comma. For example, FIND_IN_SET('bc', 'a,bc,def') returns 2
 | b | FLOOR(value)                                   | Similar to standard `FLOOR(value)` except if *value* is an integer type, the return type is a double
@@ -2906,6 +3178,7 @@ In the following:
 | b | FORMAT_TIME(string, time)                      | Formats *time* according to the specified format *string*
 | b | FORMAT_TIMESTAMP(string timestamp)             | Formats *timestamp* according to the specified format *string*
 | s | GETBIT(value, position)                        | Equivalent to `BIT_GET(value, position)`
+| s i | HYPOT(numeric1, numeric2)                    | Returns sqrt(*numeric1*^2 + *numeric2*^2) without intermediate overflow or underflow
 | b o p r s h | GREATEST(expr [, expr ]*)            | Returns the greatest of the expressions
 | b h s | IF(condition, value1, value2)              | Returns *value1* if *condition* is TRUE, *value2* otherwise
 | b s | IFNULL(value1, value2)                       | Equivalent to `NVL(value1, value2)`
@@ -2930,9 +3203,9 @@ In the following:
 | f r s | LEN(string)                                | Equivalent to `CHAR_LENGTH(string)`
 | b f h p r s | LENGTH(string)                       | Equivalent to `CHAR_LENGTH(string)`
 | h s | LEVENSHTEIN(string1, string2)                | Returns the Levenshtein distance between *string1* and *string2*
-| b | LOG(numeric1 [, base ])                        | Returns the logarithm of *numeric1* to base *base*, or base e if *base* is not present, or error if *numeric1* is 0 or negative
-| m s h | LOG([, base ], numeric1)                   | Returns the logarithm of *numeric1* to base *base*, or base e if *base* is not present, or null if *numeric1* is 0 or negative
-| p | LOG([, base ], numeric1 )                      | Returns the logarithm of *numeric1* to base *base*, or base 10 if *numeric1* is not present, or error if *numeric1* is 0 or negative
+| b | LOG(numeric [, base ])                         | Returns the logarithm of *numeric* to base *base*, or base e if *base* is not present, or error if *numeric* is 0 or negative
+| m s h | LOG([ base , ] numeric)                    | Returns the logarithm of *numeric* to base *base*, or base e if *base* is not present, or null if *numeric* is 0 or negative
+| p | LOG([ base , ] numeric)                        | Returns the logarithm of *numeric* to base *base*, or base 10 if *base* is not present, or error if *numeric* is 0 or negative
 | m s | LOG2(numeric)                                | Returns the base 2 logarithm of *numeric*
 | s | LOG1P(numeric)                                 | Returns the natural logarithm of 1 plus *numeric*
 | b o p r s h | LPAD(string, length [, pattern ])    | Returns a string or bytes value that consists of *string* prepended to *length* with *pattern*
@@ -2973,7 +3246,7 @@ In the following:
 | b s | POW(numeric1, numeric2)                      | Returns *numeric1* raised to the power *numeric2*
 | b c h q m o f s p r | POWER(numeric1, numeric2) | Returns *numeric1* raised to the power of *numeric2*
 | p r | RANDOM()                                     | Generates a random double between 0 and 1 inclusive
-| s | REGEXP(string, regexp)                         | Equivalent to `string1 RLIKE string2`
+| s h | REGEXP(string, regexp)                         | Equivalent to `string1 RLIKE string2`
 | b | REGEXP_CONTAINS(string, regexp)                | Returns whether *string* is a partial match for the *regexp*
 | b | REGEXP_EXTRACT(string, regexp [, position [, occurrence]]) | Returns the substring in *string* that matches the *regexp*, starting search at *position* (default 1), and until locating the nth *occurrence* (default 1). Returns NULL if there is no match
 | b | REGEXP_EXTRACT_ALL(string, regexp)             | Returns an array of all substrings in *string* that matches the *regexp*. Returns an empty array if there is no match
@@ -3011,7 +3284,7 @@ In the following:
 | m s h | SPACE(integer)                               | Returns a string of *integer* spaces; returns an empty string if *integer* is less than 1
 | b | SPLIT(string [, delimiter ])                   | Returns the string array of *string* split at *delimiter* (if omitted, default is comma).  If the *string* is empty it returns an empty array, otherwise, if the *delimiter* is empty, it returns an array containing the original *string*.
 | p | SPLIT_PART(string, delimiter, n)               | Returns the *n*th field in *string* using *delimiter*; returns empty string if *n* is less than 1 or greater than the number of fields, and the n can be negative to count from the end.
-| f s | STARTSWITH(string1, string2)                 | Returns whether *string2* is a prefix of *string1*
+| f s i | STARTSWITH(string1, string2)                 | Returns whether *string2* is a prefix of *string1*
 | b p | STARTS_WITH(string1, string2)                | Equivalent to `STARTSWITH(string1, string2)`
 | m | STRCMP(string, string)                         | Returns 0 if both of the strings are same and returns -1 when the first argument is smaller than the second and 1 when the second one is smaller than the first one
 | b r p | STRPOS(string, substring)                  | Equivalent to `POSITION(substring IN string)`
@@ -3045,6 +3318,7 @@ In the following:
 | b | TO_CODE_POINTS(string)                         | Converts *string* to an array of integers that represent code points or extended ASCII character values
 | o p r h | TO_DATE(string, format)                    | Converts *string* to a date using the format *format*
 | o p r | TO_TIMESTAMP(string, format)               | Converts *string* to a timestamp using the format *format*
+| p | AGE(timestamp1 [, timestamp2 ])                 | Returns a formatted string representing the difference between timestamps (for example, "3 years 11 mons 24 days 0 hours 0 mins 0.0 secs"), not an interval type. With one argument, returns the difference between the current timestamp at midnight UTC and the specified timestamp. With two arguments, returns the difference between *timestamp1* and *timestamp2*
 | b o p r s | TRANSLATE(expr, fromString, toString)  | Returns *expr* with all occurrences of each character in *fromString* replaced by its corresponding character in *toString*. Characters in *expr* that are not in *fromString* are not replaced
 | b | TRUNC(numeric1 [, integer2 ])                  | Truncates *numeric1* to optionally *integer2* (if not specified 0) places right to the decimal point
 | q | TRY_CAST(value AS type)                        | Converts *value* to *type*, returning NULL if conversion fails
@@ -3394,6 +3668,10 @@ can specify the name and optionality of each parameter using the
 [Parameter]({{ site.apiRoot }}/org/apache/calcite/linq4j/function/Parameter.html)
 annotation.
 
+For Java UDFs, `byte[]` and `ByteString` are supported Java representations of
+SQL `VARBINARY` values for parameters and return types. Boxed byte arrays
+(`Byte[]`) are not supported.
+
 ### Calling functions with named and optional parameters
 
 Usually when you call a function, you need to specify all of its parameters,
@@ -3495,12 +3773,14 @@ optionKey:
   |   stringLiteral
 
 optionVal:
-      stringLiteral
+      simpleIdentifier
+  |   numericLiteral
+  |   stringLiteral
 
 hintOption:
       simpleIdentifier
-   |  numericLiteral
-   |  stringLiteral
+  |   numericLiteral
+  |   stringLiteral
 {% endhighlight %}
 
 It is experimental in Calcite, and yet not fully implemented, what we have implemented are:

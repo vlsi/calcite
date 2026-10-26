@@ -64,20 +64,43 @@ public class SqlOverOperator extends SqlBinaryOperator {
     assert call.getOperator() == this;
     assert call.operandCount() == 2;
     SqlCall aggCall = call.operand(0);
+    boolean hasFilter = false;
     switch (aggCall.getKind()) {
     case RESPECT_NULLS:
     case IGNORE_NULLS:
+    case FILTER:
+      if (aggCall.getKind() == SqlKind.FILTER) {
+        hasFilter = true;
+      }
       validator.validateCall(aggCall, scope);
       aggCall = aggCall.operand(0);
       break;
     default:
       break;
     }
+    // Support "agg WITHIN GROUP (ORDER BY ...) OVER (...)" for inverse
+    // distribution functions such as PERCENTILE_CONT/PERCENTILE_DISC. The
+    // WITHIN GROUP wrapper carries the sort key, and the underlying operand
+    // is the actual aggregate. This is non-standard (Oracle) syntax, gated by
+    // conformance; otherwise the WITHIN GROUP call is not an aggregator and the
+    // overNonAggregate error below fires.
+    SqlNodeList groupOrderList = null;
+    if (aggCall.getKind() == SqlKind.WITHIN_GROUP
+        && validator.config().conformance().allowWithinGroupOverAggregate()) {
+      validator.validateCall(aggCall, scope);
+      groupOrderList = aggCall.operand(1);
+      aggCall = aggCall.operand(0);
+    }
     if (!aggCall.getOperator().isAggregator()) {
       throw validator.newValidationError(aggCall, RESOURCE.overNonAggregate());
     }
+    // COUNT(DISTINCT) is not allowed in window functions with FILTER
+    if (hasFilter && aggCall.getKind() == SqlKind.COUNT
+        && aggCall.getFunctionQuantifier() != null) {
+      throw validator.newValidationError(aggCall, RESOURCE.overNonAggregate());
+    }
     final SqlNode window = call.operand(1);
-    validator.validateWindow(window, scope, aggCall);
+    validator.validateWindow(window, scope, aggCall, groupOrderList);
   }
 
   @Override public RelDataType deriveType(
@@ -102,7 +125,25 @@ public class SqlOverOperator extends SqlBinaryOperator {
     SqlNode window = call.operand(1);
     SqlWindow w = validator.resolveWindow(window, scope);
 
-    final SqlCall aggCall = (SqlCall) agg;
+    SqlCall aggCall = (SqlCall) agg;
+    // "agg WITHIN GROUP (ORDER BY ...) OVER (...)": the WITHIN GROUP wrapper
+    // has already derived the correct return type (e.g. the collation column
+    // type for PERCENTILE_CONT/DISC via SqlWithinGroupOperator.deriveType), so
+    // reuse it rather than re-inferring from the bare aggregate call, which
+    // would fail because the sort key is not available to the aggregate alone.
+    if (aggCall.getKind() == SqlKind.WITHIN_GROUP) {
+      RelDataType ret = validator.deriveType(scope, aggCall);
+      validator.setValidatedNodeType(call, ret);
+      validator.setValidatedNodeType(agg, ret);
+      return ret;
+    }
+    // Unwrap FILTER, RESPECT_NULLS, or IGNORE_NULLS to get the actual aggregate call
+    while (aggCall != null
+        && (aggCall.getKind() == SqlKind.FILTER
+            || aggCall.getKind() == SqlKind.RESPECT_NULLS
+            || aggCall.getKind() == SqlKind.IGNORE_NULLS)) {
+      aggCall = aggCall.operand(0);
+    }
 
     SqlCallBinding opBinding = new SqlCallBinding(validator, scope, aggCall) {
       @Override public boolean hasEmptyGroup() {

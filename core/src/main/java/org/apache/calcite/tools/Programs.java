@@ -46,6 +46,7 @@ import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql2rel.RelDecorrelator;
 import org.apache.calcite.sql2rel.RelFieldTrimmer;
 import org.apache.calcite.sql2rel.SqlToRelConverter;
+import org.apache.calcite.sql2rel.TopDownGeneralDecorrelator;
 import org.apache.calcite.util.Util;
 
 import com.google.common.collect.ImmutableList;
@@ -80,7 +81,9 @@ public class Programs {
           EnumerableRules.ENUMERABLE_TABLE_SCAN_RULE,
           EnumerableRules.ENUMERABLE_JOIN_RULE,
           EnumerableRules.ENUMERABLE_MERGE_JOIN_RULE,
+          EnumerableRules.ENUMERABLE_IE_JOIN_RULE,
           EnumerableRules.ENUMERABLE_CORRELATE_RULE,
+          EnumerableRules.ENUMERABLE_CONDITIONAL_CORRELATE_RULE,
           EnumerableRules.ENUMERABLE_PROJECT_RULE,
           EnumerableRules.ENUMERABLE_FILTER_RULE,
           EnumerableRules.ENUMERABLE_AGGREGATE_RULE,
@@ -258,8 +261,29 @@ public class Programs {
         ImmutableList.of(CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
             CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
             CoreRules.JOIN_SUB_QUERY_TO_CORRELATE,
+            CoreRules.TABLE_FUNCTION_SCAN_SCALAR_QUERY_TO_CORRELATE,
             CoreRules.PROJECT_OVER_SUM_TO_SUM0_RULE));
-    return of(builder.build(), true, metadataProvider);
+    final Program oldProgram = of(builder.build(), true, metadataProvider);
+
+    final HepProgramBuilder newBuilder = HepProgram.builder();
+    newBuilder.addRuleCollection(
+        ImmutableList.of(CoreRules.FILTER_SUB_QUERY_TO_MARK_CORRELATE,
+            CoreRules.PROJECT_SUB_QUERY_TO_MARK_CORRELATE,
+            CoreRules.JOIN_SUB_QUERY_TO_CORRELATE,
+            CoreRules.TABLE_FUNCTION_SCAN_SCALAR_QUERY_TO_CORRELATE,
+            CoreRules.PROJECT_OVER_SUM_TO_SUM0_RULE));
+    final Program newProgram = of(newBuilder.build(), true, metadataProvider);
+
+    return (planner, rel, requiredOutputTraits, materializations, lattices) -> {
+      final CalciteConnectionConfig config =
+          planner.getContext().maybeUnwrap(CalciteConnectionConfig.class)
+              .orElse(CalciteConnectionConfig.DEFAULT);
+      final Program program = config.topDownGeneralDecorrelationEnabled()
+          ? newProgram
+          : oldProgram;
+      return program.run(planner, rel, requiredOutputTraits, materializations,
+          lattices);
+    };
   }
 
   public static Program measure(RelMetadataProvider metadataProvider) {
@@ -284,6 +308,11 @@ public class Programs {
   /** Returns the standard program used by Prepare. */
   public static Program standard() {
     return standard(DefaultRelMetadataProvider.INSTANCE, true);
+  }
+
+  /** Returns the standard program with enableFieldTrimming config. */
+  public static Program standard(Boolean enableFieldTrimming) {
+    return standard(DefaultRelMetadataProvider.INSTANCE, enableFieldTrimming);
   }
 
   /** Returns the standard program with user metadata provider. */
@@ -425,6 +454,9 @@ public class Programs {
       if (config.forceDecorrelate()) {
         final RelBuilder relBuilder =
             RelFactories.LOGICAL_BUILDER.create(rel.getCluster(), null);
+        if (config.topDownGeneralDecorrelationEnabled()) {
+          return TopDownGeneralDecorrelator.decorrelateQuery(rel, relBuilder);
+        }
         return RelDecorrelator.decorrelateQuery(rel, relBuilder);
       }
       return rel;

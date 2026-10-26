@@ -69,11 +69,12 @@ public class SqlUnnestOperator extends SqlFunctionalOperator {
       if (type.getSqlTypeName() == SqlTypeName.ANY) {
         // Unnest Operator in schema less systems returns one column as the output
         // $unnest is a placeholder to specify that one column with type ANY is output.
-        return builder
-            .add("$unnest",
-                SqlTypeName.ANY)
-            .nullable(true)
-            .build();
+        builder.add("$unnest", SqlTypeName.ANY)
+            .nullable(true);
+        if (withOrdinality) {
+          builder.add(ORDINALITY_COLUMN_NAME, SqlTypeName.INTEGER);
+        }
+        return builder.build();
       }
 
       if (type.isStruct()) {
@@ -83,13 +84,25 @@ public class SqlUnnestOperator extends SqlFunctionalOperator {
       assert type instanceof ArraySqlType || type instanceof MultisetSqlType
           || type instanceof MapSqlType;
       // If a type is nullable, all field accesses inside the type are also nullable
+      // With multiple collections, zip semantics pad shorter collections with
+      // NULL, so all output columns from a multi-collection UNNEST are nullable.
+      final boolean padNullable = opBinding.getOperandCount() > 1;
       if (type instanceof MapSqlType) {
         MapSqlType mapType = (MapSqlType) type;
-        builder.add(MAP_KEY_COLUMN_NAME, mapType.getKeyType());
-        builder.add(MAP_VALUE_COLUMN_NAME, mapType.getValueType());
+        RelDataType keyType = padNullable
+            ? typeFactory.enforceTypeWithNullability(mapType.getKeyType(), true)
+            : mapType.getKeyType();
+        RelDataType valueType = padNullable
+            ? typeFactory.enforceTypeWithNullability(mapType.getValueType(), true)
+            : mapType.getValueType();
+        builder.add(MAP_KEY_COLUMN_NAME, keyType);
+        builder.add(MAP_VALUE_COLUMN_NAME, valueType);
       } else {
         RelDataType componentType = requireNonNull(type.getComponentType(), "componentType");
-        boolean isNullable = componentType.isNullable();
+        boolean isNullable = componentType.isNullable() || padNullable;
+        // Whether a struct element expands into one column per field depends
+        // on the SQL conformance; allowAliasUnnestItems describes how
+        // collections of ROW values are expanded.
         if (!allowAliasUnnestItems(opBinding) && componentType.isStruct()) {
           for (RelDataTypeField field : componentType.getFieldList()) {
             RelDataType fieldType = field.getType();
@@ -99,8 +112,16 @@ public class SqlUnnestOperator extends SqlFunctionalOperator {
             builder.add(field.getName(), fieldType);
           }
         } else {
-          builder.add(SqlUtil.deriveAliasFromOrdinal(operand),
-              componentType);
+          RelDataType elementType = componentType.isStruct()
+              ? typeFactory.builder().kind(componentType.getStructKind())
+                  .addAll(componentType.getFieldList()).build()
+              : componentType;
+          // A NULL collection element becomes a NULL value in this column, so
+          // the column is nullable whenever the element type is.
+          RelDataType colType = isNullable
+              ? typeFactory.enforceTypeWithNullability(elementType, true)
+              : elementType;
+          builder.add(SqlUtil.deriveAliasFromOrdinal(operand), colType);
         }
       }
     }

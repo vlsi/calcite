@@ -18,6 +18,30 @@
 !use post
 !set outputformat mysql
 
+# Test case for [CALCITE-7435] WINDOW functions should allow ORDER BY fields of type INTERVAL
+# This result has been validated on Postgres by slightly changing the query (subtraction is different in Postgres)
+WITH
+T(ts, l) AS (VALUES(TIMESTAMP '2020-01-01 10:00:00', 10),
+                   (TIMESTAMP '2020-02-01 10:00:00', 10),
+                   (TIMESTAMP '2019-12-30 20:00:00', 10)),
+IT AS (SELECT(ts - TIMESTAMP '2020-01-01 00:00:00') HOURS AS t, l FROM T)
+SELECT *,
+   COUNT(*) OVER (
+      PARTITION BY l
+      ORDER BY t
+      RANGE BETWEEN INTERVAL 2 DAYS PRECEDING AND INTERVAL 1 DAYS PRECEDING) AS c
+FROM It;
++------+----+---+
+| T    | L  | C |
++------+----+---+
+| +10  | 10 | 1 |
+| -28  | 10 | 0 |
+| +754 | 10 | 0 |
++------+----+---+
+(3 rows)
+
+!ok
+
 # Multiple window functions sharing a single window
 select count(*) over(partition by gender order by ename) as count1,
   count(*) over(partition by deptno order by ename) as count2,
@@ -1003,7 +1027,7 @@ select gender, count(*) over(partition by gender order by ename) as count1 from 
 
 # Get the plan and result which push filter past window
 select gender, count(*) over(partition by gender order by ename) as count1 from emp where gender = 'F';
-EnumerableCalc(expr#0..3=[{inputs}], GENDER=[$t2], $1=[$t3])
+EnumerableCalc(expr#0..3=[{inputs}], GENDER=[$t2], COUNT1=[$t3])
   EnumerableWindow(window#0=[window(partition {2} order by [0] aggs [COUNT()])])
     EnumerableCalc(expr#0..2=[{inputs}], expr#3=['F'], expr#4=[=($t2, $t3)], proj#0..2=[{exprs}], $condition=[$t4])
       EnumerableValues(tuples=[[{ 'Jane ', 10, 'F' }, { 'Bob  ', 10, 'M' }, { 'Eric ', 20, 'M' }, { 'Susan', 30, 'F' }, { 'Alice', 30, 'F' }, { 'Adam ', 50, 'M' }, { 'Eve  ', 50, 'F' }, { 'Grace', 60, 'F' }, { 'Wilma', null, 'F' }]])
@@ -1149,4 +1173,413 @@ order by 1;
 (14 rows)
 
 !ok
+
+# [CALCITE-6442] Support FILTER clause with window functions
+# The following 4 tests are related to this issue.
+# Results were validated on Postgres.
+
+# Test 1: FILTER with OVER on COUNT
+select empno, deptno,
+  count(*) filter (where sal > 1500) over (partition by deptno) as filtered_count
+from emp
+order by empno;
++-------+--------+----------------+
+| EMPNO | DEPTNO | FILTERED_COUNT |
++-------+--------+----------------+
+|  7369 |     20 |              3 |
+|  7499 |     30 |              2 |
+|  7521 |     30 |              2 |
+|  7566 |     20 |              3 |
+|  7654 |     30 |              2 |
+|  7698 |     30 |              2 |
+|  7782 |     10 |              2 |
+|  7788 |     20 |              3 |
+|  7839 |     10 |              2 |
+|  7844 |     30 |              2 |
+|  7876 |     20 |              3 |
+|  7900 |     30 |              2 |
+|  7902 |     20 |              3 |
+|  7934 |     10 |              2 |
++-------+--------+----------------+
+(14 rows)
+
+!ok
+
+# Test 2: FILTER with OVER on SUM
+select empno, deptno,
+  sum(sal) filter (where comm is not null) over (partition by deptno) as filtered_sum
+from emp
+order by empno;
++-------+--------+--------------+
+| EMPNO | DEPTNO | FILTERED_SUM |
++-------+--------+--------------+
+|  7369 |     20 |              |
+|  7499 |     30 |      5600.00 |
+|  7521 |     30 |      5600.00 |
+|  7566 |     20 |              |
+|  7654 |     30 |      5600.00 |
+|  7698 |     30 |      5600.00 |
+|  7782 |     10 |              |
+|  7788 |     20 |              |
+|  7839 |     10 |              |
+|  7844 |     30 |      5600.00 |
+|  7876 |     20 |              |
+|  7900 |     30 |      5600.00 |
+|  7902 |     20 |              |
+|  7934 |     10 |              |
++-------+--------+--------------+
+(14 rows)
+
+!ok
+
+# Test 3: Multiple FILTER with OVER on different aggregates
+select empno, deptno,
+  count(*) filter (where sal > 1500) over (partition by deptno) as high_sal_count,
+  sum(sal) filter (where sal <= 1500) over (partition by deptno) as low_sal_sum
+from emp
+order by empno;
++-------+--------+----------------+-------------+
+| EMPNO | DEPTNO | HIGH_SAL_COUNT | LOW_SAL_SUM |
++-------+--------+----------------+-------------+
+|  7369 |     20 |              3 |     1900.00 |
+|  7499 |     30 |              2 |     4950.00 |
+|  7521 |     30 |              2 |     4950.00 |
+|  7566 |     20 |              3 |     1900.00 |
+|  7654 |     30 |              2 |     4950.00 |
+|  7698 |     30 |              2 |     4950.00 |
+|  7782 |     10 |              2 |     1300.00 |
+|  7788 |     20 |              3 |     1900.00 |
+|  7839 |     10 |              2 |     1300.00 |
+|  7844 |     30 |              2 |     4950.00 |
+|  7876 |     20 |              3 |     1900.00 |
+|  7900 |     30 |              2 |     4950.00 |
+|  7902 |     20 |              3 |     1900.00 |
+|  7934 |     10 |              2 |     1300.00 |
++-------+--------+----------------+-------------+
+(14 rows)
+
+!ok
+
+# Test 4: FILTER with OVER and ORDER BY (running window)
+select empno, deptno, sal,
+  sum(sal) filter (where sal > 1000) over (partition by deptno order by empno rows between unbounded preceding and current row) as running_sum
+from emp
+order by empno;
++-------+--------+---------+-------------+
+| EMPNO | DEPTNO | SAL     | RUNNING_SUM |
++-------+--------+---------+-------------+
+|  7369 |     20 |  800.00 |             |
+|  7499 |     30 | 1600.00 |     1600.00 |
+|  7521 |     30 | 1250.00 |     2850.00 |
+|  7566 |     20 | 2975.00 |     2975.00 |
+|  7654 |     30 | 1250.00 |     4100.00 |
+|  7698 |     30 | 2850.00 |     6950.00 |
+|  7782 |     10 | 2450.00 |     2450.00 |
+|  7788 |     20 | 3000.00 |     5975.00 |
+|  7839 |     10 | 5000.00 |     7450.00 |
+|  7844 |     30 | 1500.00 |     8450.00 |
+|  7876 |     20 | 1100.00 |     7075.00 |
+|  7900 |     30 |  950.00 |     8450.00 |
+|  7902 |     20 | 3000.00 |    10075.00 |
+|  7934 |     10 | 1300.00 |     8750.00 |
++-------+--------+---------+-------------+
+(14 rows)
+
+!ok
+
+# Test 5: FILTER with OVER and running window without PARTITION BY
+select ename, job, hiredate,
+  avg(sal) over (order by hiredate, ename rows 3 preceding) as avg_sal,
+  avg(sal) filter (where job = 'MANAGER') over (order by hiredate, ename rows 3 preceding)
+    as avg_mgr_sal
+from emp
+order by hiredate, ename;
++--------+-----------+------------+---------+-------------+
+| ENAME  | JOB       | HIREDATE   | AVG_SAL | AVG_MGR_SAL |
++--------+-----------+------------+---------+-------------+
+| SMITH  | CLERK     | 1980-12-17 |  800.00 |             |
+| BLAKE  | MANAGER   | 1981-01-05 | 1825.00 |     2850.00 |
+| JONES  | MANAGER   | 1981-02-04 | 2208.33 |     2912.50 |
+| ALLEN  | SALESMAN  | 1981-02-20 | 2056.25 |     2912.50 |
+| WARD   | SALESMAN  | 1981-02-22 | 2168.75 |     2912.50 |
+| CLARK  | MANAGER   | 1981-06-09 | 2068.75 |     2712.50 |
+| TURNER | SALESMAN  | 1981-09-08 | 1700.00 |     2450.00 |
+| MARTIN | SALESMAN  | 1981-09-28 | 1612.50 |     2450.00 |
+| KING   | PRESIDENT | 1981-11-17 | 2550.00 |     2450.00 |
+| FORD   | ANALYST   | 1981-12-03 | 2687.50 |             |
+| JAMES  | CLERK     | 1981-12-03 | 2550.00 |             |
+| MILLER | CLERK     | 1982-01-23 | 2562.50 |             |
+| SCOTT  | ANALYST   | 1987-04-19 | 2062.50 |             |
+| ADAMS  | CLERK     | 1987-05-23 | 1587.50 |             |
++--------+-----------+------------+---------+-------------+
+(14 rows)
+
+!ok
+
+# Test 6: FILTER on window value functions is not supported
+select first_value(sal) filter (where job = 'MANAGER') over (order by hiredate)
+from emp;
+java.sql.SQLException: Error while executing SQL "select first_value(sal) filter (where job = 'MANAGER') over (order by hiredate)
+from emp": FILTER clause is not supported for window function FIRST_VALUE
+!error
+
+# [CALCITE-7701] Support IGNORE NULLS for FIRST_VALUE/LAST_VALUE window functions in the enumerable convention
+# Verified against Oracle
+# FIRST_VALUE with IGNORE NULLS returns the first non-null value in the frame
+# (or NULL if the frame is empty or all values are null).
+select o, v,
+  first_value(v) ignore nulls over (order by o rows 2 preceding) as fv
+from (values (1, 1), (2, cast(null as integer)), (3, 3),
+             (4, cast(null as integer)), (5, cast(null as integer))) as t(o, v);
++---+---+----+
+| O | V | FV |
++---+---+----+
+| 1 | 1 |  1 |
+| 2 |   |  1 |
+| 3 | 3 |  1 |
+| 4 |   |  3 |
+| 5 |   |  3 |
++---+---+----+
+(5 rows)
+
+!ok
+
+# LAST_VALUE with IGNORE NULLS returns the last non-null value in the frame.
+select o, v,
+  last_value(v) ignore nulls over (order by o rows 2 preceding) as lv
+from (values (1, 1), (2, cast(null as integer)), (3, 3),
+             (4, cast(null as integer)), (5, cast(null as integer))) as t(o, v);
++---+---+----+
+| O | V | LV |
++---+---+----+
+| 1 | 1 |  1 |
+| 2 |   |  1 |
+| 3 | 3 |  3 |
+| 4 |   |  3 |
+| 5 |   |  3 |
++---+---+----+
+(5 rows)
+
+!ok
+
+# IGNORE NULLS returns NULL when every row in the frame is null.
+select o, v,
+  first_value(v) ignore nulls
+    over (order by o rows between 1 preceding and 1 preceding) as fv
+from (values (1, cast(null as integer)), (2, cast(null as integer)),
+             (3, 5)) as t(o, v);
++---+---+----+
+| O | V | FV |
++---+---+----+
+| 1 |   |    |
+| 2 |   |    |
+| 3 | 5 |    |
++---+---+----+
+(3 rows)
+
+!ok
+
+# RESPECT NULLS (the default) still returns the boundary value, including NULL.
+select o, v,
+  first_value(v) respect nulls over (order by o rows 2 preceding) as fv,
+  last_value(v) over (order by o rows 2 preceding) as lv
+from (values (1, 1), (2, cast(null as integer)), (3, 3)) as t(o, v);
++---+---+----+----+
+| O | V | FV | LV |
++---+---+----+----+
+| 1 | 1 |  1 |  1 |
+| 2 |   |  1 |    |
+| 3 | 3 |  1 |  3 |
++---+---+----+----+
+(3 rows)
+
+!ok
+
+# IGNORE NULLS works with an unbounded ROWS window.
+select o, v,
+  first_value(v) ignore nulls
+    over (order by o rows between unbounded preceding and unbounded following) as fv,
+  last_value(v) ignore nulls
+    over (order by o rows between unbounded preceding and unbounded following) as lv
+from (values (1, 1), (2, cast(null as integer)), (3, 3),
+             (4, cast(null as integer)), (5, cast(null as integer))) as t(o, v);
++---+---+----+----+
+| O | V | FV | LV |
++---+---+----+----+
+| 1 | 1 |  1 |  3 |
+| 2 |   |  1 |  3 |
+| 3 | 3 |  1 |  3 |
+| 4 |   |  1 |  3 |
+| 5 |   |  1 |  3 |
++---+---+----+----+
+(5 rows)
+
+!ok
+
+# IGNORE NULLS works with the default RANGE frame (UNBOUNDED PRECEDING TO CURRENT ROW).
+select o, v,
+  first_value(v) ignore nulls over (order by o) as fv,
+  last_value(v) ignore nulls over (order by o) as lv
+from (values (1, 1), (2, cast(null as integer)), (3, 3),
+             (4, cast(null as integer)), (5, cast(null as integer))) as t(o, v);
++---+---+----+----+
+| O | V | FV | LV |
++---+---+----+----+
+| 1 | 1 |  1 |  1 |
+| 2 |   |  1 |  1 |
+| 3 | 3 |  1 |  3 |
+| 4 |   |  1 |  3 |
+| 5 |   |  1 |  3 |
++---+---+----+----+
+(5 rows)
+
+!ok
+
+# IGNORE NULLS works with a symmetric RANGE window.
+select o, v,
+  first_value(v) ignore nulls
+    over (order by o range between 1 preceding and 1 following) as fv,
+  last_value(v) ignore nulls
+    over (order by o range between 1 preceding and 1 following) as lv
+from (values (1, 1), (2, cast(null as integer)), (3, 3),
+             (4, cast(null as integer)), (5, cast(null as integer))) as t(o, v);
++---+---+----+----+
+| O | V | FV | LV |
++---+---+----+----+
+| 1 | 1 |  1 |  1 |
+| 2 |   |  1 |  3 |
+| 3 | 3 |  3 |  3 |
+| 4 |   |  3 |  3 |
+| 5 |   |    |    |
++---+---+----+----+
+(5 rows)
+
+!ok
+
+# IGNORE NULLS works with RANGE peers: the current-row peer group is included.
+# The result rows are ordered to make the peer-group ordering deterministic
+# and to match Oracle.
+select o, v,
+  first_value(v) ignore nulls
+    over (order by o range between unbounded preceding and current row) as fv,
+  last_value(v) ignore nulls
+    over (order by o range between unbounded preceding and current row) as lv
+from (values (1, 1), (2, cast(null as integer)), (2, 3),
+             (4, cast(null as integer)), (5, cast(null as integer))) as t(o, v)
+order by o, v;
++---+---+----+----+
+| O | V | FV | LV |
++---+---+----+----+
+| 1 | 1 |  1 |  1 |
+| 2 | 3 |  1 |  3 |
+| 2 |   |  1 |  3 |
+| 4 |   |  1 |  3 |
+| 5 |   |  1 |  3 |
++---+---+----+----+
+(5 rows)
+
+!ok
+
+# [CALCITE-7835] Optimize away LEAD/LAG with a value of 0
+# LAG and LEAD with offset 0 return the value of the current row.
+# Verified on Postgres.
+select o, v,
+  lag(v, 0) over (order by o) as l,
+  lag(o, 0) over (order by o) as lo,
+  lead(o, 0, 100) over (order by o) as ld
+from (values (1, 10), (2, cast(null as integer)), (3, 30)) as t(o, v);
++---+----+----+----+----+
+| O | V  | L  | LO | LD |
++---+----+----+----+----+
+| 1 | 10 | 10 |  1 |  1 |
+| 2 |    |    |  2 |  2 |
+| 3 | 30 | 30 |  3 |  3 |
++---+----+----+----+----+
+(3 rows)
+
+!ok
+O INTEGER(10) NOT NULL
+V INTEGER(10)
+L INTEGER(10)
+LO INTEGER(10)
+LD INTEGER(10) NOT NULL
+!type
+EnumerableCalc(expr#0..1=[{inputs}], expr#2=[CAST($t0):INTEGER], proj#0..1=[{exprs}], L=[$t1], LO=[$t2], LD=[$t0])
+  EnumerableValues(tuples=[[{ 1, 10 }, { 2, null }, { 3, 30 }]])
+!plan
+
+# With offset 0, IGNORE NULLS has no effect: SQL:2016 returns the value of
+# the current row, even if it is NULL.
+select o, v, lag(v, 0) ignore nulls over (order by o) as l
+from (values (1, 10), (2, cast(null as integer)), (3, 30)) as t(o, v);
++---+----+----+
+| O | V  | L  |
++---+----+----+
+| 1 | 10 | 10 |
+| 2 |    |    |
+| 3 | 30 | 30 |
++---+----+----+
+(3 rows)
+
+!ok
+
+# Test case for [CALCITE-7834] Type inferred for LAG/LEAD is not always nullable
+# Validated on Postgres.
+SELECT y, x, LAG(x, 1, 0) OVER (ORDER BY y) AS l
+FROM (VALUES (1, 10), (2, CAST(NULL AS INTEGER)), (3, 30)) AS t(y, x);
++---+----+----+
+| Y | X  | L  |
++---+----+----+
+| 1 | 10 |  0 |
+| 2 |    | 10 |
+| 3 | 30 |    |
++---+----+----+
+(3 rows)
+
+!ok
+Y INTEGER(10) NOT NULL
+X INTEGER(10)
+L INTEGER(10)
+!type
+
+# Offset 0. Validated on Postgres.
+SELECT y, x, LEAD(x, 0, 0) OVER (ORDER BY y) AS l
+FROM (VALUES (1, 10), (2, CAST(NULL AS INTEGER)), (3, 30)) AS t(y, x);
++---+----+----+
+| Y | X  | L  |
++---+----+----+
+| 1 | 10 | 10 |
+| 2 |    |    |
+| 3 | 30 | 30 |
++---+----+----+
+(3 rows)
+
+!ok
+
+# Validated on Postgres.
+SELECT y, x, LAG(x, 1, 'z') OVER (ORDER BY y) AS l
+FROM (VALUES (1, 'a'), (2, CAST(NULL AS CHAR(1))), (3, 'c')) AS t(y, x);
++---+---+---+
+| Y | X | L |
++---+---+---+
+| 1 | a | z |
+| 2 |   | a |
+| 3 | c |   |
++---+---+---+
+(3 rows)
+
+!ok
+Y INTEGER(10) NOT NULL
+X CHAR(1)
+L VARCHAR
+!type
+
+# A NULL offset gives NULL, so the result type is nullable.  Validated on Postgres.
+SELECT y, x, LAG(x, o, 0) OVER (ORDER BY y) AS l
+FROM (VALUES (1, 10, 1), (2, 20, CAST(NULL AS INTEGER)), (3, 30, 1)) AS t(y, x, o);
+Y INTEGER(10) NOT NULL
+X INTEGER(10) NOT NULL
+L INTEGER(10)
+!type
+
 # End winagg.iq

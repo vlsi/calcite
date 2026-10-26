@@ -183,6 +183,9 @@ public enum SqlKind {
   /** The DISTINCT keyword of the GROUP BY clause. */
   GROUP_BY_DISTINCT,
 
+  /** The ALL keyword of the GROUP BY clause. */
+  GROUP_BY_ALL,
+
   /**
    * ORDER BY clause.
    *
@@ -192,17 +195,26 @@ public enum SqlKind {
    */
   ORDER_BY,
 
+  /** The ALL keyword of the ORDER BY clause. */
+  ORDER_BY_ALL,
+
   /** WITH clause. */
   WITH,
 
   /** Item in WITH clause. */
   WITH_ITEM,
 
+  /** CYCLE clause of a recursive WITH item. */
+  CYCLE,
+
   /** Represents a recursive CTE as a table ref. */
   WITH_ITEM_TABLE_REF,
 
   /** Item expression. */
   ITEM,
+
+  /** Colon path access. */
+  COLON,
 
   /** {@code UNION} relational operator. */
   UNION,
@@ -996,6 +1008,11 @@ public enum SqlKind {
   /**
    * The internal REINTERPRET operator (meaning a reinterpret cast).
    * An internal operator that does not appear in SQL syntax.
+   *
+   * <p>Do not use. The
+   * {@link org.apache.calcite.sql.fun.SqlStdOperatorTable#REINTERPRET}
+   * operator is deprecated and will be removed, together with this value;
+   * use {@link #CAST} instead.
    */
   REINTERPRET,
 
@@ -1476,8 +1493,9 @@ public enum SqlKind {
                   TIMESTAMP_ADD, TIMESTAMP_DIFF, TIMESTAMP_SUB,
                   EXTRACT, INTERVAL,
                   LITERAL_CHAIN, JDBC_FN, PRECEDING, FOLLOWING, ORDER_BY,
+                  ORDER_BY_ALL,
                   NULLS_FIRST, NULLS_LAST, COLLECTION_TABLE, TABLESAMPLE,
-                  VALUES, WITH, WITH_ITEM, ITEM, SKIP_TO_FIRST, SKIP_TO_LAST,
+                  VALUES, WITH, WITH_ITEM, CYCLE, ITEM, SKIP_TO_FIRST, SKIP_TO_LAST,
                   JSON_VALUE_EXPRESSION, UNNEST),
               SET_QUERY, AGGREGATE, DML, DDL));
 

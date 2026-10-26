@@ -457,13 +457,22 @@ public class PushProjector {
         || (childRel instanceof SetOp)) {
       // if nothing is projected from the children, arbitrarily project
       // the first columns; this is necessary since Fennel doesn't
-      // handle 0-column projections
-      if (nProject == 0 && childPreserveExprs.isEmpty()) {
+      // handle 0-column projections.
+      //
+      // An input may legitimately have a zero-column row type: for
+      // example, a Values with an empty row type and a single empty
+      // tuple, which returns one row with zero columns and is the
+      // identity for cross join. There is no first column to fall back
+      // on in that case, so skip the workaround rather than set a bit
+      // that points past the input's fields; createProjectRefsAndExprs
+      // would use it to index into an empty field list.
+      if (nProject == 0 && childPreserveExprs.isEmpty() && nFields > 0) {
         projRefs.set(0);
         nProject = 1;
       }
       if (childRel instanceof Join) {
-        if (nRightProject == 0 && rightPreserveExprs.isEmpty()) {
+        if (nRightProject == 0 && rightPreserveExprs.isEmpty()
+            && nFieldsRight > 0) {
           projRefs.set(nFields);
           nRightProject = 1;
         }
@@ -717,14 +726,17 @@ public class PushProjector {
       return null;
     }
 
-    private boolean isStrong(final ImmutableBitSet exprArgs, final RexNode call) {
+    private boolean canPush(final ImmutableBitSet exprArgs, final RexNode call) {
       // If the expressions do not use any of the inputs that require output to be null,
       // no need to check.  Otherwise, check that the expression is null.
       // For example, in an "left outer join", we don't require that expressions
       // pushed down into the left input to be strong.  On the other hand,
       // expressions pushed into the right input must be.  In that case,
       // strongFields == right input fields.
-      return !strongFields.intersects(exprArgs) || strong.isNull(call);
+      if (!strongFields.intersects(exprArgs)) {
+        return true;
+      }
+      return strong.isNull(call) && call.getType().isNullable();
     }
 
     private boolean preserve(RexNode call) {
@@ -734,13 +746,13 @@ public class PushProjector {
         // it only references expressions on the right
         final ImmutableBitSet exprArgs = RelOptUtil.InputFinder.bits(call);
         if (exprArgs.cardinality() > 0) {
-          if (leftFields.contains(exprArgs) && isStrong(exprArgs, call)) {
+          if (leftFields.contains(exprArgs) && canPush(exprArgs, call)) {
             if (!preserveLeft.contains(call)) {
               preserveLeft.add(call);
             }
             return true;
           } else if (requireNonNull(rightFields, "rightFields").contains(exprArgs)
-              && isStrong(exprArgs, call)) {
+              && canPush(exprArgs, call)) {
             requireNonNull(preserveRight, "preserveRight");
             if (!preserveRight.contains(call)) {
               preserveRight.add(call);

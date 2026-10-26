@@ -23,10 +23,12 @@ import org.apache.calcite.plan.Convention;
 import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.plan.volcano.RelSubset;
 import org.apache.calcite.rel.InvalidRelException;
 import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.convert.ConverterRule;
+import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.logical.LogicalAggregate;
 import org.apache.calcite.rel.logical.LogicalFilter;
@@ -46,6 +48,8 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 
 import java.util.AbstractList;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Rules and relational operators for
@@ -134,8 +138,57 @@ class ElasticsearchRules {
         ? s.substring(1, s.length() - 1) : s;
   }
 
-  private static String escapeSpecialSymbols(String s) {
+  /** Escapes the two characters that would terminate a JSON string. A SQL
+   * name or alias concatenated between double quotes stays a single JSON
+   * string only if backslash and double quote are doubled. Callers that
+   * embed the value inside a JSON body must route it through this helper
+   * before calling {@link #quote}. */
+  static String escapeJsonString(String s) {
     return s.replace("\\", "\\\\").replace("\"", "\\\"");
+  }
+
+  /** Shape of field paths that may be embedded in a scripted-field
+   * script using the historical dot notation, for example {@code city},
+   * {@code b.a} or {@code loc[0]}. */
+  private static final Pattern SIMPLE_SCRIPT_PATH =
+      // Use possessive quantifier *+ instead of greedy ones to avoid backtracking on inputs
+      // that almost, but do not quite, match (avoiding potential catastrophic backtracking)
+      Pattern.compile("[A-Za-z_][A-Za-z0-9_]*+"
+          + "(?:\\.[A-Za-z_][A-Za-z0-9_]*+)*+(?:\\[[0-9]++\\])*+");
+
+  /** Pattern matching trailing subscripts of a field path, for example {@code [0]}
+   * in {@code loc[0]}. */
+  private static final Pattern TRAILING_SUBSCRIPTS =
+      // Possessive quantifiers as above
+      Pattern.compile("(?:\\[[0-9]++\\])++$");
+
+  /** Builds the script snippet (Painless/Groovy) that reads {@code path}
+   * from the document source, for example {@code params._source.city}.
+   *
+   * <p>Simple paths keep the historical dot notation. Any other path is
+   * accessed via map subscripts (for example
+   * {@code params._source['a-b']}), with the field name confined to a
+   * single-quoted script string literal (backslashes and quotes escaped),
+   * so that a field name containing script punctuation is always treated
+   * as data instead of being parsed as Painless/Groovy code. */
+  static String scriptedFieldAccess(String prefix, String path) {
+    if (SIMPLE_SCRIPT_PATH.matcher(path).matches()) {
+      return prefix + "." + path;
+    }
+    String name = path;
+    String subscripts = "";
+    final Matcher matcher = TRAILING_SUBSCRIPTS.matcher(path);
+    if (matcher.find()) {
+      name = path.substring(0, matcher.start());
+      subscripts = path.substring(matcher.start());
+    }
+    final StringBuilder builder = new StringBuilder(prefix);
+    for (String step : name.split("\\.", -1)) {
+      builder.append("['")
+          .append(step.replace("\\", "\\\\").replace("'", "\\'"))
+          .append("']");
+    }
+    return builder.append(subscripts).toString();
   }
 
   /**
@@ -158,9 +211,9 @@ class ElasticsearchRules {
       }
       return "\"literal\":"
           + quote(
-          escapeSpecialSymbols(
-              RexToLixTranslator.translateLiteral(literal, literal.getType(),
-                  typeFactory, RexImpTable.NullAs.NOT_POSSIBLE).toString()));
+              escapeJsonString(
+                  RexToLixTranslator.translateLiteral(literal, literal.getType(),
+                      typeFactory, RexImpTable.NullAs.NOT_POSSIBLE).toString()));
     }
 
     @Override public String visitInputRef(RexInputRef inputRef) {
@@ -263,8 +316,42 @@ class ElasticsearchRules {
       super(config);
     }
 
+    /**
+     * Checks if the relational expression or any of its inputs
+     * is an Aggregate (LogicalAggregate or ElasticsearchAggregate).
+     */
+    private static boolean containsAggregate(RelNode node) {
+      // Handle RelSubset by checking its best or original node
+      if (node instanceof RelSubset) {
+        RelSubset subset = (RelSubset) node;
+        RelNode best = subset.getBest();
+        if (best != null) {
+          return containsAggregate(best);
+        }
+        RelNode original = subset.getOriginal();
+        if (original != null) {
+          return containsAggregate(original);
+        }
+        return false;
+      }
+      if (node instanceof Aggregate) {
+        return true;
+      }
+      for (RelNode input : node.getInputs()) {
+        if (containsAggregate(input)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
     @Override public @Nullable RelNode convert(RelNode rel) {
       final LogicalAggregate agg = (LogicalAggregate) rel;
+
+      // Prevent nested aggregations from being pushed down to Elasticsearch
+      if (containsAggregate(agg.getInput())) {
+        return null;
+      }
       final RelTraitSet traitSet = agg.getTraitSet().replace(out);
       try {
         return new ElasticsearchAggregate(

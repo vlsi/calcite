@@ -18,6 +18,7 @@ package org.apache.calcite.sql;
 
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.sql.parser.SqlParserPos;
+import org.apache.calcite.sql.type.SqlTypeUtil;
 import org.apache.calcite.sql.util.SqlVisitor;
 import org.apache.calcite.sql.validate.SqlMoniker;
 import org.apache.calcite.sql.validate.SqlMonotonicity;
@@ -69,6 +70,25 @@ public abstract class SqlCall extends SqlNode {
    */
   public void setOperand(int i, @Nullable SqlNode operand) {
     throw new UnsupportedOperationException();
+  }
+
+  /**
+   * Replaces all operands. Allows some rewrite by {@link SqlValidator}; use
+   * sparingly.
+   *
+   * <p>The default implementation delegates to {@link #setOperand(int, SqlNode)}.
+   * Subclasses may override this method to replace all operands more efficiently.
+   *
+   * @param operands New operands
+   */
+  public void setOperandList(
+      List<? extends @Nullable SqlNode> operands) {
+    if (operands.size() != operandCount()) {
+      throw new IllegalArgumentException("operand count must not change");
+    }
+    for (int i = 0; i < operands.size(); i++) {
+      setOperand(i, operands.get(i));
+    }
   }
 
   @Override public SqlKind getKind() {
@@ -210,7 +230,8 @@ public abstract class SqlCall extends SqlNode {
       if (null == argType) {
         continue;
       }
-      signatureList.add(argType.toString());
+      signatureList.add(
+          SqlTypeUtil.asSqlType(argType, SqlTypeUtil.NullabilityDisplay.DoNotDisplay));
     }
     return SqlUtil.getOperatorSignature(getOperator(), signatureList);
   }

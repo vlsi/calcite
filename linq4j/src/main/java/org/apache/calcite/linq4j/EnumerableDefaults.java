@@ -31,8 +31,10 @@ import org.apache.calcite.linq4j.function.NullableDoubleFunction1;
 import org.apache.calcite.linq4j.function.NullableFloatFunction1;
 import org.apache.calcite.linq4j.function.NullableIntegerFunction1;
 import org.apache.calcite.linq4j.function.NullableLongFunction1;
+import org.apache.calcite.linq4j.function.NullablePredicate2;
 import org.apache.calcite.linq4j.function.Predicate1;
 import org.apache.calcite.linq4j.function.Predicate2;
+import org.apache.calcite.linq4j.tree.ExpressionType;
 
 import com.google.common.base.Suppliers;
 import com.google.common.collect.HashMultiset;
@@ -47,6 +49,7 @@ import org.checkerframework.dataflow.qual.Pure;
 import org.checkerframework.framework.qual.HasQualifierParameter;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.AbstractList;
 import java.util.AbstractMap;
 import java.util.AbstractSet;
@@ -60,6 +63,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.ListIterator;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
@@ -797,13 +801,40 @@ public abstract class EnumerableDefaults {
       Function0<TAccumulate> accumulatorInitializer,
       Function2<TAccumulate, TSource, TAccumulate> accumulatorAdder,
       final Function2<TKey, TAccumulate, TResult> resultSelector) {
+    return groupByMultiple(enumerable, keySelectors, accumulatorInitializer,
+        accumulatorAdder, resultSelector, null);
+  }
+
+  /**
+   * Groups the elements of a sequence according to a list of
+   * specified key selector functions, initializing an accumulator for each
+   * group and adding to it each time an element with the same key is seen.
+   * Creates a result value from each accumulator and its key using a
+   * specified function.
+   *
+   * <p>This method exists to support SQL {@code GROUPING SETS}.
+   * It does not correspond to any method in {@link Enumerable}.
+   *
+   * <p>If {@code emptyGroupKey} is not null, it is the key of the empty
+   * grouping set (the one that aggregates over all input rows, like a query
+   * with no GROUP BY). In that case, a single row is produced for that key
+   * even when the input is empty, just as a query with no GROUP BY returns
+   * a row over empty input.
+   */
+  public static <TSource, TKey, TAccumulate, TResult> Enumerable<TResult> groupByMultiple(
+      Enumerable<TSource> enumerable, List<Function1<TSource, TKey>> keySelectors,
+      Function0<TAccumulate> accumulatorInitializer,
+      Function2<TAccumulate, TSource, TAccumulate> accumulatorAdder,
+      final Function2<TKey, TAccumulate, TResult> resultSelector,
+      @Nullable TKey emptyGroupKey) {
     return groupByMultiple_(
         new HashMap<>(),
         enumerable,
         keySelectors,
         accumulatorInitializer,
         accumulatorAdder,
-        resultSelector);
+        resultSelector,
+        emptyGroupKey);
   }
 
   /**
@@ -1188,9 +1219,12 @@ public abstract class EnumerableDefaults {
       List<Function1<TSource, TKey>> keySelectors,
       Function0<TAccumulate> accumulatorInitializer,
       Function2<TAccumulate, TSource, TAccumulate> accumulatorAdder,
-      final Function2<TKey, TAccumulate, TResult> resultSelector) {
+      final Function2<TKey, TAccumulate, TResult> resultSelector,
+      @Nullable TKey emptyGroupKey) {
+    boolean seenRow = false;
     try (Enumerator<TSource> os = enumerable.enumerator()) {
       while (os.moveNext()) {
+        seenRow = true;
         for (Function1<TSource, TKey> keySelector : keySelectors) {
           TSource o = os.current();
           TKey key = keySelector.apply(o);
@@ -1209,6 +1243,12 @@ public abstract class EnumerableDefaults {
           }
         }
       }
+    }
+    if (!seenRow && emptyGroupKey != null) {
+      // The empty grouping set (the grand total) produces a row even when the
+      // input is empty, just as a query with no GROUP BY does
+      // (see CALCITE-1059).
+      map.put(emptyGroupKey, accumulatorInitializer.apply());
     }
     return new LookupResultEnumerable<>(map, resultSelector);
   }
@@ -1543,18 +1583,15 @@ public abstract class EnumerableDefaults {
               }
               final TSource outer = outers.current();
               final Enumerable<TInner> innerEnumerable;
-              if (outer == null) {
+              // if the key is null-safe, still extract outerKey and probe even if outer is NULL.
+              final TKey outerKey = outerKeySelector.apply(outer);
+              if (outerKey == null) {
                 innerEnumerable = null;
               } else {
-                final TKey outerKey = outerKeySelector.apply(outer);
-                if (outerKey == null) {
-                  innerEnumerable = null;
-                } else {
-                  if (unmatchedKeys != null) {
-                    unmatchedKeys.remove(outerKey);
-                  }
-                  innerEnumerable = innerLookup.get(outerKey);
+                if (unmatchedKeys != null) {
+                  unmatchedKeys.remove(outerKey);
                 }
+                innerEnumerable = innerLookup.get(outerKey);
               }
               if (innerEnumerable == null
                   || !innerEnumerable.any()) {
@@ -1639,30 +1676,27 @@ public abstract class EnumerableDefaults {
               }
               final TSource outer = outers.current();
               Enumerable<TInner> innerEnumerable;
-              if (outer == null) {
+              // if the key is null-safe, still extract outerKey and probe even if outer is NULL.
+              final TKey outerKey = outerKeySelector.apply(outer);
+              if (outerKey == null) {
                 innerEnumerable = null;
               } else {
-                final TKey outerKey = outerKeySelector.apply(outer);
-                if (outerKey == null) {
-                  innerEnumerable = null;
-                } else {
-                  innerEnumerable = innerLookup.get(outerKey);
-                  // apply predicate to filter per-row
-                  if (innerEnumerable != null) {
-                    final List<TInner> matchedInners = new ArrayList<>();
-                    try (Enumerator<TInner> innerEnumerator =
-                        innerEnumerable.enumerator()) {
-                      while (innerEnumerator.moveNext()) {
-                        final TInner inner = innerEnumerator.current();
-                        if (predicate.apply(outer, inner)) {
-                          matchedInners.add(inner);
-                        }
+                innerEnumerable = innerLookup.get(outerKey);
+                // apply predicate to filter per-row
+                if (innerEnumerable != null) {
+                  final List<TInner> matchedInners = new ArrayList<>();
+                  try (Enumerator<TInner> innerEnumerator =
+                      innerEnumerable.enumerator()) {
+                    while (innerEnumerator.moveNext()) {
+                      final TInner inner = innerEnumerator.current();
+                      if (predicate.apply(outer, inner)) {
+                        matchedInners.add(inner);
                       }
                     }
-                    innerEnumerable = Linq4j.asEnumerable(matchedInners);
-                    if (innersUnmatched != null) {
-                      innersUnmatched.removeAll(matchedInners);
-                    }
+                  }
+                  innerEnumerable = Linq4j.asEnumerable(matchedInners);
+                  if (innersUnmatched != null) {
+                    innersUnmatched.removeAll(matchedInners);
                   }
                 }
               }
@@ -1689,6 +1723,375 @@ public abstract class EnumerableDefaults {
         };
       }
     };
+  }
+
+  /**
+   * Left mark join implementation based on hash. It will keep all rows from the left side and
+   * creates a new attribute to mark the rows from left input as having join partners from right
+   * side or not. Refer to <a href="https://dl.gi.de/items/c5f7c49f-1572-490e-976a-cc4292519bdd">
+   *   The Complete Story of Joins (in HyPer)</a>. The implementation in the paper targets the case
+   * of a single join key that is not null‑safe, which is a representative scenario. We need to
+   * consider the more general case of multiple join keys, including both the null‑safe and not
+   * null‑safe. The key point is whether the marker should be FALSE or NULL when the hash table
+   * match fails.
+   *
+   * <p> Left mark join is produced by rewriting IN/SOME/EXISTS subqueries, so left mark join will
+   * never contain both not null-safe join keys and non-equi predicates.
+   *
+   * @param outer                       Left input
+   * @param inner                       Right input
+   * @param outerKeyNullAwareSelector   Function that extracts keys from the row of left input
+   *                                    (return NULL when a not null-safe key has a NULL value)
+   * @param innerKeyNullAwareSelector   Function that extracts keys from the row of right input
+   *                                    (return NULL when a not null-safe key has a NULL value)
+   * @param outerNullSafeKeySelector    Function that extracts the null-safe keys from the row of
+   *                                    left input
+   * @param innerNullSafeKeySelector    Function that extracts the null-safe keys from the row of
+   *                                    right input
+   * @param atMostOneNotNullSafeKey     True when there is at most one not null-safe key in join
+   *                                    keys
+   * @param resultSelector              Function that concats the row of left input and marker
+   * @param comparer                    Function that compares the keys
+   * @param nullSafeComparer            Function that compares the null-safe keys
+   * @param nonEquiPredicate            Non-equi predicate that can return NULL
+   * @param equiPredicate               Equi predicate that can return NULL
+   */
+  public static <TSource, TInner, TKey, TNsKey, TResult> Enumerable<TResult> leftMarkHashJoin(
+      final Enumerable<TSource> outer, final Enumerable<TInner> inner,
+      final Function1<TSource, TKey> outerKeyNullAwareSelector,
+      final Function1<TInner, TKey> innerKeyNullAwareSelector,
+      final @Nullable Function1<TSource, TNsKey> outerNullSafeKeySelector,
+      final @Nullable Function1<TInner, TNsKey> innerNullSafeKeySelector,
+      final boolean atMostOneNotNullSafeKey,
+      final Function2<TSource, @Nullable Boolean, TResult> resultSelector,
+      final @Nullable EqualityComparer<TKey> comparer,
+      final @Nullable EqualityComparer<TNsKey> nullSafeComparer,
+      final @Nullable NullablePredicate2<TSource, TInner> nonEquiPredicate,
+      final NullablePredicate2<TSource, TInner> equiPredicate) {
+    if (atMostOneNotNullSafeKey) {
+      return leftMarkHashJoinOptimized(outer, inner, outerKeyNullAwareSelector,
+          innerKeyNullAwareSelector, outerNullSafeKeySelector, innerNullSafeKeySelector,
+          resultSelector, comparer, nullSafeComparer, nonEquiPredicate);
+    }
+    return leftMarkHashJoinGeneral(outer, inner, outerKeyNullAwareSelector,
+        innerKeyNullAwareSelector, outerNullSafeKeySelector, innerNullSafeKeySelector,
+        resultSelector, comparer, nullSafeComparer, nonEquiPredicate, equiPredicate);
+  }
+
+  /**
+   * For other join types (especially INNER join), the hash table can be used to quickly determine
+   * which right-side rows should be joined with a given left-side row. But left mark join is more
+   * complicated. The <code>marker</code> indicates whether a left row has a join partner on the
+   * right side, it is a three-valued boolean, meaning we need to know the actual result (TRUE,
+   * FALSE, or NULL) of the join condition.
+   *
+   * <p> Join key comes in two categories:
+   * <ul>
+   *   <li>null-safe key (IS NOT DISTINCT FROM): it only produces TRUE/FALSE.</li>
+   *   <li>not null-safe key (EQUALS): it produces a three-valued boolean.</li>
+   * </ul>
+   *
+   * <p> If all join keys are null-safe, we can get the comparison result (TRUE or FALSE) based on
+   * hash table matching.
+   *
+   * <p> If there are multiple not null-safe join keys, the hash table matching alone is
+   * insufficient to determine the comparison result. However, if there is only one not null-safe
+   * key, we can record whether this key has any NULL values when constructing the hash table.
+   * During probing, if no match is found in the hash table and there are any NULL values on this
+   * unique not null-safe key, we can know that the <code>marker</code> is NULL.
+   */
+  static <TSource, TInner, TKey, TNsKey, TResult> Enumerable<TResult> leftMarkHashJoinOptimized(
+      final Enumerable<TSource> outer, final Enumerable<TInner> inner,
+      final Function1<TSource, TKey> outerKeyNullAwareSelector,
+      final Function1<TInner, TKey> innerKeyNullAwareSelector,
+      final @Nullable Function1<TSource, TNsKey> outerNullSafeKeySelector,
+      final @Nullable Function1<TInner, TNsKey> innerNullSafeKeySelector,
+      final Function2<TSource, @Nullable Boolean, TResult> resultSelector,
+      final @Nullable EqualityComparer<TKey> comparer,
+      final @Nullable EqualityComparer<TNsKey> nullSafeComparer,
+      final @Nullable NullablePredicate2<TSource, TInner> nonEquiPredicate) {
+    return new AbstractEnumerable<TResult>() {
+      @Override public Enumerator<TResult> enumerator() {
+        HashTableWithNullSafeKeySet<TKey, TNsKey, TInner> ht =
+            HashTableWithNullSafeKeySet.build(inner, innerKeyNullAwareSelector,
+                innerNullSafeKeySelector, comparer, nullSafeComparer);
+
+        return new Enumerator<TResult>() {
+          Enumerator<TSource> outers = outer.enumerator();
+          @Nullable Boolean marker = false;
+
+          @Override public TResult current() {
+            return resultSelector.apply(outers.current(), marker);
+          }
+
+          @Override public boolean moveNext() {
+            if (!outers.moveNext()) {
+              return false;
+            }
+            marker = false;
+            final TSource outerRow = outers.current();
+            final TKey outerKey = outerKeyNullAwareSelector.apply(outerRow);
+            if (outerNullSafeKeySelector != null
+                && !ht.containsNullSafeKey(outerNullSafeKeySelector.apply(outerRow))) {
+              // there are null-safe keys, but there is no match in the hash table of null-safe
+              // keys. The marker is FALSE
+              return true;
+            }
+
+            if (outerKey == null) {
+              // outerRow has a NULL value on the unique not null-safe key. The marker is NULL
+              marker = null;
+            } else {
+              Enumerable<TInner> innerEnumerable = ht.lookup.get(outerKey);
+              if (innerEnumerable == null) {
+                // no match found in the hash table. If there are any NULL values on the unique
+                // not null-safe key, the marker is NULL.
+                marker = ht.lookup.containsKey(null) ? null : false;
+              } else {
+                if (nonEquiPredicate == null) {
+                  marker = true;
+                } else {
+                  try (Enumerator<TInner> innerEnumerator = innerEnumerable.enumerator()) {
+                    while (innerEnumerator.moveNext()) {
+                      final TInner innerRow = innerEnumerator.current();
+                      Boolean predicateMatched = nonEquiPredicate.apply(outerRow, innerRow);
+                      if (predicateMatched == null) {
+                        marker = null;
+                      } else if (predicateMatched) {
+                        marker = true;
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            // if the inner is empty set, convert the NULL marker to FALSE
+            if (marker == null && ht.buildSideIsEmpty) {
+              marker = false;
+            }
+            return true;
+          }
+
+          @Override public void reset() {
+            outers.reset();
+          }
+
+          @Override public void close() {
+            outers.close();
+          }
+        };
+      }
+    };
+  }
+
+  /**
+   * As described in {@link #leftMarkHashJoinOptimized}, if there are multiple not null-safe join
+   * keys, the hash table matching alone is insufficient to determine the comparison result. For
+   * left rows that fail to match in the hash table, we need to apply the equi-predicate against
+   * the right-side rows one by one to determine whether the <code>marker</code> should be
+   * FALSE or NULL.
+   */
+  static <TSource, TInner, TKey, TNsKey, TResult> Enumerable<TResult> leftMarkHashJoinGeneral(
+      final Enumerable<TSource> outer, final Enumerable<TInner> inner,
+      final Function1<TSource, TKey> outerKeyNullAwareSelector,
+      final Function1<TInner, TKey> innerKeyNullAwareSelector,
+      final @Nullable Function1<TSource, TNsKey> outerNullSafeKeySelector,
+      final @Nullable Function1<TInner, TNsKey> innerNullSafeKeySelector,
+      final Function2<TSource, @Nullable Boolean, TResult> resultSelector,
+      final @Nullable EqualityComparer<TKey> comparer,
+      final @Nullable EqualityComparer<TNsKey> nullSafeComparer,
+      final @Nullable NullablePredicate2<TSource, TInner> nonEquiPredicate,
+      final NullablePredicate2<TSource, TInner> equiPredicate) {
+    return new AbstractEnumerable<TResult>() {
+      @Override public Enumerator<TResult> enumerator() {
+        HashTableWithNullSafeKeySet<TKey, TNsKey, TInner> ht =
+            HashTableWithNullSafeKeySet.build(inner, innerKeyNullAwareSelector,
+                innerNullSafeKeySelector, comparer, nullSafeComparer);
+
+        return new Enumerator<TResult>() {
+          Enumerator<TSource> outers = outer.enumerator();
+          @Nullable Boolean marker = false;
+
+          @Override public TResult current() {
+            return resultSelector.apply(outers.current(), marker);
+          }
+
+          @Override public boolean moveNext() {
+            if (!outers.moveNext()) {
+              return false;
+            }
+            marker = false;
+            final TSource outerRow = outers.current();
+            final TKey outerKey = outerKeyNullAwareSelector.apply(outerRow);
+            if (outerNullSafeKeySelector != null
+                && !ht.containsNullSafeKey(outerNullSafeKeySelector.apply(outerRow))) {
+              // there are null-safe keys, but there is no match in the hash table of null-safe
+              // keys. The marker is FALSE
+              return true;
+            }
+
+            if (outerKey == null) {
+              // outerRow has NULL values on at least one not null-safe key. Need to apply the
+              // equi-predicate against all right-side rows to determine the marker is FALSE or NULL
+              flag:
+              for (Enumerable<TInner> eachInnerEnumerable : ht.lookup.values()) {
+                try (Enumerator<TInner> eachInnerEnumerator = eachInnerEnumerable.enumerator()) {
+                  while (eachInnerEnumerator.moveNext()) {
+                    TInner eachInnerRow = eachInnerEnumerator.current();
+                    Boolean equiPredicateMatched = equiPredicate.apply(outerRow, eachInnerRow);
+                    if (equiPredicateMatched == null) {
+                      marker = null;
+                      break flag;
+                    }
+                  }
+                }
+              }
+            } else {
+              Enumerable<TInner> innerEnumerable = ht.lookup.get(outerKey);
+              if (innerEnumerable == null) {
+                // no match found in the hash table. If there are any NULL values on not
+                // null-safe keys, need to apply the equi-predicate against those rows to determine
+                // the marker is FALSE or NULL.
+                Enumerable<TInner> nullValueOnNotNullSafeKey = ht.lookup.get(null);
+                if (nullValueOnNotNullSafeKey != null) {
+                  try (Enumerator<TInner> enumerator = nullValueOnNotNullSafeKey.enumerator()) {
+                    while (enumerator.moveNext()) {
+                      TInner nullValueOnNotNullSafeKeyRow = enumerator.current();
+                      Boolean equiPredicateMatched =
+                          equiPredicate.apply(outerRow, nullValueOnNotNullSafeKeyRow);
+                      if (equiPredicateMatched == null) {
+                        marker = null;
+                        break;
+                      }
+                    }
+                  }
+                }
+              } else {
+                if (nonEquiPredicate == null) {
+                  marker = true;
+                } else {
+                  try (Enumerator<TInner> innerEnumerator = innerEnumerable.enumerator()) {
+                    while (innerEnumerator.moveNext()) {
+                      final TInner innerRow = innerEnumerator.current();
+                      Boolean predicateMatched = nonEquiPredicate.apply(outerRow, innerRow);
+                      if (predicateMatched == null) {
+                        marker = null;
+                      } else if (predicateMatched) {
+                        marker = true;
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            if (marker == null && ht.buildSideIsEmpty) {
+              marker = false;
+            }
+            return true;
+          }
+
+          @Override public void reset() {
+            outers.reset();
+          }
+
+          @Override public void close() {
+            outers.close();
+          }
+        };
+      }
+    };
+  }
+
+  /**
+   * The implementation of left mark join based on nested loop.
+   * This is a unified implementation supporting both correlated and non-correlated cases.
+   *
+   * @param outer           Left input
+   * @param innerProvider   Function that provides inner enumerable for each outer row
+   *                        (for correlated join, pass outerRow -> correlatedInner)
+   *                        (for non-correlated join, pass outerRow -> staticInner)
+   * @param predicate       Non-equi predicate that can return NULL
+   * @param resultSelector  Function that concats the row of left input and marker
+   */
+  private static <TSource, TInner, TResult> Enumerable<TResult> leftMarkJoinInternal(
+      final Enumerable<TSource> outer,
+      final Function1<TSource, Enumerable<TInner>> innerProvider,
+      final NullablePredicate2<TSource, TInner> predicate,
+      final Function2<TSource, @Nullable Boolean, TResult> resultSelector) {
+    return new AbstractEnumerable<TResult>() {
+      @Override public Enumerator<TResult> enumerator() {
+        return new Enumerator<TResult>() {
+          Enumerator<TSource> outers = outer.enumerator();
+          @Nullable Boolean marker = false;
+
+          @Override public TResult current() {
+            return resultSelector.apply(outers.current(), marker);
+          }
+
+          @Override public boolean moveNext() {
+            if (!outers.moveNext()) {
+              return false;
+            }
+            marker = false;
+            final TSource outerRow = outers.current();
+            Enumerable<TInner> innerEnumerable = innerProvider.apply(outerRow);
+            if (innerEnumerable != null) {
+              try (Enumerator<TInner> inners = innerEnumerable.enumerator()) {
+                while (inners.moveNext()) {
+                  final TInner innerRow = inners.current();
+                  Boolean predicateMatched = predicate.apply(outerRow, innerRow);
+                  if (predicateMatched == null) {
+                    marker = null;
+                  } else if (predicateMatched) {
+                    marker = true;
+                    break;
+                  }
+                }
+              }
+            }
+            return true;
+          }
+
+          @Override public void reset() {
+            outers.reset();
+          }
+
+          @Override public void close() {
+            outers.close();
+          }
+        };
+      }
+    };
+  }
+
+  /**
+   * For each row of the {@code outer} enumerable returns correlated rows
+   * from the inner enumerable generated for each outer row, filtered by a predicate
+   * (correlated LEFT_MARK join).
+   */
+  public static <TSource, TInner, TResult> Enumerable<TResult> correlateLeftMarkJoin(
+      final Enumerable<TSource> outer,
+      final Function1<TSource, Enumerable<TInner>> inner,
+      final NullablePredicate2<TSource, TInner> predicate,
+      final Function2<TSource, @Nullable Boolean, TResult> resultSelector) {
+    return leftMarkJoinInternal(outer, inner, predicate, resultSelector);
+  }
+
+  /**
+   * The implementation of left mark join based on nested loop.
+   *
+   * @param outer           Left input
+   * @param inner           Right input
+   * @param predicate       Non-equi predicate that can return NULL
+   * @param resultSelector  Function that concats the row of left input and marker
+   */
+  public static <TSource, TInner, TResult> Enumerable<TResult> leftMarkNestedLoopJoin(
+      final Enumerable<TSource> outer, final Enumerable<TInner> inner,
+      final NullablePredicate2<TSource, TInner> predicate,
+      final Function2<TSource, @Nullable Boolean, TResult> resultSelector) {
+    return leftMarkJoinInternal(outer, ignored -> inner, predicate, resultSelector);
   }
 
   /**
@@ -2163,6 +2566,50 @@ public abstract class EnumerableDefaults {
         };
 
         return EnumerableDefaults.where(outer.enumerator(), predicate);
+      }
+    };
+  }
+
+  /**
+   * Joins pairs that satisfy two inequality predicates.
+   *
+   * <p>Each operator compares a left key with a right key using the
+   * corresponding comparator. Null keys do not match. Both inputs are
+   * materialized and sorted before the first result is returned.
+   *
+   * @throws IllegalArgumentException if either operator is not
+   *     {@link ExpressionType#LessThan}, {@link ExpressionType#LessThanOrEqual},
+   *     {@link ExpressionType#GreaterThan}, or
+   *     {@link ExpressionType#GreaterThanOrEqual}
+   */
+  public static <TLeft, TRight, TKey1, TKey2, TResult>
+      Enumerable<TResult> ieJoin(Enumerable<TLeft> left,
+      Enumerable<TRight> right,
+      Function1<? super TLeft, TKey1> leftKeySelector1,
+      Function1<? super TRight, TKey1> rightKeySelector1,
+      Function1<? super TLeft, TKey2> leftKeySelector2,
+      Function1<? super TRight, TKey2> rightKeySelector2,
+      Comparator<? super TKey1> comparator1,
+      Comparator<? super TKey2> comparator2,
+      ExpressionType operator1, ExpressionType operator2,
+      Function2<? super TLeft, ? super TRight, TResult> resultSelector) {
+    for (ExpressionType operator : Arrays.asList(operator1, operator2)) {
+      switch (operator) {
+      case LessThan:
+      case LessThanOrEqual:
+      case GreaterThan:
+      case GreaterThanOrEqual:
+        break;
+      default:
+        throw new IllegalArgumentException("Unsupported IEJoin operator: " + operator);
+      }
+    }
+    return new AbstractEnumerable<TResult>() {
+      @Override public Enumerator<TResult> enumerator() {
+        return new IEJoinEnumerator<>(left, right,
+            leftKeySelector1, rightKeySelector1,
+            leftKeySelector2, rightKeySelector2,
+            comparator1, comparator2, operator1, operator2, resultSelector);
       }
     };
   }
@@ -2879,26 +3326,43 @@ public abstract class EnumerableDefaults {
       Function1<TSource, TKey> keySelector,
       Comparator<TKey> comparator,
       int offset, int fetch) {
+    return orderBy(source, keySelector, comparator,
+        BigDecimal.valueOf(offset), BigDecimal.valueOf(fetch));
+  }
+
+  /**
+   * A sort implementation optimized for a sort with a fetch size (LIMIT).
+   *
+   * @param offset how many rows are skipped from the sorted output.
+   *               Must be greater than or equal to 0.
+   * @param fetch how many rows are retrieved. Must be greater than or equal to 0.
+   */
+  public static <TSource, TKey> Enumerable<TSource> orderBy(
+      Enumerable<TSource> source,
+      Function1<TSource, TKey> keySelector,
+      Comparator<TKey> comparator,
+      BigDecimal offset, BigDecimal fetch) {
     // As discussed in CALCITE-3920 and CALCITE-4157, this method avoids to sort the complete input,
     // if only the first N rows are actually needed. A TreeMap implementation has been chosen,
     // so that it behaves similar to the orderBy method without fetch/offset.
     // The TreeMap has a better performance if there are few distinct sort keys.
     return new AbstractEnumerable<TSource>() {
       @Override public Enumerator<TSource> enumerator() {
-        if (fetch == 0) {
+        if (fetch.compareTo(BigDecimal.ZERO) <= 0) {
           return Linq4j.emptyEnumerator();
         }
 
         TreeMap<TKey, List<TSource>> map = new TreeMap<>(comparator);
-        long size = 0;
-        long needed = fetch + (long) offset;
+        BigDecimal size = BigDecimal.ZERO;
+        BigDecimal actualOffset = offset.max(BigDecimal.ZERO);
+        BigDecimal needed = rowsRequired(actualOffset).add(rowsRequired(fetch));
 
         // read the input into a tree map
         try (Enumerator<TSource> os = source.enumerator()) {
           while (os.moveNext()) {
             TSource o = os.current();
             TKey key = keySelector.apply(o);
-            if (needed >= 0 && size >= needed) {
+            if (needed.signum() >= 0 && size.compareTo(needed) >= 0) {
               // the current row will never appear in the output, so just skip it
               @KeyFor("map") TKey lastKey = map.lastKey();
               if (comparator.compare(key, lastKey) >= 0) {
@@ -2912,7 +3376,7 @@ public abstract class EnumerableDefaults {
               } else {
                 l.remove(l.size() - 1);
               }
-              size--;
+              size = size.subtract(BigDecimal.ONE);
             }
             // add the current element to the map
             map.compute(key, (k, l) -> {
@@ -2927,24 +3391,30 @@ public abstract class EnumerableDefaults {
               l.add(o);
               return l;
             });
-            size++;
+            size = size.add(BigDecimal.ONE);
           }
         }
 
         // skip the first 'offset' rows by deleting them from the map
-        if (offset > 0) {
-          // search the key up to (but excluding) which we have to remove entries from the map
-          int skipped = 0;
+        if (actualOffset.compareTo(BigDecimal.ZERO) > 0) {
+          // search the key up to which we have to remove entries from the map
+          BigDecimal skipped = BigDecimal.ZERO;
+          BigDecimal rowsToSkip = rowsRequired(actualOffset);
           TKey until = (TKey) DUMMY;
+          boolean removeUntilInclusive = false;
           for (Map.Entry<TKey, List<TSource>> e : map.entrySet()) {
-            skipped += e.getValue().size();
+            skipped = skipped.add(BigDecimal.valueOf(e.getValue().size()));
 
-            if (skipped > offset) {
+            if (skipped.compareTo(rowsToSkip) >= 0) {
               // we might need to remove entries from the list
               List<TSource> l = e.getValue();
-              int toKeep = skipped - offset;
-              if (toKeep < l.size()) {
-                l.subList(0, l.size() - toKeep).clear();
+              BigDecimal toKeep = skipped.subtract(rowsToSkip);
+              if (toKeep.compareTo(BigDecimal.valueOf(l.size())) < 0) {
+                if (toKeep.signum() == 0) {
+                  removeUntilInclusive = true;
+                } else {
+                  l.subList(0, l.size() - toKeep.intValueExact()).clear();
+                }
               }
 
               until = e.getKey();
@@ -2955,7 +3425,7 @@ public abstract class EnumerableDefaults {
             // the offset is bigger than the number of rows in the map
             return Linq4j.emptyEnumerator();
           }
-          map.headMap(until, false).clear();
+          map.headMap(until, removeUntilInclusive).clear();
         }
 
         return new LookupImpl<>(map).valuesEnumerable().enumerator();
@@ -3425,6 +3895,10 @@ public abstract class EnumerableDefaults {
     return toRet;
   }
 
+  private static BigDecimal rowsRequired(BigDecimal count) {
+    return count.max(BigDecimal.ZERO).setScale(0, RoundingMode.CEILING);
+  }
+
   /**
    * Bypasses a specified number of elements in a
    * sequence and then returns the remaining elements.
@@ -3434,6 +3908,18 @@ public abstract class EnumerableDefaults {
     return skipWhile(source, (v1, v2) -> {
       // Count is 1-based
       return v2 < count;
+    });
+  }
+
+  /**
+   * Bypasses a specified number of elements in a
+   * sequence and then returns the remaining elements.
+   */
+  public static <TSource> Enumerable<TSource> skip(Enumerable<TSource> source,
+      final BigDecimal count) {
+    return skipWhileBigDecimal(source, (v1, v2) -> {
+      // Count is 1-based
+      return v2.compareTo(count) < 0;
     });
   }
 
@@ -3593,6 +4079,19 @@ public abstract class EnumerableDefaults {
   }
 
   /**
+   * Returns a specified number of contiguous elements
+   * from the start of a sequence.
+   */
+  public static <TSource> Enumerable<TSource> take(Enumerable<TSource> source,
+      final BigDecimal count) {
+    return takeWhileBigDecimal(
+        source, (v1, v2) -> {
+          // Count is 1-based
+          return v2.compareTo(count) < 0;
+        });
+  }
+
+  /**
    * Returns elements from a sequence as long as a
    * specified condition is true.
    */
@@ -3628,6 +4127,36 @@ public abstract class EnumerableDefaults {
     return new AbstractEnumerable<TSource>() {
       @Override public Enumerator<TSource> enumerator() {
         return new TakeWhileLongEnumerator<>(source.enumerator(), predicate);
+      }
+    };
+  }
+
+  /**
+   * Returns elements from a sequence as long as a
+   * specified condition is true. The element's index is used in the
+   * logic of the predicate function.
+   */
+  public static <TSource> Enumerable<TSource> takeWhileBigDecimal(
+      final Enumerable<TSource> source,
+      final Predicate2<TSource, BigDecimal> predicate) {
+    return new AbstractEnumerable<TSource>() {
+      @Override public Enumerator<TSource> enumerator() {
+        return new TakeWhileBigDecimalEnumerator<>(source.enumerator(), predicate);
+      }
+    };
+  }
+
+  /**
+   * Bypasses elements in a sequence as long as a
+   * specified condition is true. The element's index is used in the
+   * logic of the predicate function.
+   */
+  public static <TSource> Enumerable<TSource> skipWhileBigDecimal(
+      final Enumerable<TSource> source,
+      final Predicate2<TSource, BigDecimal> predicate) {
+    return new AbstractEnumerable<TSource>() {
+      @Override public Enumerator<TSource> enumerator() {
+        return new SkipWhileBigDecimalEnumerator<>(source.enumerator(), predicate);
       }
     };
   }
@@ -3807,21 +4336,8 @@ public abstract class EnumerableDefaults {
       while (os.moveNext()) {
         TSource o = os.current();
         final TKey key = keySelector.apply(o);
-        @SuppressWarnings("nullness")
-        List<TElement> list = map.get(key);
-        if (list == null) {
-          // for first entry, use a singleton list to save space
-          list = Collections.singletonList(elementSelector.apply(o));
-        } else {
-          if (list.size() == 1) {
-            // when we go from 1 to 2 elements, switch to array list
-            TElement element = list.get(0);
-            list = new ArrayList<>();
-            list.add(element);
-          }
-          list.add(elementSelector.apply(o));
-        }
-        map.put(key, list);
+        final TElement data = elementSelector.apply(o);
+        appendDataForKey(map, key, data);
       }
     }
     return new LookupImpl<>(map);
@@ -3844,6 +4360,24 @@ public abstract class EnumerableDefaults {
         source,
         keySelector,
         elementSelector);
+  }
+
+  private static <TKey, TElement> void appendDataForKey(
+      Map<TKey, List<TElement>> map, TKey key, TElement row) {
+    List<TElement> list = map.get(key);
+    if (list == null) {
+      // for first entry, use a singleton list to save space
+      list = Collections.singletonList(row);
+    } else {
+      if (list.size() == 1) {
+        // when we go from 1 to 2 elements, switch to array list
+        TElement element = list.get(0);
+        list = new ArrayList<>();
+        list.add(element);
+      }
+      list.add(row);
+    }
+    map.put(key, list);
   }
 
   /**
@@ -4030,6 +4564,97 @@ public abstract class EnumerableDefaults {
     return sink;
   }
 
+  /**
+   * Default implementation of
+   * {@link ExtendedEnumerable#update(List, Function1, Function1, Function1)}.
+   *
+   * <p>Builds a map from source-row keys to replacement rows in a single pass
+   * over the source, then performs a single pass over the sink, replacing
+   * matched rows in place.
+   */
+  public static <T, TKey> long update(
+      Enumerable<T> source,
+      List<T> sink,
+      Function1<T, TKey> sinkKeySelector,
+      Function1<T, TKey> sourceKeySelector,
+      Function1<T, T> sourceTransform) {
+    final Map<TKey, T> updateMap = new HashMap<>();
+    try (Enumerator<T> e = source.enumerator()) {
+      while (e.moveNext()) {
+        final T row = e.current();
+        updateMap.put(sourceKeySelector.apply(row), sourceTransform.apply(row));
+      }
+    }
+    long updateCount = 0;
+    final ListIterator<T> it = sink.listIterator();
+    while (it.hasNext()) {
+      final T current = it.next();
+      final T newRow = updateMap.get(sinkKeySelector.apply(current));
+      if (newRow != null) {
+        it.set(newRow);
+        updateCount++;
+      }
+    }
+    return updateCount;
+  }
+
+  /**
+   * Hash table with null-safe key set.
+   *
+   * @param <TKey>    key type
+   * @param <TNsKey>  null-safe key type
+   * @param <TData>   build side row type
+   */
+  static class HashTableWithNullSafeKeySet<TKey, TNsKey, TData> {
+    final Lookup<TKey, TData> lookup;
+    final Set<Wrapped<TNsKey>> nullSafeKeySet;
+    final EqualityComparer<TNsKey> nullSafeComparer;
+    // whether the build side is empty set
+    final boolean buildSideIsEmpty;
+
+    private HashTableWithNullSafeKeySet(
+        Lookup<TKey, TData> lookup,
+        Set<Wrapped<TNsKey>> nullSafeKeySet,
+        EqualityComparer<TNsKey> nullSafeComparer) {
+      this.lookup = lookup;
+      this.nullSafeKeySet = nullSafeKeySet;
+      this.nullSafeComparer = nullSafeComparer;
+      this.buildSideIsEmpty = lookup.isEmpty();
+    }
+
+    static <TKey, TNsKey, TData> HashTableWithNullSafeKeySet<TKey, TNsKey, TData> build(
+        Enumerable<TData> data,
+        Function1<TData, TKey> keyNullAwareSelector,
+        @Nullable Function1<TData, TNsKey> nullSafeKeySelector,
+        @Nullable EqualityComparer<TKey> comparer,
+        @Nullable EqualityComparer<TNsKey> nullSafeComparer) {
+      Map<TKey, List<TData>> map =
+          comparer == null
+              ? new HashMap<>()
+              : new WrapMap<>(() -> new HashMap<Wrapped<TKey>, List<TData>>(), comparer);
+      Set<Wrapped<TNsKey>> nullSafeKeySet = new HashSet<>();
+      nullSafeComparer = nullSafeComparer == null ? Functions.identityComparer() : nullSafeComparer;
+
+      try (Enumerator<TData> enumerator = data.enumerator()) {
+        while (enumerator.moveNext()) {
+          TData row = enumerator.current();
+          TKey nullAwareKey = keyNullAwareSelector.apply(row);
+          appendDataForKey(map, nullAwareKey, row);
+          if (nullSafeKeySelector != null) {
+            TNsKey nullSafeKey = nullSafeKeySelector.apply(row);
+            nullSafeKeySet.add(Wrapped.upAs(nullSafeComparer, nullSafeKey));
+          }
+        }
+      }
+      Lookup<TKey, TData> nullAwareLookup = new LookupImpl<>(map);
+      return new HashTableWithNullSafeKeySet<>(nullAwareLookup, nullSafeKeySet, nullSafeComparer);
+    }
+
+    public boolean containsNullSafeKey(TNsKey key) {
+      return nullSafeKeySet.contains(Wrapped.upAs(nullSafeComparer, key));
+    }
+  }
+
   /** Enumerable that implements take-while.
    *
    * @param <TSource> element type */
@@ -4116,6 +4741,50 @@ public abstract class EnumerableDefaults {
     }
   }
 
+  /** Enumerable that implements take-while.
+   *
+   * @param <TSource> element type */
+  static class TakeWhileBigDecimalEnumerator<TSource> implements Enumerator<TSource> {
+    private final Enumerator<TSource> enumerator;
+    private final Predicate2<TSource, BigDecimal> predicate;
+
+    boolean done = false;
+    BigDecimal n = BigDecimal.valueOf(-1);
+
+    TakeWhileBigDecimalEnumerator(Enumerator<TSource> enumerator,
+        Predicate2<TSource, BigDecimal> predicate) {
+      this.enumerator = enumerator;
+      this.predicate = predicate;
+    }
+
+    @Override public TSource current() {
+      return enumerator.current();
+    }
+
+    @Override public boolean moveNext() {
+      if (!done) {
+        if (enumerator.moveNext()) {
+          n = n.add(BigDecimal.ONE);
+          if (predicate.apply(enumerator.current(), n)) {
+            return true;
+          }
+        }
+        done = true;
+      }
+      return false;
+    }
+
+    @Override public void reset() {
+      enumerator.reset();
+      done = false;
+      n = BigDecimal.valueOf(-1);
+    }
+
+    @Override public void close() {
+      enumerator.close();
+    }
+  }
+
   /** Enumerator that implements skip-while.
    *
    * @param <TSource> element type */
@@ -4155,6 +4824,53 @@ public abstract class EnumerableDefaults {
       enumerator.reset();
       started = false;
       n = -1;
+    }
+
+    @Override public void close() {
+      enumerator.close();
+    }
+  }
+
+  /** Enumerator that implements skip-while.
+   *
+   * @param <TSource> element type */
+  static class SkipWhileBigDecimalEnumerator<TSource> implements Enumerator<TSource> {
+    private final Enumerator<TSource> enumerator;
+    private final Predicate2<TSource, BigDecimal> predicate;
+
+    boolean started = false;
+    BigDecimal n = BigDecimal.valueOf(-1);
+
+    SkipWhileBigDecimalEnumerator(Enumerator<TSource> enumerator,
+        Predicate2<TSource, BigDecimal> predicate) {
+      this.enumerator = enumerator;
+      this.predicate = predicate;
+    }
+
+    @Override public TSource current() {
+      return enumerator.current();
+    }
+
+    @Override public boolean moveNext() {
+      for (;;) {
+        if (!enumerator.moveNext()) {
+          return false;
+        }
+        if (started) {
+          return true;
+        }
+        n = n.add(BigDecimal.ONE);
+        if (!predicate.apply(enumerator.current(), n)) {
+          started = true;
+          return true;
+        }
+      }
+    }
+
+    @Override public void reset() {
+      enumerator.reset();
+      started = false;
+      n = BigDecimal.valueOf(-1);
     }
 
     @Override public void close() {
@@ -4244,32 +4960,35 @@ public abstract class EnumerableDefaults {
     }
 
     @Override public Set<Entry<@KeyFor("this") K, V>> entrySet() {
-      return new AbstractSet<Entry<@KeyFor("this") K, V>>() {
-        @SuppressWarnings("override.return.invalid")
-        @Override public Iterator<Entry<K, V>> iterator() {
-          final Iterator<Entry<Wrapped<K>, V>> iterator =
-              map.entrySet().iterator();
+      return new WrapMapEntrySet();
+    }
 
-          return new Iterator<Entry<K, V>>() {
-            @Override public boolean hasNext() {
-              return iterator.hasNext();
-            }
+    /** EntrySet for {@link WrapMap}. */
+    private class WrapMapEntrySet extends AbstractSet<Entry<@KeyFor("this") K, V>> {
+      @SuppressWarnings("override.return.invalid")
+      @Override public Iterator<Entry<K, V>> iterator() {
+        final Iterator<Entry<Wrapped<K>, V>> iterator =
+            map.entrySet().iterator();
 
-            @Override public Entry<K, V> next() {
-              Entry<Wrapped<K>, V> next = iterator.next();
-              return new SimpleEntry<>(next.getKey().element, next.getValue());
-            }
+        return new Iterator<Entry<K, V>>() {
+          @Override public boolean hasNext() {
+            return iterator.hasNext();
+          }
 
-            @Override public void remove() {
-              iterator.remove();
-            }
-          };
-        }
+          @Override public Entry<K, V> next() {
+            Entry<Wrapped<K>, V> next = iterator.next();
+            return new SimpleEntry<>(next.getKey().element, next.getValue());
+          }
 
-        @Override public int size() {
-          return map.size();
-        }
-      };
+          @Override public void remove() {
+            iterator.remove();
+          }
+        };
+      }
+
+      @Override public int size() {
+        return map.size();
+      }
     }
 
     @SuppressWarnings("contracts.conditional.postcondition.not.satisfied")

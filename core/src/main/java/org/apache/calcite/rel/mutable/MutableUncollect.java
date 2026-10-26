@@ -25,15 +25,20 @@ import java.util.Objects;
 /** Mutable equivalent of {@link org.apache.calcite.rel.core.Uncollect}. */
 public class MutableUncollect extends MutableSingleRel {
   public final boolean withOrdinality;
+  public final boolean expandStructFields;
+  public final boolean isOuter;
 
   private MutableUncollect(RelDataType rowType,
-      MutableRel input, boolean withOrdinality) {
+      MutableRel input, boolean withOrdinality, boolean expandStructFields,
+      boolean isOuter) {
     super(MutableRelType.UNCOLLECT, rowType, input);
     this.withOrdinality = withOrdinality;
+    this.expandStructFields = expandStructFields;
+    this.isOuter = isOuter;
   }
 
   /**
-   * Creates a MutableUncollect.
+   * Creates a MutableUncollect that expands struct elements.
    *
    * @param rowType         Row type
    * @param input           Input relational expression
@@ -42,26 +47,64 @@ public class MutableUncollect extends MutableSingleRel {
    */
   public static MutableUncollect of(RelDataType rowType,
       MutableRel input, boolean withOrdinality) {
-    return new MutableUncollect(rowType, input, withOrdinality);
+    return of(rowType, input, withOrdinality, true, false);
+  }
+
+  /**
+   * Creates a MutableUncollect.
+   *
+   * @param rowType            Row type
+   * @param input              Input relational expression
+   * @param withOrdinality     Whether the output contains an extra
+   *                           {@code ORDINALITY} column
+   * @param expandStructFields If true, a collection whose element type
+   *                           is a struct produces one output column per
+   *                           struct field; if false, a single column
+   *                           typed as the whole element
+   */
+  /**
+   * Creates a MutableUncollect.
+   *
+   * @param rowType            Row type
+   * @param input              Input relational expression
+   * @param withOrdinality     Whether the output contains an extra
+   *                           {@code ORDINALITY} column
+   * @param expandStructFields If true, a collection whose element type
+   *                           is a struct produces one output column per
+   *                           struct field; if false, a single column
+   *                           typed as the whole element
+   * @param isOuter            If true, an empty or NULL collection yields one
+   *                           row of NULLs; if false, it yields no rows
+   */
+  public static MutableUncollect of(RelDataType rowType,
+      MutableRel input, boolean withOrdinality, boolean expandStructFields,
+      boolean isOuter) {
+    return new MutableUncollect(rowType, input, withOrdinality,
+        expandStructFields, isOuter);
   }
 
   @Override public boolean equals(@Nullable Object obj) {
     return obj == this
         || obj instanceof MutableUncollect
         && withOrdinality == ((MutableUncollect) obj).withOrdinality
+        && expandStructFields == ((MutableUncollect) obj).expandStructFields
+        && isOuter == ((MutableUncollect) obj).isOuter
         && input.equals(((MutableUncollect) obj).input);
   }
 
   @Override public int hashCode() {
-    return Objects.hash(input, withOrdinality);
+    return Objects.hash(input, withOrdinality, expandStructFields, isOuter);
   }
 
   @Override public StringBuilder digest(StringBuilder buf) {
-    return buf.append("Uncollect(withOrdinality: ")
-        .append(withOrdinality).append(")");
+    return buf.append("Uncollect(withOrdinality: ").append(withOrdinality)
+        .append(", expandStructFields: ").append(expandStructFields)
+        .append(", isOuter: ").append(isOuter)
+        .append(")");
   }
 
   @Override public MutableRel clone() {
-    return MutableUncollect.of(rowType, input.clone(), withOrdinality);
+    return MutableUncollect.of(rowType, input.clone(), withOrdinality,
+        expandStructFields, isOuter);
   }
 }

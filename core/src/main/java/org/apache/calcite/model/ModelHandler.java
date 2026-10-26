@@ -18,6 +18,7 @@ package org.apache.calcite.model;
 
 import org.apache.calcite.adapter.jdbc.JdbcSchema;
 import org.apache.calcite.avatica.AvaticaUtils;
+import org.apache.calcite.config.CalciteSystemProperty;
 import org.apache.calcite.jdbc.CalciteConnection;
 import org.apache.calcite.jdbc.CalciteSchema;
 import org.apache.calcite.materialize.Lattice;
@@ -53,9 +54,13 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 
 import org.checkerframework.checker.nullness.qual.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.sql.SQLException;
 import java.util.ArrayDeque;
 import java.util.Collections;
@@ -77,19 +82,37 @@ public class ModelHandler {
       .configure(JsonParser.Feature.ALLOW_COMMENTS, true);
   private static final ObjectMapper YAML_MAPPER = new YAMLMapper();
 
+  /** Receives the detail suppressed from the client-facing message when a
+   * non-inline model cannot be read or parsed. */
+  private static final Logger LOGGER =
+      LoggerFactory.getLogger(ModelHandler.class);
+
   private final SchemaPlus rootSchema;
   private final @Nullable String defaultSchemaName;
   private final Deque<Pair<? extends @Nullable String, SchemaPlus>> schemaStack =
       new ArrayDeque<>();
   private final String modelUri;
+  private final ClassNameFilter classNameFilter;
   Lattice.@Nullable Builder latticeBuilder;
   Lattice.@Nullable TileBuilder tileBuilder;
 
-  @SuppressWarnings("method.invocation.invalid")
+  /** Creates a {@code ModelHandler} that uses the
+   * {@linkplain ClassNameFilter#standard() standard} class-name filter. */
   public ModelHandler(SchemaPlus rootSchema, String uri) throws IOException {
+    this(rootSchema, uri, ClassNameFilter.standard());
+  }
+
+  /** Creates a {@code ModelHandler} that validates every class loaded
+   * by reflection from the model against {@code classNameFilter}. Use
+   * this to apply a stricter (or more permissive) filter than the
+   * standard one. */
+  @SuppressWarnings("method.invocation.invalid")
+  public ModelHandler(SchemaPlus rootSchema, String uri,
+      ClassNameFilter classNameFilter) throws IOException {
     super();
     this.modelUri = uri;
     this.rootSchema = rootSchema;
+    this.classNameFilter = classNameFilter;
     JsonRoot root;
     ObjectMapper mapper;
     if (uri.startsWith("inline:")) {
@@ -101,10 +124,53 @@ public class ModelHandler {
       root = mapper.readValue(inline, JsonRoot.class);
     } else {
       mapper = uri.endsWith(".yaml") || uri.endsWith(".yml") ? YAML_MAPPER : JSON_MAPPER;
-      root = mapper.readValue(new File(uri), JsonRoot.class);
+      try {
+        root = mapper.readValue(modelFile(uri), JsonRoot.class);
+      } catch (IOException e) {
+        // The client-facing message for a non-inline model must not depend
+        // on the file's contents or on whether the file exists. Collapse everything
+        // to one path-only summary; keep the detail in the operator log.
+        LOGGER.warn("Unable to read model file '{}'", uri, e);
+        throw new IOException("Unable to read model file '" + uri
+            + "'; see log of " + ModelHandler.class.getName()
+            + " for details");
+      } catch (RuntimeException e) {
+        // Same handling for RuntimeException, just in case some custom
+        // deserializers throw it.
+        LOGGER.warn("Unable to read model file '{}'", uri, e);
+        throw new RuntimeException("Unable to read model file '" + uri
+            + "'; see log of " + ModelHandler.class.getName()
+            + " for details");
+      }
     }
     visit(root);
     this.defaultSchemaName = root.defaultSchema;
+  }
+
+  /** Resolves a non-{@code inline:} model URI to a file, enforcing
+   * {@link CalciteSystemProperty#MODEL_BASE_DIRECTORY} when it is set. */
+  private static File modelFile(String uri) {
+    return modelFile(CalciteSystemProperty.MODEL_BASE_DIRECTORY.value(), uri);
+  }
+
+  /** As {@link #modelFile(String)}, but with an explicit base directory;
+   * package-private for tests.
+   *
+   * <p>An empty base directory means "no restriction": the URI is used as
+   * given. Otherwise a relative URI resolves under the base directory,
+   * and any URI that resolves (lexically) outside it is rejected. */
+  static File modelFile(String baseDirectory, String uri) {
+    if (baseDirectory.isEmpty()) {
+      return new File(uri);
+    }
+    final Path basePath = Paths.get(baseDirectory).toAbsolutePath().normalize();
+    final Path path = basePath.resolve(uri).normalize();
+    if (!path.startsWith(basePath)) {
+      throw new SecurityException("Model file '" + uri + "' resolves"
+          + " outside the configured base directory (system property '"
+          + "calcite.model.baseDirectory')");
+    }
+    return path.toFile();
   }
 
   @Deprecated // to be removed before 2.0
@@ -128,7 +194,12 @@ public class ModelHandler {
   }
 
   /** Creates and validates a {@link ScalarFunctionImpl}, and adds it to a
-   * schema. If {@code methodName} is "*", may add more than one function.
+   * schema, using the {@linkplain ClassNameFilter#standard() standard}
+   * class-name filter. Kept for backwards compatibility; prefer the
+   * filter-taking overload of {@code addFunctions}, which lets callers
+   * supply their own filter.
+   *
+   * <p>If {@code methodName} is "*", may add more than one function.
    *
    * @param schema Schema to add to
    * @param functionName Name of function; null to derived from method name
@@ -144,12 +215,22 @@ public class ModelHandler {
   public static void addFunctions(SchemaPlus schema,
       @Nullable String functionName, List<String> unusedPath,
       String className, @Nullable String methodName, boolean upCase) {
+    addFunctions(ClassNameFilter.standard(), schema, functionName, className,
+        methodName, upCase);
+  }
+
+  /** Creates and validates a {@link ScalarFunctionImpl} and adds it to a
+   * schema, after asking {@code filter} to accept {@code className}. */
+  public static void addFunctions(ClassNameFilter filter, SchemaPlus schema,
+      @Nullable String functionName, String className,
+      @Nullable String methodName, boolean upCase) {
+    filter.check(className);
     final Class<?> clazz;
     try {
-      clazz = Class.forName(className);
+      // Defer class initialization until it is checked to be a valid function (see below)
+      clazz = Class.forName(className, false, ModelHandler.class.getClassLoader());
     } catch (ClassNotFoundException e) {
-      throw new RuntimeException("UDF class '"
-          + className + "' not found");
+      throw new RuntimeException("UDF class '" + className + "' not found");
     }
     String methodNameOrDefault = Util.first(methodName, "eval");
     String actualFunctionName;
@@ -275,6 +356,7 @@ public class ModelHandler {
   public void visit(JsonCustomSchema jsonSchema) {
     try {
       final SchemaPlus parentSchema = currentMutableSchema("sub-schema");
+      classNameFilter.check(jsonSchema.factory);
       final SchemaFactory schemaFactory =
           AvaticaUtils.instantiatePlugin(SchemaFactory.class,
               jsonSchema.factory);
@@ -329,6 +411,7 @@ public class ModelHandler {
 
   public void visit(JsonJdbcSchema jsonSchema) {
     final SchemaPlus parentSchema = currentMutableSchema("jdbc schema");
+    classNameFilter.check(jsonSchema.jdbcDriver);
     final DataSource dataSource =
         JdbcSchema.dataSource(jsonSchema.jdbcUrl,
             jsonSchema.jdbcDriver,
@@ -340,6 +423,7 @@ public class ModelHandler {
           JdbcSchema.create(parentSchema, jsonSchema.name, dataSource,
               jsonSchema.jdbcCatalog, jsonSchema.jdbcSchema);
     } else {
+      classNameFilter.check(jsonSchema.sqlDialectFactory);
       SqlDialectFactory factory =
           AvaticaUtils.instantiatePlugin(SqlDialectFactory.class,
               jsonSchema.sqlDialectFactory);
@@ -401,6 +485,7 @@ public class ModelHandler {
         latticeBuilder.rowCountEstimate(jsonLattice.rowCountEstimate);
       }
       if (jsonLattice.statisticProvider != null) {
+        classNameFilter.check(jsonLattice.statisticProvider);
         latticeBuilder.statisticProvider(jsonLattice.statisticProvider);
       }
       populateLattice(jsonLattice, latticeBuilder);
@@ -421,6 +506,7 @@ public class ModelHandler {
   public void visit(JsonCustomTable jsonTable) {
     try {
       final SchemaPlus schema = currentMutableSchema("table");
+      classNameFilter.check(jsonTable.factory);
       final TableFactory tableFactory =
           AvaticaUtils.instantiatePlugin(TableFactory.class,
               jsonTable.factory);
@@ -518,10 +604,8 @@ public class ModelHandler {
     // "name" is not required - a class can have several functions
     try {
       final SchemaPlus schema = currentMutableSchema("function");
-      final List<String> path =
-          Util.first(jsonFunction.path, currentSchemaPath());
-      addFunctions(schema, jsonFunction.name, path, jsonFunction.className,
-          jsonFunction.methodName, false);
+      addFunctions(classNameFilter, schema, jsonFunction.name,
+          jsonFunction.className, jsonFunction.methodName, false);
     } catch (Exception e) {
       throw new RuntimeException("Error instantiating " + jsonFunction, e);
     }

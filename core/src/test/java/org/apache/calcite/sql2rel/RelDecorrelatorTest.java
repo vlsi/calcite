@@ -208,6 +208,868 @@ public class RelDecorrelatorTest {
     assertThat(after, hasTree(planAfter));
   }
 
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7057">[CALCITE-7057]
+   * NPE when decorrelating query containing nested correlated subqueries</a>. */
+  @Test void test7057() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = ""
+        + "select\n"
+        + " (select ename || ' from dept '\n"
+        + " || (select dname from dept where deptno = emp.deptno and emp.empno = empnos.empno)\n"
+        + "       from emp\n"
+        + "    ) as ename_from_dept\n"
+        + "from (values (7369), (7499)) as empnos(empno) order by 1";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+
+    // before fix:
+    //
+    // [01]LogicalSort(sort0=[$0], dir0=[ASC])
+    // [02] LogicalProject(ENAME_FROM_DEPT=[$1])
+    // [03]   LogicalCorrelate(correlation=[$cor2], joinType=[left], requiredColumns=[{0}])
+    // [04]     LogicalValues(tuples=[[{ 7369 }, { 7499 }]])
+    // [05]     LogicalAggregate(group=[{}], agg#0=[SINGLE_VALUE($0)])
+    // [06]       LogicalProject(EXPR$0=[||(||($1, ' from dept '), $8)])
+    // [07]         LogicalJoin(condition=[true], joinType=[left], variablesSet=[[$cor0, $cor2]])
+    // [08]           LogicalTableScan(table=[[scott, EMP]])
+    // [09]           LogicalAggregate(group=[{}], agg#0=[SINGLE_VALUE($0)])
+    // [10]             LogicalProject(DNAME=[$1])
+    // [11]               LogicalFilter(condition=[AND(=($0, $cor0.DEPTNO),
+    //                                  =(CAST($cor0.EMPNO):INTEGER NOT NULL, $cor2.EMPNO))])
+    // [12]                 LogicalTableScan(table=[[scott, DEPT]])
+    //
+    // diff is [07]LogicalJoin(condition=[true], joinType=[left], variablesSet=[[$cor0, $cor2]])
+    //             LogicalCorrelate(correlation=[$cor0], joinType=[left], requiredColumns=[{0, 7}])
+    //
+    final String planBefore = ""
+        + "LogicalSort(sort0=[$0], dir0=[ASC])\n"
+        + "  LogicalProject(ENAME_FROM_DEPT=[$1])\n"
+        + "    LogicalCorrelate(correlation=[$cor2], joinType=[left], requiredColumns=[{0}])\n"
+        + "      LogicalValues(tuples=[[{ 7369 }, { 7499 }]])\n"
+        + "      LogicalAggregate(group=[{}], agg#0=[SINGLE_VALUE($0)])\n"
+        + "        LogicalProject(EXPR$0=[||(||($1, ' from dept '), $8)])\n"
+        + "          LogicalCorrelate(correlation=[$cor0], joinType=[left], requiredColumns=[{0, 7}])\n"
+        + "            LogicalTableScan(table=[[scott, EMP]])\n"
+        + "            LogicalAggregate(group=[{}], agg#0=[SINGLE_VALUE($0)])\n"
+        + "              LogicalProject(DNAME=[$1])\n"
+        + "                LogicalFilter(condition=[AND(=($0, $cor0.DEPTNO), =(CAST($cor0.EMPNO):INTEGER NOT NULL, $cor2.EMPNO))])\n"
+        + "                  LogicalTableScan(table=[[scott, DEPT]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    final String planAfter = ""
+        + "LogicalSort(sort0=[$0], dir0=[ASC])\n"
+        + "  LogicalProject(ENAME_FROM_DEPT=[$2])\n"
+        + "    LogicalJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[left])\n"
+        + "      LogicalValues(tuples=[[{ 7369 }, { 7499 }]])\n"
+        + "      LogicalAggregate(group=[{0}], agg#0=[SINGLE_VALUE($1)])\n"
+        + "        LogicalProject(EMPNO1=[$11], EXPR$0=[||(||($1, ' from dept '), $12)])\n"
+        + "          LogicalJoin(condition=[AND(=($7, $9), =($8, $10))], joinType=[left])\n"
+        + "            LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7], EMPNO0=[CAST($0):INTEGER NOT NULL])\n"
+        + "              LogicalTableScan(table=[[scott, EMP]])\n"
+        + "            LogicalAggregate(group=[{0, 1, 2}], agg#0=[SINGLE_VALUE($3)])\n"
+        + "              LogicalProject(DEPTNO0=[$3], EMPNO0=[$4], EMPNO=[$5], DNAME=[$1])\n"
+        + "                LogicalJoin(condition=[=($0, $3)], joinType=[inner])\n"
+        + "                  LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "                  LogicalJoin(condition=[=($1, $2)], joinType=[inner])\n"
+        + "                    LogicalAggregate(group=[{0, 1}])\n"
+        + "                      LogicalProject(DEPTNO=[$7], EMPNO0=[CAST($0):INTEGER NOT NULL])\n"
+        + "                        LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                    LogicalValues(tuples=[[{ 7369 }, { 7499 }]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  @Test void testDecorrelateCountBug() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = "SELECT deptno, "
+        + "(SELECT CASE WHEN SUM(sal) > 10 then 'VIP' else 'Regular' END expr "
+        + " FROM emp e WHERE d.deptno = e.deptno) a "
+        + "FROM dept d";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalProject(DEPTNO=[$0], A=[$3])\n"
+        + "  LogicalCorrelate(correlation=[$cor0], joinType=[left], requiredColumns=[{0}])\n"
+        + "    LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "    LogicalProject(EXPR=[CASE(>($0, 10.00), 'VIP    ', 'Regular')])\n"
+        + "      LogicalAggregate(group=[{}], agg#0=[SUM($0)])\n"
+        + "        LogicalProject(SAL=[$5])\n"
+        + "          LogicalFilter(condition=[=($cor0.DEPTNO, $7)])\n"
+        + "            LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+
+    // Verify plan
+    final String planAfter = ""
+        + "LogicalProject(DEPTNO=[$0], A=[$3])\n"
+        + "  LogicalJoin(condition=[=($0, $4)], joinType=[left])\n"
+        + "    LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "    LogicalProject(EXPR=[CASE(>($2, 10.00), 'VIP    ', 'Regular')], DEPTNO=[$0])\n"
+        + "      LogicalJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[left])\n"
+        + "        LogicalProject(DEPTNO=[$0])\n"
+        + "          LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "        LogicalAggregate(group=[{0}], agg#0=[SUM($1)])\n"
+        + "          LogicalProject(DEPTNO=[$7], SAL=[$5])\n"
+        + "            LogicalFilter(condition=[IS NOT NULL($7)])\n"
+        + "              LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7303">[CALCITE-7303]
+   * Subqueries cannot be decorrelated if filter condition have multi CorrelationId</a>. */
+  @Test void testCorrelationEquivalent() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = "SELECT deptno\n"
+        + "FROM emp e\n"
+        + "WHERE EXISTS (\n"
+        + "  SELECT *\n"
+        + "  FROM dept d\n"
+        + "  WHERE EXISTS(\n"
+        + "    SELECT *\n"
+        + "    FROM bonus b\n"
+        + "    WHERE b.ename = e.ename\n"
+        + "    AND b.job = d.dname\n"
+        + "    AND d.deptno = e.deptno))";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalProject(DEPTNO=[$7])\n"
+        + "  LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7])\n"
+        + "    LogicalCorrelate(correlation=[$cor0], joinType=[inner], requiredColumns=[{1, 7}])\n"
+        + "      LogicalTableScan(table=[[scott, EMP]])\n"
+        + "      LogicalAggregate(group=[{0}])\n"
+        + "        LogicalProject(i=[true])\n"
+        + "          LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2])\n"
+        + "            LogicalCorrelate(correlation=[$cor1], joinType=[inner], requiredColumns=[{0, 1}])\n"
+        + "              LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "              LogicalAggregate(group=[{0}])\n"
+        + "                LogicalProject(i=[true])\n"
+        + "                  LogicalFilter(condition=[AND(=($0, $cor0.ENAME), =(CAST($1):VARCHAR(14), $cor1.DNAME), =($cor1.DEPTNO, $cor0.DEPTNO))])\n"
+        + "                    LogicalTableScan(table=[[scott, BONUS]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    // Verify plan
+    final String planAfter = ""
+        + "LogicalProject(DEPTNO=[$7])\n"
+        + "  LogicalJoin(condition=[AND(=($1, $8), =($7, $9))], joinType=[inner])\n"
+        + "    LogicalTableScan(table=[[scott, EMP]])\n"
+        + "    LogicalProject(ENAME0=[$0], DEPTNO0=[$1], $f2=[true])\n"
+        + "      LogicalAggregate(group=[{0, 1}])\n"
+        + "        LogicalProject(ENAME0=[$3], DEPTNO0=[$4])\n"
+        + "          LogicalJoin(condition=[AND(=($0, $5), =($1, $6))], joinType=[inner])\n"
+        + "            LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "            LogicalProject(ENAME0=[$0], DEPTNO=[$1], DEPTNO0=[$2], DNAME=[$3], $f4=[true])\n"
+        + "              LogicalAggregate(group=[{0, 1, 2, 3}])\n"
+        + "                LogicalProject(ENAME0=[$4], DEPTNO=[$5], DEPTNO0=[$6], DNAME=[$7])\n"
+        + "                  LogicalJoin(condition=[AND(=($0, $4), =(CAST($1):VARCHAR(14), $7))], joinType=[inner])\n"
+        + "                    LogicalTableScan(table=[[scott, BONUS]])\n"
+        + "                    LogicalJoin(condition=[=($2, $1)], joinType=[inner])\n"
+        + "                      LogicalProject(ENAME=[$1], DEPTNO=[$7])\n"
+        + "                        LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                      LogicalProject(DEPTNO=[$0], DNAME=[$1])\n"
+        + "                        LogicalTableScan(table=[[scott, DEPT]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7394">[CALCITE-7394]
+   * Nested sub-query with multiple levels of correlation returns incorrect results</a>. */
+  @Test void testNestedSubQueryWithMultiLevelCorrelation() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = ""
+        + "select d.dname,\n"
+        + "  (select count(*)\n"
+        + "   from emp e\n"
+        + "   where e.deptno = d.deptno\n"
+        + "   and exists (\n"
+        + "     select 1\n"
+        + "     from (values (1000), (2000), (3000)) as v(sal)\n"
+        + "     where e.sal > v.sal\n"
+        + "     and d.deptno * 100 < v.sal\n"
+        + "   )\n"
+        + "  ) as c\n"
+        + "from dept d\n"
+        + "order by d.dname";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalSort(sort0=[$0], dir0=[ASC])\n"
+        + "  LogicalProject(DNAME=[$1], C=[$3])\n"
+        + "    LogicalCorrelate(correlation=[$cor0], joinType=[left], requiredColumns=[{0}])\n"
+        + "      LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "      LogicalAggregate(group=[{}], EXPR$0=[COUNT()])\n"
+        + "        LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7])\n"
+        + "          LogicalFilter(condition=[=($7, $cor0.DEPTNO)])\n"
+        + "            LogicalCorrelate(correlation=[$cor1], joinType=[inner], requiredColumns=[{5}])\n"
+        + "              LogicalTableScan(table=[[scott, EMP]])\n"
+        + "              LogicalAggregate(group=[{0}])\n"
+        + "                LogicalProject(i=[true])\n"
+        + "                  LogicalFilter(condition=[AND(>(CAST($cor1.SAL):DECIMAL(12, 2), CAST($0):DECIMAL(12, 2) NOT NULL), <(*($cor0.DEPTNO, 100), $0))])\n"
+        + "                    LogicalValues(tuples=[[{ 1000 }, { 2000 }, { 3000 }]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    // before fix:
+    //
+    // LogicalSort(sort0=[$0], dir0=[ASC])
+    //  LogicalProject(DNAME=[$1], C=[$7])
+    //    LogicalJoin(condition=[AND(=($0, $5), =($4, $6))], joinType=[left])
+    //      LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2], DEPTNO0=[$0], $f4=[*($0, 100)])
+    //        LogicalTableScan(table=[[scott, DEPT]])
+    //      LogicalProject(DEPTNO8=[$0], $f4=[$1], EXPR$0=[CASE(IS NOT NULL($5), $5, 0)])
+    //        LogicalJoin(condition=[AND(IS NOT DISTINCT FROM($0, $3),
+    //                                   IS NOT DISTINCT FROM($1, $4))], joinType=[left])
+    //          LogicalJoin(condition=[true], joinType=[inner])       // <---- error part
+    //            LogicalProject(DEPTNO=[$0], $f4=[*($0, 100)])
+    //              LogicalTableScan(table=[[scott, DEPT]])
+    //            LogicalAggregate(group=[{0}])                       // <---- error part
+    //              LogicalProject(SAL0=[CAST($5):DECIMAL(12, 2)])    // <---- error part
+    //                LogicalTableScan(table=[[scott, EMP]])          // <---- error part
+    //          LogicalAggregate(group=[{0, 1}], EXPR$0=[COUNT()])
+    //            LogicalProject(DEPTNO8=[$7], $f4=[$9])
+    //              LogicalFilter(condition=[IS NOT NULL($7)])
+    //                LogicalProject(..., DEPTNO=[$7], i=[$11], $f4=[$9])
+    //                  LogicalJoin(condition=[=($8, $10)], joinType=[inner])
+    //                    LogicalProject(..., SAL0=[CAST($5):DECIMAL(12, 2)])
+    //                      LogicalTableScan(table=[[scott, EMP]])
+    //                    LogicalProject($f4=[$0], SAL0=[$1], $f2=[true])
+    //                      LogicalAggregate(group=[{0, 1}])
+    //                        LogicalProject($f4=[$1], SAL0=[$2])
+    //                          LogicalJoin(condition=[AND(>($2, CAST($0):DECIMAL(12, 2) NOT NULL),
+    //                                                    <($1, $0))], joinType=[inner])
+    //                            LogicalValues(tuples=[[{ 1000 }, { 2000 }, { 3000 }]])
+    //                            LogicalJoin(condition=[true], joinType=[inner])
+    //                              LogicalAggregate(group=[{0}])
+    //                                LogicalProject($f4=[*($0, 100)])
+    //                                  LogicalTableScan(table=[[scott, DEPT]])
+    //                              LogicalAggregate(group=[{0}])
+    //                                LogicalProject(SAL0=[CAST($5):DECIMAL(12, 2)])
+    //                                  LogicalTableScan(table=[[scott, EMP]])
+    final String planAfter = ""
+        + "LogicalSort(sort0=[$0], dir0=[ASC])\n"
+        + "  LogicalProject(DNAME=[$1], C=[$6])\n"
+        + "    LogicalJoin(condition=[AND(=($0, $4), =($3, $5))], joinType=[left])\n"
+        + "      LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2], $f3=[*($0, 100)])\n"
+        + "        LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "      LogicalProject(DEPTNO8=[$0], $f3=[$1], EXPR$0=[CASE(IS NOT NULL($4), $4, 0)])\n"
+        + "        LogicalJoin(condition=[AND(IS NOT DISTINCT FROM($0, $2), IS NOT DISTINCT FROM($1, $3))], joinType=[left])\n"
+        + "          LogicalProject(DEPTNO=[$0], $f3=[*($0, 100)])\n"
+        + "            LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "          LogicalAggregate(group=[{0, 1}], EXPR$0=[COUNT()])\n"
+        + "            LogicalProject(DEPTNO8=[$7], $f3=[$9])\n"
+        + "              LogicalFilter(condition=[IS NOT NULL($7)])\n"
+        + "                LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7], i=[$11], $f3=[$9])\n"
+        + "                  LogicalJoin(condition=[=($8, $10)], joinType=[inner])\n"
+        + "                    LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7], SAL0=[CAST($5):DECIMAL(12, 2)])\n"
+        + "                      LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                    LogicalProject($f3=[$0], SAL0=[$1], $f2=[true])\n"
+        + "                      LogicalAggregate(group=[{0, 1}])\n"
+        + "                        LogicalProject($f3=[$1], SAL0=[$2])\n"
+        + "                          LogicalJoin(condition=[AND(>($2, CAST($0):DECIMAL(12, 2) NOT NULL), <($1, $0))], joinType=[inner])\n"
+        + "                            LogicalValues(tuples=[[{ 1000 }, { 2000 }, { 3000 }]])\n"
+        + "                            LogicalJoin(condition=[true], joinType=[inner])\n"
+        + "                              LogicalAggregate(group=[{0}])\n"
+        + "                                LogicalProject($f3=[*($0, 100)])\n"
+        + "                                  LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "                              LogicalAggregate(group=[{0}])\n"
+        + "                                LogicalProject(SAL0=[CAST($5):DECIMAL(12, 2)])\n"
+        + "                                  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7297">[CALCITE-7297]
+   * The result is incorrect when the GROUP BY key in a subquery is a RexFieldAccess</a>. */
+  @Test void testSkipsRedundantValueGenerator() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = ""
+        + "SELECT *,\n"
+        + "    (SELECT COUNT(*)\n"
+        + "    FROM \n"
+        + "        (\n"
+        + "        SELECT empno, ename, job\n"
+        + "        FROM emp\n"
+        + "        WHERE emp.deptno = dept.deptno) AS sub\n"
+        + "    GROUP BY deptno) AS num_dept_groups\n"
+        + "FROM dept";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalCorrelate(correlation=[$cor1], joinType=[left], requiredColumns=[{0}])\n"
+        + "  LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "  LogicalAggregate(group=[{}], agg#0=[SINGLE_VALUE($0)])\n"
+        + "    LogicalProject(EXPR$0=[$1])\n"
+        + "      LogicalAggregate(group=[{0}], EXPR$0=[COUNT()])\n"
+        + "        LogicalProject($f0=[$cor1.DEPTNO])\n"
+        + "          LogicalFilter(condition=[=($7, $cor1.DEPTNO)])\n"
+        + "            LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    // Verify plan
+    final String planAfter = ""
+        + "LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2], $f1=[$4])\n"
+        + "  LogicalJoin(condition=[=($0, $3)], joinType=[left])\n"
+        + "    LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "    LogicalAggregate(group=[{0}], agg#0=[SINGLE_VALUE($1)])\n"
+        + "      LogicalProject(DEPTNO=[$1], EXPR$0=[$2])\n"
+        + "        LogicalAggregate(group=[{0, 1}], EXPR$0=[COUNT()])\n"
+        + "          LogicalProject($f0=[$7], DEPTNO=[$7])\n"
+        + "            LogicalFilter(condition=[IS NOT NULL($7)])\n"
+        + "              LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  @Test void testCorrelationInSetOp0() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = "SELECT ename,\n"
+        + "    (SELECT sum(c)\n"
+        + "    FROM\n"
+        + "        (SELECT deptno AS c\n"
+        + "        FROM dept\n"
+        + "        WHERE dept.deptno = emp.deptno\n"
+        + "        UNION ALL\n"
+        + "        SELECT 2 AS c\n"
+        + "        FROM bonus) AS union_subquery\n"
+        + "    ) AS correlated_sum\n"
+        + "FROM emp\n"
+        + "ORDER BY ename";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalSort(sort0=[$0], dir0=[ASC])\n"
+        + "  LogicalProject(ENAME=[$1], CORRELATED_SUM=[$8])\n"
+        + "    LogicalCorrelate(correlation=[$cor0], joinType=[left], requiredColumns=[{7}])\n"
+        + "      LogicalTableScan(table=[[scott, EMP]])\n"
+        + "      LogicalAggregate(group=[{}], EXPR$0=[SUM($0)])\n"
+        + "        LogicalUnion(all=[true])\n"
+        + "          LogicalProject(C=[CAST($0):INTEGER NOT NULL])\n"
+        + "            LogicalFilter(condition=[=($0, $cor0.DEPTNO)])\n"
+        + "              LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "          LogicalProject(C=[2])\n"
+        + "            LogicalTableScan(table=[[scott, BONUS]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    // Verify plan
+    final String planAfter = ""
+        + "LogicalSort(sort0=[$0], dir0=[ASC])\n"
+        + "  LogicalProject(ENAME=[$1], CORRELATED_SUM=[$9])\n"
+        + "    LogicalJoin(condition=[IS NOT DISTINCT FROM($7, $8)], joinType=[left])\n"
+        + "      LogicalTableScan(table=[[scott, EMP]])\n"
+        + "      LogicalAggregate(group=[{0}], EXPR$0=[SUM($1)])\n"
+        + "        LogicalProject(DEPTNO=[$0], C=[$1])\n"
+        + "          LogicalUnion(all=[true])\n"
+        + "            LogicalProject(DEPTNO=[$0], C=[$1])\n"
+        + "              LogicalJoin(condition=[IS NOT DISTINCT FROM($0, $2)], joinType=[inner])\n"
+        + "                LogicalAggregate(group=[{0}])\n"
+        + "                  LogicalProject(DEPTNO=[$7])\n"
+        + "                    LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                LogicalProject(C=[CAST($0):INTEGER NOT NULL], DEPTNO=[$0])\n"
+        + "                  LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "            LogicalProject(DEPTNO=[$0], C=[$1])\n"
+        + "              LogicalJoin(condition=[true], joinType=[inner])\n"
+        + "                LogicalAggregate(group=[{0}])\n"
+        + "                  LogicalProject(DEPTNO=[$7])\n"
+        + "                    LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                LogicalProject(C=[2])\n"
+        + "                  LogicalTableScan(table=[[scott, BONUS]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7272">[CALCITE-7272]
+   * Subqueries cannot be decorrelated if have set op</a>. */
+  @Test void testCorrelationInSetOp1() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = "SELECT ename,\n"
+        + "    (SELECT sum(c)\n"
+        + "    FROM\n"
+        + "        (SELECT deptno AS c\n"
+        + "        FROM dept\n"
+        + "        WHERE dept.deptno = emp.deptno\n"
+        + "        UNION ALL\n"
+        + "        SELECT 2 AS c\n"
+        + "        FROM bonus\n"
+        + "        WHERE bonus.job = emp.job) AS union_subquery\n"
+        + "    ) AS correlated_sum\n"
+        + "FROM emp\n"
+        + "ORDER BY ename";
+
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalSort(sort0=[$0], dir0=[ASC])\n"
+        + "  LogicalProject(ENAME=[$1], CORRELATED_SUM=[$8])\n"
+        + "    LogicalCorrelate(correlation=[$cor0], joinType=[left], requiredColumns=[{2, 7}])\n"
+        + "      LogicalTableScan(table=[[scott, EMP]])\n"
+        + "      LogicalAggregate(group=[{}], EXPR$0=[SUM($0)])\n"
+        + "        LogicalUnion(all=[true])\n"
+        + "          LogicalProject(C=[CAST($0):INTEGER NOT NULL])\n"
+        + "            LogicalFilter(condition=[=($0, $cor0.DEPTNO)])\n"
+        + "              LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "          LogicalProject(C=[2])\n"
+        + "            LogicalFilter(condition=[=($1, $cor0.JOB)])\n"
+        + "              LogicalTableScan(table=[[scott, BONUS]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    // Verify plan
+    final String planAfter = ""
+        + "LogicalSort(sort0=[$0], dir0=[ASC])\n"
+        + "  LogicalProject(ENAME=[$1], CORRELATED_SUM=[$10])\n"
+        + "    LogicalJoin(condition=[AND(IS NOT DISTINCT FROM($2, $8), IS NOT DISTINCT FROM($7, $9))], joinType=[left])\n"
+        + "      LogicalTableScan(table=[[scott, EMP]])\n"
+        + "      LogicalAggregate(group=[{0, 1}], EXPR$0=[SUM($2)])\n"
+        + "        LogicalProject(JOB=[$0], DEPTNO=[$1], C=[$2])\n"
+        + "          LogicalUnion(all=[true])\n"
+        + "            LogicalProject(JOB=[$0], DEPTNO=[$1], C=[$2])\n"
+        + "              LogicalJoin(condition=[IS NOT DISTINCT FROM($1, $3)], joinType=[inner])\n"
+        + "                LogicalAggregate(group=[{0, 1}])\n"
+        + "                  LogicalProject(JOB=[$2], DEPTNO=[$7])\n"
+        + "                    LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                LogicalProject(C=[CAST($0):INTEGER NOT NULL], DEPTNO=[$0])\n"
+        + "                  LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "            LogicalProject(JOB=[$0], DEPTNO=[$1], C=[$2])\n"
+        + "              LogicalJoin(condition=[IS NOT DISTINCT FROM($0, $3)], joinType=[inner])\n"
+        + "                LogicalAggregate(group=[{0, 1}])\n"
+        + "                  LogicalProject(JOB=[$2], DEPTNO=[$7])\n"
+        + "                    LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                LogicalProject(C=[2], JOB=[$1])\n"
+        + "                  LogicalFilter(condition=[IS NOT NULL($1)])\n"
+        + "                    LogicalTableScan(table=[[scott, BONUS]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7272">[CALCITE-7272]
+   * Subqueries cannot be decorrelated if have set op</a>. */
+  @Test void testCorrelationInSetOp2() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = "SELECT d.dname\n"
+        + "FROM dept d\n"
+        + "WHERE EXISTS (\n"
+        + "  SELECT 1\n"
+        + "  FROM emp e\n"
+        + "  WHERE e.deptno = d.deptno\n"
+        + "  AND (\n"
+        + "    SELECT SUM(x)\n"
+        + "    FROM (\n"
+        + "        SELECT COUNT(*) as x\n"
+        + "        FROM bonus b\n"
+        + "        WHERE b.ename = e.ename\n"
+        + "        UNION ALL\n"
+        + "        SELECT COUNT(*) as x\n"
+        + "        FROM emp e2\n"
+        + "        WHERE e2.deptno = d.deptno\n"
+        + "    ) t\n"
+        + "  ) > 5)";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalProject(DNAME=[$1])\n"
+        + "  LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2])\n"
+        + "    LogicalCorrelate(correlation=[$cor0], joinType=[inner], requiredColumns=[{0}])\n"
+        + "      LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "      LogicalAggregate(group=[{0}])\n"
+        + "        LogicalProject(i=[true])\n"
+        + "          LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7])\n"
+        + "            LogicalFilter(condition=[AND(=($7, $cor0.DEPTNO), >($8, 5))])\n"
+        + "              LogicalCorrelate(correlation=[$cor1], joinType=[left], requiredColumns=[{1}])\n"
+        + "                LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                LogicalAggregate(group=[{}], EXPR$0=[SUM($0)])\n"
+        + "                  LogicalUnion(all=[true])\n"
+        + "                    LogicalAggregate(group=[{}], X=[COUNT()])\n"
+        + "                      LogicalFilter(condition=[=($0, $cor1.ENAME)])\n"
+        + "                        LogicalTableScan(table=[[scott, BONUS]])\n"
+        + "                    LogicalAggregate(group=[{}], X=[COUNT()])\n"
+        + "                      LogicalFilter(condition=[=($7, $cor0.DEPTNO)])\n"
+        + "                        LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    // Verify plan
+    final String planAfter = ""
+        + "LogicalProject(DNAME=[$1])\n"
+        + "  LogicalJoin(condition=[=($0, $3)], joinType=[inner])\n"
+        + "    LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "    LogicalProject(DEPTNO0=[$0], $f1=[true])\n"
+        + "      LogicalAggregate(group=[{0}])\n"
+        + "        LogicalProject(DEPTNO0=[$8])\n"
+        + "          LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7], DEPTNO0=[CAST($8):TINYINT], ENAME0=[$9], EXPR$0=[CAST($10):BIGINT])\n"
+        + "            LogicalJoin(condition=[AND(IS NOT DISTINCT FROM($1, $9), =($7, $8))], joinType=[inner])\n"
+        + "              LogicalTableScan(table=[[scott, EMP]])\n"
+        + "              LogicalFilter(condition=[>($2, 5)])\n"
+        + "                LogicalAggregate(group=[{0, 1}], EXPR$0=[SUM($2)])\n"
+        + "                  LogicalProject(DEPTNO=[$0], ENAME=[$1], X=[$2])\n"
+        + "                    LogicalUnion(all=[true])\n"
+        + "                      LogicalProject(DEPTNO=[$0], ENAME=[$1], X=[$3])\n"
+        + "                        LogicalJoin(condition=[IS NOT DISTINCT FROM($1, $2)], joinType=[inner])\n"
+        + "                          LogicalJoin(condition=[true], joinType=[inner])\n"
+        + "                            LogicalProject(DEPTNO=[$0])\n"
+        + "                              LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "                            LogicalProject(ENAME=[$1])\n"
+        + "                              LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                          LogicalProject(ENAME=[$0], X=[CASE(IS NOT NULL($2), $2, 0)])\n"
+        + "                            LogicalJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[left])\n"
+        + "                              LogicalProject(ENAME=[$1])\n"
+        + "                                LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                              LogicalAggregate(group=[{0}], X=[COUNT()])\n"
+        + "                                LogicalProject(ENAME=[$0])\n"
+        + "                                  LogicalFilter(condition=[IS NOT NULL($0)])\n"
+        + "                                    LogicalTableScan(table=[[scott, BONUS]])\n"
+        + "                      LogicalProject(DEPTNO=[$0], ENAME=[$1], X=[$3])\n"
+        + "                        LogicalJoin(condition=[IS NOT DISTINCT FROM($0, $2)], joinType=[inner])\n"
+        + "                          LogicalJoin(condition=[true], joinType=[inner])\n"
+        + "                            LogicalProject(DEPTNO=[$0])\n"
+        + "                              LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "                            LogicalProject(ENAME=[$1])\n"
+        + "                              LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                          LogicalProject(DEPTNO=[$0], X=[CASE(IS NOT NULL($2), $2, 0)])\n"
+        + "                            LogicalJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[left])\n"
+        + "                              LogicalProject(DEPTNO=[$0])\n"
+        + "                                LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "                              LogicalAggregate(group=[{0}], X=[COUNT()])\n"
+        + "                                LogicalProject(DEPTNO=[$7])\n"
+        + "                                  LogicalFilter(condition=[IS NOT NULL($7)])\n"
+        + "                                    LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7272">[CALCITE-7272]
+   * Subqueries cannot be decorrelated if have set op</a>. */
+  @Test void testCorrelationInSetOp3() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = "SELECT d.dname\n"
+        + "FROM dept d\n"
+        + "WHERE EXISTS (\n"
+        + "  SELECT 1\n"
+        + "  FROM emp e\n"
+        + "  WHERE (\n"
+        + "    SELECT SUM(x)\n"
+        + "    FROM (\n"
+        + "        SELECT COUNT(*) as x\n"
+        + "        FROM bonus b\n"
+        + "        WHERE b.ename = e.ename\n"
+        + "        UNION ALL\n"
+        + "        SELECT COUNT(*) as x\n"
+        + "        FROM emp e2\n"
+        + "        WHERE e2.deptno = d.deptno\n"
+        + "    ) t\n"
+        + "  ) > 5)";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalProject(DNAME=[$1])\n"
+        + "  LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2])\n"
+        + "    LogicalCorrelate(correlation=[$cor1], joinType=[inner], requiredColumns=[{0}])\n"
+        + "      LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "      LogicalAggregate(group=[{0}])\n"
+        + "        LogicalProject(i=[true])\n"
+        + "          LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7])\n"
+        + "            LogicalFilter(condition=[>($8, 5)])\n"
+        + "              LogicalCorrelate(correlation=[$cor0], joinType=[left], requiredColumns=[{1}])\n"
+        + "                LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                LogicalAggregate(group=[{}], EXPR$0=[SUM($0)])\n"
+        + "                  LogicalUnion(all=[true])\n"
+        + "                    LogicalAggregate(group=[{}], X=[COUNT()])\n"
+        + "                      LogicalFilter(condition=[=($0, $cor0.ENAME)])\n"
+        + "                        LogicalTableScan(table=[[scott, BONUS]])\n"
+        + "                    LogicalAggregate(group=[{}], X=[COUNT()])\n"
+        + "                      LogicalFilter(condition=[=($7, $cor1.DEPTNO)])\n"
+        + "                        LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    // Verify plan
+    final String planAfter = ""
+        + "LogicalProject(DNAME=[$1])\n"
+        + "  LogicalJoin(condition=[IS NOT DISTINCT FROM($0, $3)], joinType=[inner])\n"
+        + "    LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "    LogicalProject(DEPTNO0=[$0], $f1=[true])\n"
+        + "      LogicalAggregate(group=[{0}])\n"
+        + "        LogicalProject(DEPTNO0=[$9])\n"
+        + "          LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7], ENAME0=[$8], DEPTNO0=[CAST($9):TINYINT], EXPR$0=[CAST($10):BIGINT])\n"
+        + "            LogicalJoin(condition=[IS NOT DISTINCT FROM($1, $8)], joinType=[inner])\n"
+        + "              LogicalTableScan(table=[[scott, EMP]])\n"
+        + "              LogicalFilter(condition=[>($2, 5)])\n"
+        + "                LogicalAggregate(group=[{0, 1}], EXPR$0=[SUM($2)])\n"
+        + "                  LogicalProject(ENAME=[$0], DEPTNO=[$1], X=[$2])\n"
+        + "                    LogicalUnion(all=[true])\n"
+        + "                      LogicalProject(ENAME=[$0], DEPTNO=[$1], X=[$3])\n"
+        + "                        LogicalJoin(condition=[IS NOT DISTINCT FROM($0, $2)], joinType=[inner])\n"
+        + "                          LogicalJoin(condition=[true], joinType=[inner])\n"
+        + "                            LogicalProject(ENAME=[$1])\n"
+        + "                              LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                            LogicalProject(DEPTNO=[$0])\n"
+        + "                              LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "                          LogicalProject(ENAME=[$0], X=[CASE(IS NOT NULL($2), $2, 0)])\n"
+        + "                            LogicalJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[left])\n"
+        + "                              LogicalProject(ENAME=[$1])\n"
+        + "                                LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                              LogicalAggregate(group=[{0}], X=[COUNT()])\n"
+        + "                                LogicalProject(ENAME=[$0])\n"
+        + "                                  LogicalFilter(condition=[IS NOT NULL($0)])\n"
+        + "                                    LogicalTableScan(table=[[scott, BONUS]])\n"
+        + "                      LogicalProject(ENAME=[$0], DEPTNO=[$1], X=[$3])\n"
+        + "                        LogicalJoin(condition=[IS NOT DISTINCT FROM($1, $2)], joinType=[inner])\n"
+        + "                          LogicalJoin(condition=[true], joinType=[inner])\n"
+        + "                            LogicalProject(ENAME=[$1])\n"
+        + "                              LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                            LogicalProject(DEPTNO=[$0])\n"
+        + "                              LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "                          LogicalProject(DEPTNO=[$0], X=[CASE(IS NOT NULL($2), $2, 0)])\n"
+        + "                            LogicalJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[left])\n"
+        + "                              LogicalProject(DEPTNO=[$0])\n"
+        + "                                LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "                              LogicalAggregate(group=[{0}], X=[COUNT()])\n"
+        + "                                LogicalProject(DEPTNO=[$7])\n"
+        + "                                  LogicalFilter(condition=[IS NOT NULL($7)])\n"
+        + "                                    LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
   /**
    * Test case for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-6468">[CALCITE-6468] RelDecorrelator
@@ -269,23 +1131,17 @@ public class RelDecorrelatorTest {
     // Verify plan
     final String planAfter = ""
         + "LogicalProject(EXPR$0=[1])\n"
-        + "  LogicalJoin(condition=[AND(IS NOT DISTINCT FROM($0, $2), >($1, $3))], joinType=[inner])\n"
+        + "  LogicalJoin(condition=[AND(=($0, $2), >($1, $3))], joinType=[inner])\n"
         + "    LogicalAggregate(group=[{0}], TOTAL=[SUM($1)])\n"
         + "      LogicalProject(DEPTNO=[$7], SAL=[$5])\n"
         + "        LogicalTableScan(table=[[scott, EMP]])\n"
-        + "    LogicalProject(DEPTNO=[$0], EXPR$0=[$2])\n"
-        + "      LogicalJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[left])\n"
-        + "        LogicalProject(DEPTNO=[$0])\n"
-        + "          LogicalAggregate(group=[{0}], TOTAL=[SUM($1)])\n"
-        + "            LogicalProject(DEPTNO=[$7], SAL=[$5])\n"
-        + "              LogicalTableScan(table=[[scott, EMP]])\n"
-        + "        LogicalAggregate(group=[{0}], EXPR$0=[AVG($1)])\n"
-        + "          LogicalProject(DEPTNO=[$0], TOTAL=[$1])\n"
-        + "            LogicalAggregate(group=[{0}], TOTAL=[SUM($1)])\n"
-        + "              LogicalProject(DEPTNO=[$0], SAL=[$1])\n"
-        + "                LogicalFilter(condition=[IS NOT NULL($0)])\n"
-        + "                  LogicalProject(DEPTNO=[$7], SAL=[$5])\n"
-        + "                    LogicalTableScan(table=[[scott, EMP]])\n";
+        + "    LogicalAggregate(group=[{0}], EXPR$0=[AVG($1)])\n"
+        + "      LogicalProject(DEPTNO=[$0], TOTAL=[$1])\n"
+        + "        LogicalAggregate(group=[{0}], TOTAL=[SUM($1)])\n"
+        + "          LogicalProject(DEPTNO=[$0], SAL=[$1])\n"
+        + "            LogicalFilter(condition=[IS NOT NULL($0)])\n"
+        + "              LogicalProject(DEPTNO=[$7], SAL=[$5])\n"
+        + "                LogicalTableScan(table=[[scott, EMP]])\n";
     assertThat(after, hasTree(planAfter));
   }
 
@@ -366,15 +1222,1369 @@ public class RelDecorrelatorTest {
         RelDecorrelator.decorrelateQuery(original, builder, noRules);
     final String planDecorrelatedNoRules = ""
         + "LogicalProject(EXPR$0=[ROW($9, $1)])\n"
-        + "  LogicalJoin(condition=[IS NOT DISTINCT FROM($7, $8)], joinType=[left])\n"
+        + "  LogicalJoin(condition=[=($7, $8)], joinType=[left])\n"
         + "    LogicalTableScan(table=[[scott, EMP]])\n"
-        + "    LogicalProject(DEPTNO1=[$0], $f1=[$2])\n"
-        + "      LogicalJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[left])\n"
-        + "        LogicalAggregate(group=[{7}])\n"
-        + "          LogicalTableScan(table=[[scott, EMP]])\n"
-        + "        LogicalAggregate(group=[{0}], agg#0=[SINGLE_VALUE($1)])\n"
-        + "          LogicalProject(DEPTNO1=[$0], DEPTNO=[$0])\n"
-        + "            LogicalTableScan(table=[[scott, DEPT]])\n";
+        + "    LogicalAggregate(group=[{0}], agg#0=[SINGLE_VALUE($1)])\n"
+        + "      LogicalProject(DEPTNO1=[$0], DEPTNO=[$0])\n"
+        + "        LogicalTableScan(table=[[scott, DEPT]])\n";
     assertThat(decorrelatedNoRules, hasTree(planDecorrelatedNoRules));
+  }
+
+  @Test void testDecorrelateCorrelatedOrderByLimitToRowNumber() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = ""
+        + "SELECT dname FROM  dept WHERE 2000 > (\n"
+        + "SELECT emp.sal FROM  emp where dept.deptno = emp.deptno\n"
+        + "ORDER BY year(hiredate), emp.sal limit 1)";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalProject(DNAME=[$1])\n"
+        + "  LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2])\n"
+        + "    LogicalFilter(condition=[>(2000.00, CAST($3):DECIMAL(12, 2))])\n"
+        + "      LogicalCorrelate(correlation=[$cor0], joinType=[left], requiredColumns=[{0}])\n"
+        + "        LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "        LogicalProject(SAL=[$0])\n"
+        + "          LogicalSort(sort0=[$1], sort1=[$0], dir0=[ASC], dir1=[ASC], fetch=[1])\n"
+        + "            LogicalProject(SAL=[$5], EXPR$1=[EXTRACT(FLAG(YEAR), $4)])\n"
+        + "              LogicalFilter(condition=[=($cor0.DEPTNO, $7)])\n"
+        + "                LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    // Verify plan
+    final String planAfter = ""
+        + "LogicalProject(DNAME=[$1])\n"
+        + "  LogicalJoin(condition=[=($0, $4)], joinType=[inner])\n"
+        + "    LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "    LogicalFilter(condition=[>(2000.00, CAST($0):DECIMAL(12, 2))])\n"
+        + "      LogicalProject(SAL=[$0], DEPTNO=[$2])\n"
+        + "        LogicalFilter(condition=[<=($3, 1)])\n"
+        + "          LogicalProject(SAL=[$5], EXPR$1=[EXTRACT(FLAG(YEAR), $4)], DEPTNO=[$7], rn=[ROW_NUMBER() OVER (PARTITION BY $7 ORDER BY EXTRACT(FLAG(YEAR), $4) NULLS LAST, $5 NULLS LAST)])\n"
+        + "            LogicalFilter(condition=[IS NOT NULL($7)])\n"
+        + "              LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  @Test void testDecorrelateCorrelatedOrderByLimitToRowNumber2() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = ""
+        + "SELECT *\n"
+        + "FROM dept d\n"
+        + "WHERE d.deptno IN (\n"
+        + "  SELECT e.deptno\n"
+        + "  FROM emp e\n"
+        + "  WHERE d.deptno = e.deptno\n"
+        + "  LIMIT 10\n"
+        + "  OFFSET 2\n"
+        + ")\n"
+        + "LIMIT 2\n"
+        + "OFFSET 1";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalSort(offset=[1], fetch=[2])\n"
+        + "  LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2])\n"
+        + "    LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2])\n"
+        + "      LogicalFilter(condition=[=($0, $3)])\n"
+        + "        LogicalCorrelate(correlation=[$cor0], joinType=[inner], requiredColumns=[{0}])\n"
+        + "          LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "          LogicalAggregate(group=[{0}])\n"
+        + "            LogicalSort(offset=[2], fetch=[10])\n"
+        + "              LogicalProject(DEPTNO=[$7])\n"
+        + "                LogicalFilter(condition=[=($cor0.DEPTNO, $7)])\n"
+        + "                  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    // Verify plan
+    final String planAfter = ""
+        + "LogicalSort(offset=[1], fetch=[2])\n"
+        + "  LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2])\n"
+        + "    LogicalJoin(condition=[=($0, $4)], joinType=[inner])\n"
+        + "      LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "      LogicalFilter(condition=[=($1, $0)])\n"
+        + "        LogicalAggregate(group=[{0, 1}])\n"
+        + "          LogicalProject(DEPTNO=[$0], DEPTNO1=[$1])\n"
+        + "            LogicalFilter(condition=[AND(>($2, 2), <=($2, +(2, 10)))])\n"
+        + "              LogicalProject(DEPTNO=[$7], DEPTNO1=[$7], rn=[ROW_NUMBER() OVER (PARTITION BY $7)])\n"
+        + "                LogicalFilter(condition=[IS NOT NULL($7)])\n"
+        + "                  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  @Test void testDecorrelateCorrelatedOrderByLimitToRowNumber3() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = ""
+        + "SELECT deptno FROM dept WHERE 1000.00 >\n"
+        + "(SELECT sal FROM emp WHERE dept.deptno = emp.deptno\n"
+        + "order by emp.sal limit 1 offset 10)";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalProject(DEPTNO=[$0])\n"
+        + "  LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2])\n"
+        + "    LogicalFilter(condition=[>(1000.00, $3)])\n"
+        + "      LogicalCorrelate(correlation=[$cor0], joinType=[left], requiredColumns=[{0}])\n"
+        + "        LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "        LogicalSort(sort0=[$0], dir0=[ASC], offset=[10], fetch=[1])\n"
+        + "          LogicalProject(SAL=[$5])\n"
+        + "            LogicalFilter(condition=[=($cor0.DEPTNO, $7)])\n"
+        + "              LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    // Verify plan
+    final String planAfter = ""
+        + "LogicalProject(DEPTNO=[$0])\n"
+        + "  LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2], SAL=[$3], DEPTNO0=[$4], rn=[CAST($5):BIGINT])\n"
+        + "    LogicalJoin(condition=[=($0, $4)], joinType=[inner])\n"
+        + "      LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "      LogicalFilter(condition=[>(1000.00, $0)])\n"
+        + "        LogicalFilter(condition=[AND(>($2, 10), <=($2, +(10, 1)))])\n"
+        + "          LogicalProject(SAL=[$5], DEPTNO=[$7], rn=[ROW_NUMBER() OVER (PARTITION BY $7 ORDER BY $5 NULLS LAST)])\n"
+        + "            LogicalFilter(condition=[IS NOT NULL($7)])\n"
+        + "              LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /**
+   * Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-709">[CALCITE-709]
+   * LIMIT inside scalar sub-query</a>.
+   */
+  @Test void test709() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = ""
+        + "SELECT E1.DEPTNO\n"
+        + "FROM EMP E1\n"
+        + "WHERE E1.SAL > (SELECT B1.COMM FROM BONUS B1 WHERE E1.ENAME = B1.ENAME LIMIT 2)";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalProject(DEPTNO=[$7])\n"
+        + "  LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7])\n"
+        + "    LogicalFilter(condition=[>($5, $8)])\n"
+        + "      LogicalCorrelate(correlation=[$cor0], joinType=[left], requiredColumns=[{1}])\n"
+        + "        LogicalTableScan(table=[[scott, EMP]])\n"
+        + "        LogicalAggregate(group=[{}], agg#0=[SINGLE_VALUE($0)])\n"
+        + "          LogicalSort(fetch=[2])\n"
+        + "            LogicalProject(COMM=[$3])\n"
+        + "              LogicalFilter(condition=[=($cor0.ENAME, $0)])\n"
+        + "                LogicalTableScan(table=[[scott, BONUS]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    // Verify plan
+    final String planAfter = ""
+        + "LogicalProject(DEPTNO=[$7])\n"
+        + "  LogicalJoin(condition=[AND(=($1, $8), >($5, $9))], joinType=[inner])\n"
+        + "    LogicalTableScan(table=[[scott, EMP]])\n"
+        + "    LogicalAggregate(group=[{0}], agg#0=[SINGLE_VALUE($1)])\n"
+        + "      LogicalProject(ENAME=[$1], COMM=[$0])\n"
+        + "        LogicalFilter(condition=[<=($2, 2)])\n"
+        + "          LogicalProject(COMM=[$3], ENAME=[$0], rn=[ROW_NUMBER() OVER (PARTITION BY $0)])\n"
+        + "            LogicalFilter(condition=[IS NOT NULL($0)])\n"
+        + "              LogicalTableScan(table=[[scott, BONUS]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7257">[CALCITE-7257]
+   * Subqueries cannot be decorrelated if join condition contains RexFieldAccess</a>. */
+  @Test void testJoinConditionContainsRexFieldAccess() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = ""
+        + "SELECT E1.* \n"
+        + "FROM\n"
+        + "  EMP E1\n"
+        + "WHERE\n"
+        + "  E1.EMPNO = (\n"
+        + "    SELECT D1.DEPTNO FROM DEPT D1\n"
+        + "    WHERE E1.ENAME IN (SELECT B1.ENAME FROM BONUS B1))";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7])\n"
+        + "  LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7])\n"
+        + "    LogicalFilter(condition=[=($0, CAST($8):SMALLINT)])\n"
+        + "      LogicalCorrelate(correlation=[$cor0], joinType=[left], requiredColumns=[{1}])\n"
+        + "        LogicalTableScan(table=[[scott, EMP]])\n"
+        + "        LogicalAggregate(group=[{}], agg#0=[SINGLE_VALUE($0)])\n"
+        + "          LogicalProject(DEPTNO=[$0])\n"
+        + "            LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2])\n"
+        + "              LogicalJoin(condition=[=($cor0.ENAME, $3)], joinType=[inner])\n"
+        + "                LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "                LogicalProject(ENAME=[$0])\n"
+        + "                  LogicalTableScan(table=[[scott, BONUS]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    final String planAfter = ""
+        + "LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7])\n"
+        + "  LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7], ENAME0=[$8], $f1=[CAST($9):TINYINT])\n"
+        + "    LogicalJoin(condition=[AND(=($1, $8), =($0, CAST($9):SMALLINT))], joinType=[inner])\n"
+        + "      LogicalTableScan(table=[[scott, EMP]])\n"
+        + "      LogicalAggregate(group=[{0}], agg#0=[SINGLE_VALUE($1)])\n"
+        + "        LogicalProject(ENAME=[$3], DEPTNO=[$0])\n"
+        + "          LogicalJoin(condition=[=($3, $4)], joinType=[inner])\n"
+        + "            LogicalJoin(condition=[true], joinType=[inner])\n"
+        + "              LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "              LogicalProject(ENAME=[$1])\n"
+        + "                LogicalTableScan(table=[[scott, EMP]])\n"
+        + "            LogicalProject(ENAME=[$0])\n"
+        + "              LogicalTableScan(table=[[scott, BONUS]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7379">[CALCITE-7379]
+   * LHS correlated variables are shadowed by nullable RHS outputs in LEFT JOIN</a>. */
+  @Test void testDecorrelateLeftJoinCorVarShadowing() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = ""
+        + "WITH\n"
+        + "  t1(a, b, c) AS (VALUES (2, 2, 2), (3, 3, 3), (4, 4, 4)),\n"
+        + "  t2(a, b, c) AS (VALUES (1, 1, 1), (3, 3, 3), (4, 4, 4)),\n"
+        + "  t3(a, b, c) AS (VALUES (1, 1, 1), (2, 2, 2), (4, 4, 4))\n"
+        + "SELECT * FROM t1 WHERE EXISTS (\n"
+        + "SELECT * FROM t2\n"
+        + "LEFT JOIN\n"
+        + "(SELECT * FROM t3 WHERE t3.a = t1.a) foo\n"
+        + "ON t2.a = foo.a)";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalProject(A=[$0], B=[$1], C=[$2])\n"
+        + "  LogicalProject(EXPR$0=[$0], EXPR$1=[$1], EXPR$2=[$2])\n"
+        + "    LogicalCorrelate(correlation=[$cor0], joinType=[inner], requiredColumns=[{0}])\n"
+        + "      LogicalValues(tuples=[[{ 2, 2, 2 }, { 3, 3, 3 }, { 4, 4, 4 }]])\n"
+        + "      LogicalAggregate(group=[{0}])\n"
+        + "        LogicalProject(i=[true])\n"
+        + "          LogicalJoin(condition=[=($0, $3)], joinType=[left])\n"
+        + "            LogicalValues(tuples=[[{ 1, 1, 1 }, { 3, 3, 3 }, { 4, 4, 4 }]])\n"
+        + "            LogicalProject(A=[$0], B=[$1], C=[$2])\n"
+        + "              LogicalFilter(condition=[=($0, $cor0.A)])\n"
+        + "                LogicalValues(tuples=[[{ 1, 1, 1 }, { 2, 2, 2 }, { 4, 4, 4 }]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    // The plan before fix:
+    //
+    // LogicalProject(A=[$0], B=[$1], C=[$2])
+    //  LogicalJoin(condition=[IS NOT DISTINCT FROM($0, $3)], joinType=[inner])
+    //    LogicalValues(tuples=[[{ 2, 2, 2 }, { 3, 3, 3 }, { 4, 4, 4 }]])
+    //    LogicalProject(EXPR$00=[$0], $f1=[true])
+    //      LogicalAggregate(group=[{0}])
+    //        LogicalProject(EXPR$00=[$6])
+    //          LogicalJoin(condition=[=($0, $3)], joinType=[left])
+    //            LogicalValues(tuples=[[{ 1, 1, 1 }, { 3, 3, 3 }, { 4, 4, 4 }]])
+    //            LogicalProject(A=[$0], B=[$1], C=[$2], EXPR$0=[$0])
+    //              LogicalValues(tuples=[[{ 1, 1, 1 }, { 2, 2, 2 }, { 4, 4, 4 }]])
+    final String planAfter = ""
+        + "LogicalProject(A=[$0], B=[$1], C=[$2])\n"
+        + "  LogicalJoin(condition=[=($0, $3)], joinType=[inner])\n"
+        + "    LogicalValues(tuples=[[{ 2, 2, 2 }, { 3, 3, 3 }, { 4, 4, 4 }]])\n"
+        + "    LogicalProject(EXPR$00=[$0], $f1=[true])\n"
+        + "      LogicalAggregate(group=[{0}])\n"
+        + "        LogicalProject(EXPR$00=[$3])\n"
+        + "          LogicalJoin(condition=[AND(=($0, $4), IS NOT DISTINCT FROM($3, $7))], joinType=[left])\n"
+        + "            LogicalJoin(condition=[true], joinType=[inner])\n"
+        + "              LogicalValues(tuples=[[{ 1, 1, 1 }, { 3, 3, 3 }, { 4, 4, 4 }]])\n"
+        + "              LogicalProject(EXPR$0=[$0])\n"
+        + "                LogicalValues(tuples=[[{ 2, 2, 2 }, { 3, 3, 3 }, { 4, 4, 4 }]])\n"
+        + "            LogicalProject(A=[$0], B=[$1], C=[$2], EXPR$0=[$0])\n"
+        + "              LogicalValues(tuples=[[{ 1, 1, 1 }, { 2, 2, 2 }, { 4, 4, 4 }]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7379">[CALCITE-7379]
+   * LHS correlated variables are shadowed by nullable RHS outputs in LEFT JOIN</a>. */
+  @Test void testDecorrelateFullJoinCorVarShadowing() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = ""
+        + "SELECT\n"
+        + "    d.dname,\n"
+        + "    (SELECT COUNT(sub.empno)\n"
+        + "        FROM (\n"
+        + "            SELECT * FROM emp e2 WHERE e2.deptno = d.deptno\n"
+        + "        ) sub\n"
+        + "        FULL JOIN emp e\n"
+        + "        ON sub.mgr = e.mgr\n"
+        + "    ) as matched_subordinate_count\n"
+        + "FROM dept d";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalProject(DNAME=[$1], MATCHED_SUBORDINATE_COUNT=[$3])\n"
+        + "  LogicalCorrelate(correlation=[$cor0], joinType=[left], requiredColumns=[{0}])\n"
+        + "    LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "    LogicalAggregate(group=[{}], EXPR$0=[COUNT($0)])\n"
+        + "      LogicalProject(EMPNO=[$0])\n"
+        + "        LogicalJoin(condition=[=($3, $11)], joinType=[full])\n"
+        + "          LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7])\n"
+        + "            LogicalFilter(condition=[=($7, $cor0.DEPTNO)])\n"
+        + "              LogicalTableScan(table=[[scott, EMP]])\n"
+        + "          LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    final String planAfter = ""
+        + "LogicalProject(DNAME=[$1], MATCHED_SUBORDINATE_COUNT=[$4])\n"
+        + "  LogicalJoin(condition=[=($0, $3)], joinType=[left])\n"
+        + "    LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "    LogicalProject(_cor_$cor0_0=[$0], EXPR$0=[CASE(IS NOT NULL($2), $2, 0)])\n"
+        + "      LogicalJoin(condition=[IS NOT DISTINCT FROM($0, $1)], joinType=[left])\n"
+        + "        LogicalProject(DEPTNO=[$0])\n"
+        + "          LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "        LogicalAggregate(group=[{0}], EXPR$0=[COUNT($1)])\n"
+        + "          LogicalProject(_cor_$cor0_0=[COALESCE($8, $17)], EMPNO=[$0])\n"
+        + "            LogicalJoin(condition=[AND(=($3, $12), IS NOT DISTINCT FROM($8, $17))], joinType=[full])\n"
+        + "              LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7], DEPTNO8=[$7])\n"
+        + "                LogicalFilter(condition=[IS NOT NULL($7)])\n"
+        + "                  LogicalTableScan(table=[[scott, EMP]])\n"
+        + "              LogicalJoin(condition=[true], joinType=[inner])\n"
+        + "                LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                LogicalProject(DEPTNO=[$0])\n"
+        + "                  LogicalTableScan(table=[[scott, DEPT]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7698">[CALCITE-7698]</a>;
+    * RelDecorrelator throws AssertionError when decorrelating
+   * a correlated sub-query with outer join. */
+  @Test void testExistsWithCorrelatedOnWhereLeftJoin() {
+    final String sql = "WITH l(a, b, c) AS (VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3)),\n"
+        + "  r(d, e, f) AS (VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3)),\n"
+        + "  t(i, j, k) AS (VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3))\n"
+        + "SELECT * FROM l WHERE EXISTS (\n"
+        + "  SELECT * FROM (SELECT f FROM r WHERE r.d = l.a AND r.e > 10) r1\n"
+        + "  LEFT JOIN (SELECT i, k FROM t WHERE t.j = l.b AND i < 50) t1 ON r1.f = t1.k)";
+    final String planAfter = ""
+        + "LogicalProject(A=[$0], B=[$1], C=[$2])\n"
+        + "  LogicalJoin(condition=[AND(=($0, $3), =($1, $4))], joinType=[inner])\n"
+        + "    LogicalValues(tuples=[[{ 1, 1, 1 }, { 2, 2, 2 }, { 3, 3, 3 }]])\n"
+        + "    LogicalProject(EXPR$0=[$1], EXPR$1=[$2], $f2=[true])\n"
+        + "      LogicalJoin(condition=[AND(=($0, $4), IS NOT DISTINCT FROM($2, $5))], joinType=[left])\n"
+        + "        LogicalJoin(condition=[true], joinType=[inner])\n"
+        + "          LogicalProject(F=[$2], EXPR$0=[$0])\n"
+        + "            LogicalFilter(condition=[>($1, 10)])\n"
+        + "              LogicalValues(tuples=[[{ 1, 1, 1 }, { 2, 2, 2 }, { 3, 3, 3 }]])\n"
+        + "          LogicalProject(EXPR$1=[$1])\n"
+        + "            LogicalValues(tuples=[[{ 1, 1, 1 }, { 2, 2, 2 }, { 3, 3, 3 }]])\n"
+        + "        LogicalProject(I=[$0], K=[$2], EXPR$1=[$1])\n"
+        + "          LogicalFilter(condition=[<($0, 50)])\n"
+        + "            LogicalValues(tuples=[[{ 1, 1, 1 }, { 2, 2, 2 }, { 3, 3, 3 }]])\n";
+    assertThat(decorrelateSql(sql), hasTree(planAfter));
+  }
+
+  private RelNode decorrelateSql(String sql) {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true, requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    return RelDecorrelator.decorrelateQuery(before, builder,
+        RuleSets.ofList(Collections.emptyList()), RuleSets.ofList(Collections.emptyList()));
+  }
+
+  /**
+   * Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7661">[CALCITE-7661]
+   * RelDecorrelator loses shared correlation constraint across inner join inputs</a>.
+   */
+  @Test void testDecorrelateInnerJoinWithSharedCorrelation() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = ""
+        + "SELECT d.deptno FROM dept d WHERE EXISTS (\n"
+        + "  SELECT *\n"
+        + "  FROM (SELECT * FROM emp e WHERE e.deptno = d.deptno) l\n"
+        + "  JOIN (SELECT * FROM dept d2 WHERE d2.deptno = d.deptno) r\n"
+        + "  ON TRUE)";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalProject(DEPTNO=[$0])\n"
+        + "  LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2])\n"
+        + "    LogicalCorrelate(correlation=[$cor0], joinType=[inner], requiredColumns=[{0}])\n"
+        + "      LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "      LogicalAggregate(group=[{0}])\n"
+        + "        LogicalProject(i=[true])\n"
+        + "          LogicalJoin(condition=[true], joinType=[inner])\n"
+        + "            LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], "
+        + "HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7])\n"
+        + "              LogicalFilter(condition=[=($7, $cor0.DEPTNO)])\n"
+        + "                LogicalTableScan(table=[[scott, EMP]])\n"
+        + "            LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2])\n"
+        + "              LogicalFilter(condition=[=($0, $cor0.DEPTNO)])\n"
+        + "                LogicalTableScan(table=[[scott, DEPT]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Without the shared-carrier condition, the inner join becomes
+    // LogicalJoin(condition=[true]) and can join an employee to a different
+    // department.
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    final String planAfter = ""
+        + "LogicalProject(DEPTNO=[$0])\n"
+        + "  LogicalJoin(condition=[=($0, $3)], joinType=[inner])\n"
+        + "    LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "    LogicalProject(DEPTNO3=[$0], $f1=[true])\n"
+        + "      LogicalAggregate(group=[{0}])\n"
+        + "        LogicalProject(DEPTNO3=[$12])\n"
+        + "          LogicalJoin(condition=[IS NOT DISTINCT FROM($8, $12)], joinType=[inner])\n"
+        + "            LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], "
+        + "HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7], DEPTNO8=[$7])\n"
+        + "              LogicalFilter(condition=[IS NOT NULL($7)])\n"
+        + "                LogicalTableScan(table=[[scott, EMP]])\n"
+        + "            LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2], DEPTNO3=[$0])\n"
+        + "              LogicalTableScan(table=[[scott, DEPT]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-5390">[CALCITE-5390]
+   * RelDecorrelator throws NullPointerException</a>. */
+  @Test void testCorrelationLexicalScoping() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = ""
+        + "select deptno,\n"
+        + "  (select min(1) from emp where empno > d.deptno) as i0,\n"
+        + "  (select min(0) from emp where deptno = d.deptno and "
+        + "ename = 'SMITH' and d.deptno > 0) as i1\n"
+        + "from dept as d";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalProject(DEPTNO=[$0], I0=[$3], I1=[$4])\n"
+        + "  LogicalCorrelate(correlation=[$cor0], joinType=[left], requiredColumns=[{0}])\n"
+        + "    LogicalCorrelate(correlation=[$cor0], joinType=[left], requiredColumns=[{0}])\n"
+        + "      LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "      LogicalAggregate(group=[{}], EXPR$0=[MIN($0)])\n"
+        + "        LogicalProject($f0=[1])\n"
+        + "          LogicalFilter(condition=[>($0, CAST($cor0.DEPTNO):SMALLINT NOT NULL)])\n"
+        + "            LogicalTableScan(table=[[scott, EMP]])\n"
+        + "    LogicalAggregate(group=[{}], EXPR$0=[MIN($0)])\n"
+        + "      LogicalProject($f0=[0])\n"
+        + "        LogicalFilter(condition=[AND(=($7, $cor0.DEPTNO), =($1, 'SMITH'), >(CAST($cor0.DEPTNO):INTEGER NOT NULL, 0))])\n"
+        + "          LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    final String planAfter = ""
+        + "LogicalProject(DEPTNO=[$0], I0=[$3], I1=[$7])\n"
+        + "  LogicalJoin(condition=[AND(=($0, $5), =($4, $6))], joinType=[left])\n"
+        + "    LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2], EXPR$0=[$5], $f4=[>(CAST($0):INTEGER NOT NULL, 0)])\n"
+        + "      LogicalJoin(condition=[=($3, $4)], joinType=[left])\n"
+        + "        LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2], DEPTNO0=[CAST($0):SMALLINT NOT NULL])\n"
+        + "          LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "        LogicalAggregate(group=[{0}], EXPR$0=[MIN($1)])\n"
+        + "          LogicalProject(DEPTNO0=[$8], $f0=[1])\n"
+        + "            LogicalJoin(condition=[>($0, $8)], joinType=[inner])\n"
+        + "              LogicalTableScan(table=[[scott, EMP]])\n"
+        + "              LogicalAggregate(group=[{0}])\n"
+        + "                LogicalProject(DEPTNO0=[CAST($0):SMALLINT NOT NULL])\n"
+        + "                  LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "    LogicalAggregate(group=[{0, 1}], EXPR$0=[MIN($2)])\n"
+        + "      LogicalProject(DEPTNO0=[$8], $f4=[$9], $f0=[0])\n"
+        + "        LogicalJoin(condition=[=($7, $8)], joinType=[inner])\n"
+        + "          LogicalFilter(condition=[=($1, 'SMITH')])\n"
+        + "            LogicalTableScan(table=[[scott, EMP]])\n"
+        + "          LogicalFilter(condition=[$1])\n"
+        + "            LogicalProject(DEPTNO=[$0], $f4=[>(CAST($0):INTEGER NOT NULL, 0)])\n"
+        + "              LogicalJoin(condition=[=($3, $4)], joinType=[left])\n"
+        + "                LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2], DEPTNO0=[CAST($0):SMALLINT NOT NULL])\n"
+        + "                  LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "                LogicalAggregate(group=[{0}], EXPR$0=[MIN($1)])\n"
+        + "                  LogicalProject(DEPTNO0=[$8], $f0=[1])\n"
+        + "                    LogicalJoin(condition=[>($0, $8)], joinType=[inner])\n"
+        + "                      LogicalTableScan(table=[[scott, EMP]])\n"
+        + "                      LogicalAggregate(group=[{0}])\n"
+        + "                        LogicalProject(DEPTNO0=[CAST($0):SMALLINT NOT NULL])\n"
+        + "                          LogicalTableScan(table=[[scott, DEPT]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7320">[CALCITE-7320]
+   * AggregateProjectMergeRule throws AssertionError when Project maps multiple grouping keys
+   * to the same field</a>. */
+  @Test void test7320() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = ""
+        + "SELECT deptno,\n"
+        + "       (SELECT SUM(cnt)\n"
+        + "        FROM (\n"
+        + "          SELECT COUNT(*) AS cnt\n"
+        + "          FROM emp\n"
+        + "          WHERE emp.deptno = dept.deptno\n"
+        + "          GROUP BY GROUPING SETS ((deptno), ())\n"
+        + "))\n"
+        + "FROM dept";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalProject(DEPTNO=[$0], EXPR$1=[$3])\n"
+        + "  LogicalCorrelate(correlation=[$cor0], joinType=[left], requiredColumns=[{0}])\n"
+        + "    LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "    LogicalAggregate(group=[{}], EXPR$0=[SUM($0)])\n"
+        + "      LogicalProject(CNT=[$1])\n"
+        + "        LogicalAggregate(group=[{0}], groups=[[{0}, {}]], CNT=[COUNT()])\n"
+        + "          LogicalProject(DEPTNO=[$7])\n"
+        + "            LogicalFilter(condition=[=($7, $cor0.DEPTNO)])\n"
+        + "              LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    final String planAfter = ""
+        + "LogicalProject(DEPTNO=[$0], EXPR$1=[$4])\n"
+        + "  LogicalJoin(condition=[=($0, $3)], joinType=[left])\n"
+        + "    LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "    LogicalAggregate(group=[{0}], EXPR$0=[SUM($1)])\n"
+        + "      LogicalProject(DEPTNO1=[$0], CNT=[CASE(IS NOT NULL($3), $3, 0)])\n"
+        + "        LogicalJoin(condition=[IS NOT DISTINCT FROM($0, $2)], joinType=[left])\n"
+        + "          LogicalProject(DEPTNO=[$0])\n"
+        + "            LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "          LogicalAggregate(group=[{0, 1}], groups=[[{0, 1}, {1}]], CNT=[COUNT()])\n"
+        + "            LogicalProject(DEPTNO=[$7], DEPTNO1=[$7])\n"
+        + "              LogicalFilter(condition=[IS NOT NULL($7)])\n"
+        + "                LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7540">[CALCITE-7540]
+   * Correlated outer reference in HAVING of grouped subquery is incorrectly reported as not
+   * grouped</a>. */
+  @Test void test7540() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = ""
+        + "SELECT *\n"
+        + "FROM dept d\n"
+        + "INNER JOIN emp e\n"
+        + "  ON e.sal < (\n"
+        + "    SELECT MAX(e2.sal)\n"
+        + "    FROM emp e2\n"
+        + "    WHERE e2.job = e.job\n"
+        + "    GROUP BY e2.job\n"
+        + "    HAVING MIN(e2.deptno) = d.deptno\n"
+        + "  )";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                // SubQuery program rules
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+    final String planBefore = ""
+        + "LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2], EMPNO=[$3], ENAME=[$4], JOB=[$5], MGR=[$6], HIREDATE=[$7], SAL=[$8], COMM=[$9], DEPTNO0=[$10])\n"
+        + "  LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2], EMPNO=[$3], ENAME=[$4], JOB=[$5], MGR=[$6], HIREDATE=[$7], SAL=[$8], COMM=[$9], DEPTNO0=[$10])\n"
+        + "    LogicalFilter(condition=[<($8, $11)])\n"
+        + "      LogicalCorrelate(correlation=[$cor1], joinType=[left], requiredColumns=[{0, 5}])\n"
+        + "        LogicalJoin(condition=[true], joinType=[inner])\n"
+        + "          LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "          LogicalTableScan(table=[[scott, EMP]])\n"
+        + "        LogicalAggregate(group=[{}], agg#0=[SINGLE_VALUE($0)])\n"
+        + "          LogicalProject(EXPR$0=[$1])\n"
+        + "            LogicalFilter(condition=[=($2, $cor1.DEPTNO)])\n"
+        + "              LogicalAggregate(group=[{0}], EXPR$0=[MAX($1)], agg#1=[MIN($2)])\n"
+        + "                LogicalProject(JOB=[$2], SAL=[$5], DEPTNO=[$7])\n"
+        + "                  LogicalFilter(condition=[=($2, $cor1.JOB)])\n"
+        + "                    LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+    final String planAfter = ""
+        + "LogicalProject(DEPTNO=[$0], DNAME=[$1], LOC=[$2], EMPNO=[$3], ENAME=[$4], JOB=[$5], MGR=[$6], HIREDATE=[$7], SAL=[$8], COMM=[$9], DEPTNO0=[$10])\n"
+        + "  LogicalJoin(condition=[AND(=($0, $11), =($5, $12), <($8, $13))], joinType=[inner])\n"
+        + "    LogicalJoin(condition=[true], joinType=[inner])\n"
+        + "      LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "      LogicalTableScan(table=[[scott, EMP]])\n"
+        + "    LogicalAggregate(group=[{0, 1}], agg#0=[SINGLE_VALUE($2)])\n"
+        + "      LogicalProject($f3=[$3], JOB3=[$1], EXPR$0=[$2])\n"
+        + "        LogicalFilter(condition=[IS NOT NULL($3)])\n"
+        + "          LogicalAggregate(group=[{0, 1}], EXPR$0=[MAX($2)], agg#1=[MIN($3)])\n"
+        + "            LogicalProject(JOB=[$2], JOB3=[$2], SAL=[$5], DEPTNO=[$7])\n"
+        + "              LogicalFilter(condition=[IS NOT NULL($2)])\n"
+        + "                LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7442">[CALCITE-7442]
+  * Getting Wrong index of Correlated variable inside Subquery after FilterJoinRule</a>. */
+  @Test void testCorrelatedVariableIndexForInClause() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = "select e.empno, d.dname, b.ename\n"
+        + "from emp e\n"
+        + "inner join dept d\n"
+        + "  on d.deptno = e.deptno\n"
+        + "inner join bonus b\n"
+        + "  on e.ename = b.ename\n"
+        + "  and b.job in (\n"
+        + "    select b2.job\n"
+        + "    from bonus b2\n"
+        + "    where b2.ename = b.ename)\n"
+        + "where e.sal > 1000 and d.dname = 'SALES'";
+
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(ImmutableList.of(CoreRules.FILTER_INTO_JOIN))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode afterFilterIntoJoin =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+
+    final String planAfterFilterIntoJoin = "LogicalProject(EMPNO=[$0], DNAME=[$9], ENAME=[$11])\n"
+        + "  LogicalJoin(condition=[AND(=($1, $11), IN($12, {\n"
+        + "LogicalProject(JOB=[$1])\n"
+        + "  LogicalFilter(condition=[=($0, $cor0.ENAME0)])\n"
+        + "    LogicalTableScan(table=[[scott, BONUS]])\n"
+        + "}))], joinType=[inner], variablesSet=[[$cor0]])\n"
+        + "    LogicalJoin(condition=[=($8, $7)], joinType=[inner])\n"
+        + "      LogicalFilter(condition=[>(CAST($5):DECIMAL(12, 2), 1000.00)])\n"
+        + "        LogicalTableScan(table=[[scott, EMP]])\n"
+        + "      LogicalFilter(condition=[=($1, 'SALES')])\n"
+        + "        LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "    LogicalTableScan(table=[[scott, BONUS]])\n";
+    assertThat(afterFilterIntoJoin, hasTree(planAfterFilterIntoJoin));
+
+    final HepProgram hepProgram1 = HepProgram.builder()
+        .addRuleCollection(ImmutableList.of(CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program1 =
+        Programs.of(hepProgram1, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode afterJoinSubqueryCorrelate =
+        program1.run(cluster.getPlanner(), afterFilterIntoJoin, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+
+    final String planAfterJoinSubqueryCorrelate =
+        "LogicalProject(EMPNO=[$0], DNAME=[$9], ENAME=[$11])\n"
+            + "  LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4],"
+            + " SAL=[$5], COMM=[$6], DEPTNO=[$7], DEPTNO0=[$8], DNAME=[$9], LOC=[$10],"
+            + " ENAME0=[$11], JOB0=[$12], SAL0=[$13], COMM0=[$14])\n"
+            + "    LogicalJoin(condition=[=($1, $11)], joinType=[inner])\n"
+            + "      LogicalJoin(condition=[=($8, $7)], joinType=[inner])\n"
+            + "        LogicalFilter(condition=[>(CAST($5):DECIMAL(12, 2), 1000.00)])\n"
+            + "          LogicalTableScan(table=[[scott, EMP]])\n"
+            + "        LogicalFilter(condition=[=($1, 'SALES')])\n"
+            + "          LogicalTableScan(table=[[scott, DEPT]])\n"
+            + "      LogicalFilter(condition=[=($1, $4)])\n"
+            + "        LogicalCorrelate(correlation=[$cor0], joinType=[inner],"
+            + " requiredColumns=[{0}])\n"
+            + "          LogicalTableScan(table=[[scott, BONUS]])\n"
+            + "          LogicalProject(JOB=[$1])\n"
+            + "            LogicalFilter(condition=[=($0, $cor0.ENAME)])\n"
+            + "              LogicalTableScan(table=[[scott, BONUS]])\n";
+    assertThat(afterJoinSubqueryCorrelate, hasTree(planAfterJoinSubqueryCorrelate));
+
+    final RelNode afterDecorrelation =
+        RelDecorrelator.decorrelateQuery(afterJoinSubqueryCorrelate, builder,
+            RuleSets.ofList(Collections.emptyList()), RuleSets.ofList(Collections.emptyList()));
+    final String planAfterDecorrelation = "LogicalProject(EMPNO=[$0], DNAME=[$9], ENAME=[$11])\n"
+        + "  LogicalJoin(condition=[=($1, $11)], joinType=[inner])\n"
+        + "    LogicalJoin(condition=[=($8, $7)], joinType=[inner])\n"
+        + "      LogicalFilter(condition=[>(CAST($5):DECIMAL(12, 2), 1000.00)])\n"
+        + "        LogicalTableScan(table=[[scott, EMP]])\n"
+        + "      LogicalFilter(condition=[=($1, 'SALES')])\n"
+        + "        LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "    LogicalJoin(condition=[AND(=($0, $5), =($1, $4))], joinType=[inner])\n"
+        + "      LogicalTableScan(table=[[scott, BONUS]])\n"
+        + "      LogicalProject(JOB=[$1], ENAME=[$0])\n"
+        + "        LogicalFilter(condition=[IS NOT NULL($0)])\n"
+        + "          LogicalTableScan(table=[[scott, BONUS]])\n";
+    assertThat(afterDecorrelation, hasTree(planAfterDecorrelation));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7442">[CALCITE-7442]
+  * Getting Wrong index of Correlated variable inside Subquery after FilterJoinRule</a>.
+  * Same as {@link #testCorrelatedVariableIndexForInClause()} but uses EXISTS
+  * instead of IN. */
+  @Test void testCorrelatedVariableIndexForExistsClause() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = "select e.empno, d.dname, b.ename\n"
+        + "from emp e\n"
+        + "inner join dept d\n"
+        + "  on d.deptno = e.deptno\n"
+        + "inner join bonus b\n"
+        + "  on e.ename = b.ename\n"
+        + "  and exists (\n"
+        + "    select b2.job\n"
+        + "    from bonus b2\n"
+        + "    where b2.ename = b.ename\n"
+        + "    and b2.job = b.job)\n"
+        + "where e.sal > 1000 and d.dname = 'SALES'";
+
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(ImmutableList.of(CoreRules.FILTER_INTO_JOIN))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode afterFilterIntoJoin =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+
+    final String planAfterFilterIntoJoin = "LogicalProject(EMPNO=[$0], DNAME=[$9], ENAME=[$11])\n"
+        + "  LogicalJoin(condition=[AND(=($1, $11), EXISTS({\n"
+        + "LogicalFilter(condition=[AND(=($0, $cor0.ENAME0), =($1, $cor0.JOB0))])\n"
+        + "  LogicalTableScan(table=[[scott, BONUS]])\n"
+        + "}))], joinType=[inner], variablesSet=[[$cor0]])\n"
+        + "    LogicalJoin(condition=[=($8, $7)], joinType=[inner])\n"
+        + "      LogicalFilter(condition=[>(CAST($5):DECIMAL(12, 2), 1000.00)])\n"
+        + "        LogicalTableScan(table=[[scott, EMP]])\n"
+        + "      LogicalFilter(condition=[=($1, 'SALES')])\n"
+        + "        LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "    LogicalTableScan(table=[[scott, BONUS]])\n";
+    assertThat(afterFilterIntoJoin, hasTree(planAfterFilterIntoJoin));
+
+    final HepProgram hepProgram1 = HepProgram.builder()
+        .addRuleCollection(ImmutableList.of(CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program1 =
+        Programs.of(hepProgram1, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode afterJoinSubqueryCorrelate =
+        program1.run(cluster.getPlanner(), afterFilterIntoJoin, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+
+    final String planAfterJoinSubqueryCorrelate =
+        "LogicalProject(EMPNO=[$0], DNAME=[$9], ENAME=[$11])\n"
+            + "  LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4],"
+            + " SAL=[$5], COMM=[$6], DEPTNO=[$7], DEPTNO0=[$8], DNAME=[$9], LOC=[$10],"
+            + " ENAME0=[$11], JOB0=[$12], SAL0=[$13], COMM0=[$14])\n"
+            + "    LogicalJoin(condition=[=($1, $11)], joinType=[inner])\n"
+            + "      LogicalJoin(condition=[=($8, $7)], joinType=[inner])\n"
+            + "        LogicalFilter(condition=[>(CAST($5):DECIMAL(12, 2), 1000.00)])\n"
+            + "          LogicalTableScan(table=[[scott, EMP]])\n"
+            + "        LogicalFilter(condition=[=($1, 'SALES')])\n"
+            + "          LogicalTableScan(table=[[scott, DEPT]])\n"
+            + "      LogicalCorrelate(correlation=[$cor0], joinType=[inner], "
+            + "requiredColumns=[{0, 1}])\n"
+            + "        LogicalTableScan(table=[[scott, BONUS]])\n"
+            + "        LogicalAggregate(group=[{0}])\n"
+            + "          LogicalProject(i=[true])\n"
+            + "            LogicalFilter(condition=[AND(=($0, $cor0.ENAME), =($1, $cor0.JOB))])\n"
+            + "              LogicalTableScan(table=[[scott, BONUS]])\n";
+    assertThat(afterJoinSubqueryCorrelate, hasTree(planAfterJoinSubqueryCorrelate));
+
+    final RelNode afterDecorrelation =
+        RelDecorrelator.decorrelateQuery(afterJoinSubqueryCorrelate, builder,
+            RuleSets.ofList(Collections.emptyList()), RuleSets.ofList(Collections.emptyList()));
+    final String planAfterDecorrelation = "LogicalProject(EMPNO=[$0], DNAME=[$9], ENAME=[$11])\n"
+        + "  LogicalJoin(condition=[=($1, $11)], joinType=[inner])\n"
+        + "    LogicalJoin(condition=[=($8, $7)], joinType=[inner])\n"
+        + "      LogicalFilter(condition=[>(CAST($5):DECIMAL(12, 2), 1000.00)])\n"
+        + "        LogicalTableScan(table=[[scott, EMP]])\n"
+        + "      LogicalFilter(condition=[=($1, 'SALES')])\n"
+        + "        LogicalTableScan(table=[[scott, DEPT]])\n"
+        + "    LogicalJoin(condition=[AND(=($0, $4), =($1, $5))], joinType=[inner])\n"
+        + "      LogicalTableScan(table=[[scott, BONUS]])\n"
+        + "      LogicalProject(ENAME=[$0], JOB=[$1], $f2=[true])\n"
+        + "        LogicalFilter(condition=[AND(IS NOT NULL($0), IS NOT NULL($1))])\n"
+        + "          LogicalTableScan(table=[[scott, BONUS]])\n";
+    assertThat(afterDecorrelation, hasTree(planAfterDecorrelation));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7442">[CALCITE-7442]
+   * Getting Wrong index of Correlated variable inside Subquery after FilterJoinRule</a>.
+   * Same as {@link #testCorrelatedVariableIndexForInClause()} EXISTS edge case */
+  @Test void testCorrelatedVariableIndexForExistsClause2() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    final String sql = "select e1.empno \n"
+        + "from emp e1, \n"
+        + "lateral(\n"
+        + "  select d.deptno \n"
+        + "  from emp e2 inner join dept d \n"
+        + "  on exists(\n"
+        + "    select e3.empno from emp e3 where e3.empno = e2.empno and e3.ename = e1.ename\n"
+        + "  )\n"
+        + ")";
+
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(ImmutableList.of(CoreRules.JOIN_CONDITION_PUSH))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode afterJoinConditionPush =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+
+    final String planAfterJoinConditionPush = "LogicalProject(EMPNO=[$0])\n"
+        + "  LogicalCorrelate(correlation=[$cor1], joinType=[inner], requiredColumns=[{1}])\n"
+        + "    LogicalTableScan(table=[[scott, EMP]])\n"
+        + "    LogicalProject(DEPTNO=[$8])\n"
+        + "      LogicalJoin(condition=[EXISTS({\n"
+        + "LogicalFilter(condition=[AND(=($0, $cor0.EMPNO), =($1, $cor1.ENAME))])\n"
+        + "  LogicalTableScan(table=[[scott, EMP]])\n"
+        + "})], joinType=[inner], variablesSet=[[$cor0]])\n"
+        + "        LogicalTableScan(table=[[scott, EMP]])\n"
+        + "        LogicalTableScan(table=[[scott, DEPT]])\n";
+    assertThat(afterJoinConditionPush, hasTree(planAfterJoinConditionPush));
+
+    final HepProgram hepProgram1 = HepProgram.builder()
+        .addRuleCollection(ImmutableList.of(CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program1 =
+        Programs.of(hepProgram1, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode afterJoinSubqueryCorrelate =
+        program1.run(cluster.getPlanner(), afterJoinConditionPush, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+
+    final String planAfterJoinSubqueryCorrelate = "LogicalProject(EMPNO=[$0])\n"
+        + "  LogicalCorrelate(correlation=[$cor1], joinType=[inner], requiredColumns=[{1}])\n"
+        + "    LogicalTableScan(table=[[scott, EMP]])\n"
+        + "    LogicalProject(DEPTNO=[$8])\n"
+        + "      LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4],"
+        + " SAL=[$5], COMM=[$6], DEPTNO=[$7], DEPTNO0=[$9], DNAME=[$10], LOC=[$11])\n"
+        + "        LogicalJoin(condition=[true], joinType=[inner])\n"
+        + "          LogicalCorrelate(correlation=[$cor0], joinType=[inner], requiredColumns=[{0}])\n"
+        + "            LogicalTableScan(table=[[scott, EMP]])\n"
+        + "            LogicalAggregate(group=[{0}])\n"
+        + "              LogicalProject(i=[true])\n"
+        + "                LogicalFilter(condition=[AND(=($0, $cor0.EMPNO), =($1, $cor1.ENAME))])\n"
+        + "                  LogicalTableScan(table=[[scott, EMP]])\n"
+        + "          LogicalTableScan(table=[[scott, DEPT]])\n";
+    assertThat(afterJoinSubqueryCorrelate, hasTree(planAfterJoinSubqueryCorrelate));
+
+    final RelNode afterDecorrelation =
+        RelDecorrelator.decorrelateQuery(afterJoinSubqueryCorrelate, builder,
+            RuleSets.ofList(Collections.emptyList()), RuleSets.ofList(Collections.emptyList()));
+    final String planAfterDecorrelation = "LogicalProject(EMPNO=[$0])\n"
+        + "  LogicalJoin(condition=[=($1, $9)], joinType=[inner])\n"
+        + "    LogicalTableScan(table=[[scott, EMP]])\n"
+        + "    LogicalProject(DEPTNO=[$11], ENAME0=[$9])\n"
+        + "      LogicalJoin(condition=[true], joinType=[inner])\n"
+        + "        LogicalJoin(condition=[=($0, $8)], joinType=[inner])\n"
+        + "          LogicalTableScan(table=[[scott, EMP]])\n"
+        + "          LogicalProject(EMPNO=[$0], ENAME=[$1], $f2=[true])\n"
+        + "            LogicalFilter(condition=[IS NOT NULL($1)])\n"
+        + "              LogicalTableScan(table=[[scott, EMP]])\n"
+        + "        LogicalTableScan(table=[[scott, DEPT]])\n";
+    assertThat(afterDecorrelation, hasTree(planAfterDecorrelation));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7574">[CALCITE-7574]
+   * RelDecorrelator.isFieldNotNullRecursive throws IndexOutOfBoundsException
+   * when decorrelating correlated scalar subquery with Aggregate</a>.
+   *
+   * <p>When decorrelating a correlated scalar subquery containing an Aggregate,
+   * {@code isFieldNotNullRecursive} incorrectly used {@code ImmutableBitSet.size()}
+   * (which returns the bitset capacity, typically 64 * words) instead of
+   * {@code Aggregate.getGroupCount()} (which returns the number of group keys).
+   * This caused an {@code IndexOutOfBoundsException} when the field index
+   * corresponded to an aggregate result field (not a group field).
+   */
+  @Test void testDecorrelateScalarSubQueryWithAggregate() {
+    final FrameworkConfig frameworkConfig = config().build();
+    final RelBuilder builder = RelBuilder.create(frameworkConfig);
+    final RelOptCluster cluster = builder.getCluster();
+    final Planner planner = Frameworks.getPlanner(frameworkConfig);
+    // Minimal case: outer FROM is an Aggregate, correlated subquery
+    // references the aggregate result field (s) in the correlation
+    // condition, triggering isFieldNotNullRecursive on an Aggregate with
+    // an index pointing to an aggregate result field.
+    final String sql = "select t.deptno,\n"
+        + "  (select count(*) from emp e\n"
+        + "   where e.deptno = t.deptno\n"
+        + "     and e.sal > t.s)\n"
+        + "from (select deptno, sum(sal) as s\n"
+        + "      from emp group by deptno) t";
+    final RelNode originalRel;
+    try {
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      originalRel = planner.rel(validate).rel;
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+
+    final HepProgram hepProgram = HepProgram.builder()
+        .addRuleCollection(
+            ImmutableList.of(
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE))
+        .build();
+    final Program program =
+        Programs.of(hepProgram, true,
+            requireNonNull(cluster.getMetadataProvider()));
+    final RelNode before =
+        program.run(cluster.getPlanner(), originalRel, cluster.traitSet(),
+            Collections.emptyList(), Collections.emptyList());
+
+    // Before the fix, decorrelateQuery would throw:
+    // java.lang.IndexOutOfBoundsException: index out of range: 0
+    //   at org.apache.calcite.util.ImmutableBitSet.nth
+    //   at ...RelDecorrelator.isFieldNotNullRecursive
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, builder, RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+
+    // Verify decorrelation produced a valid plan (no Correlate nodes)
+    final String planAfter = ""
+        + "LogicalProject(DEPTNO=[$0], EXPR$1=[$4])\n"
+        + "  LogicalJoin(condition=[AND(IS NOT DISTINCT FROM($0, $2), IS NOT DISTINCT FROM($1, $3))], joinType=[left])\n"
+        + "    LogicalAggregate(group=[{0}], S=[SUM($1)])\n"
+        + "      LogicalProject(DEPTNO=[$7], SAL=[$5])\n"
+        + "        LogicalTableScan(table=[[scott, EMP]])\n"
+        + "    LogicalProject(DEPTNO0=[$0], S=[$1], EXPR$0=[CASE(IS NOT NULL($4), $4, 0)])\n"
+        + "      LogicalJoin(condition=[AND(IS NOT DISTINCT FROM($0, $2), IS NOT DISTINCT FROM($1, $3))], joinType=[left])\n"
+        + "        LogicalAggregate(group=[{0}], S=[SUM($1)])\n"
+        + "          LogicalProject(DEPTNO=[$7], SAL=[$5])\n"
+        + "            LogicalTableScan(table=[[scott, EMP]])\n"
+        + "        LogicalAggregate(group=[{0, 1}], EXPR$0=[COUNT()])\n"
+        + "          LogicalProject(DEPTNO0=[$8], S=[$9])\n"
+        + "            LogicalJoin(condition=[AND(=($7, $8), >(CAST($5):DECIMAL(19, 2), $9))], joinType=[inner])\n"
+        + "              LogicalTableScan(table=[[scott, EMP]])\n"
+        + "              LogicalAggregate(group=[{0}], S=[SUM($1)])\n"
+        + "                LogicalProject(DEPTNO=[$7], SAL=[$5])\n"
+        + "                  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7646">[CALCITE-7646]
+   * CorrelateProjectExtractor does not handle nested field accesses cor0.field0.field1</a>. */
+  @Test void testNestedCorrelatedFieldAccess() throws SqlParseException {
+    final String sql = "select a.\"aid\", t.lat\n"
+        + "from \"bookstore\".\"authors\" a,\n"
+        + "lateral (select b.\"aid\" as c,\n"
+        + "    (a.\"birthPlace\").\"coords\".\"latitude\" as lat\n"
+        + "  from \"bookstore\".\"authors\" b\n"
+        + "  where b.\"aid\" = a.\"aid\") as t";
+    SchemaPlus rootSchema = Frameworks.createRootSchema(true);
+    CalciteAssert.addSchema(rootSchema, CalciteAssert.SchemaSpec.BOOKSTORE);
+    CalciteConnectionConfig config = new CalciteConnectionConfigImpl(new Properties());
+    // The Frameworks planner cannot be used here because it flattens
+    // structured types, and RelStructuredTypeFlattener does not support
+    // correlations on structured columns.
+    SqlTestFactory factory = SqlTestFactory.INSTANCE
+        .withCatalogReader((typeFactory, caseSensitive) ->
+            new CalciteCatalogReader(
+                CalciteSchema.from(rootSchema),
+                ImmutableList.of("bookstore"),
+                typeFactory,
+                config));
+    SqlParser parser = factory.createParser(sql);
+    SqlNode parsed = parser.parseQuery();
+    final SqlToRelConverter sqlToRelConverter = factory.createSqlToRelConverter();
+    assert sqlToRelConverter.validator != null;
+    final SqlNode validated = sqlToRelConverter.validator.validate(parsed);
+    final RelNode before = sqlToRelConverter.convertQuery(validated, false, true).rel;
+
+    final String planBefore = ""
+        + "LogicalProject(aid=[$0], LAT=[$5])\n"
+        + "  LogicalCorrelate(correlation=[$cor1], joinType=[inner], requiredColumns=[{0, 2}])\n"
+        + "    LogicalTableScan(table=[[bookstore, authors]])\n"
+        + "    LogicalProject(C=[$0], LAT=[$cor1.birthPlace.coords.latitude])\n"
+        + "      LogicalFilter(condition=[=($0, $cor1.aid)])\n"
+        + "        LogicalTableScan(table=[[bookstore, authors]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    final RelBuilder relBuilder =
+        RelFactories.LOGICAL_BUILDER.create(before.getCluster(), null);
+    // Decorrelate without any rules, just "purely" decorrelation algorithm on RelDecorrelator
+    final RelNode after =
+        RelDecorrelator.decorrelateQuery(before, relBuilder,
+            RuleSets.ofList(Collections.emptyList()),
+            RuleSets.ofList(Collections.emptyList()));
+
+    // The nested field access is extracted into the projection $f4 on the
+    // left side and no correlation variables remain.
+    final String planAfter = ""
+        + "LogicalProject(aid=[$0], LAT=[$6])\n"
+        + "  LogicalJoin(condition=[AND(=($0, $7), IS NOT DISTINCT FROM($4, $8))], joinType=[inner])\n"
+        + "    LogicalProject(aid=[$0], name=[$1], birthPlace=[$2], books=[$3], $f4=[$2.coords.latitude])\n"
+        + "      LogicalTableScan(table=[[bookstore, authors]])\n"
+        + "    LogicalProject(C=[$0], LAT=[$4], aid=[$0], $f4=[$4])\n"
+        + "      LogicalJoin(condition=[true], joinType=[inner])\n"
+        + "        LogicalTableScan(table=[[bookstore, authors]])\n"
+        + "        LogicalAggregate(group=[{0}])\n"
+        + "          LogicalProject($f4=[$2.coords.latitude])\n"
+        + "            LogicalTableScan(table=[[bookstore, authors]])\n";
+    assertThat(after, hasTree(planAfter));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7753">[CALCITE-7753]
+   * CorrelateProjectExtractor corrupts plans with nested Correlates that reuse
+   * the same correlation id</a>. */
+  @Test void testNestedCorrelatesSharingCorrelationId() {
+    final RelBuilder builder = RelBuilder.create(config().build())
+        .transform(c -> c.withSimplify(false));
+    final Holder<@Nullable RexCorrelVariable> v = Holder.empty();
+    builder.scan("EMP").variable(v::set);
+    final RelNode emp = builder.build();
+
+    final RelNode inner = builder
+        .scan("EMP")
+        .scan("EMP")
+        .filter(builder.equals(builder.field(v.get(), "DEPTNO"), builder.field("DEPTNO")))
+        .correlate(JoinRelType.INNER, v.get().id, builder.field(2, 0, "DEPTNO"))
+        .filter(builder.isNull(builder.field(v.get(), "COMM")))
+        .build();
+
+    final RelNode before = builder
+        .push(emp)
+        .push(inner)
+        .correlate(JoinRelType.LEFT, v.get().id, builder.field(2, 0, "COMM"))
+        .build();
+    final String planBefore = ""
+        + "LogicalCorrelate(correlation=[$cor0], joinType=[left], requiredColumns=[{6}])\n"
+        + "  LogicalTableScan(table=[[scott, EMP]])\n"
+        + "  LogicalFilter(condition=[IS NULL($cor0.COMM)])\n"
+        + "    LogicalCorrelate(correlation=[$cor0], joinType=[inner], requiredColumns=[{7}])\n"
+        + "      LogicalTableScan(table=[[scott, EMP]])\n"
+        + "      LogicalFilter(condition=[=($cor0.DEPTNO, $7)])\n"
+        + "        LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(before, hasTree(planBefore));
+
+    RelDecorrelator.decorrelateQuery(before, builder,
+        RuleSets.ofList(Collections.emptyList()),
+        RuleSets.ofList(Collections.emptyList()));
   }
 }

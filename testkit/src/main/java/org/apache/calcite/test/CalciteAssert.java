@@ -137,8 +137,6 @@ import static org.apache.calcite.test.Matchers.compose;
 import static org.apache.calcite.test.Matchers.containsStringLinux;
 import static org.apache.calcite.test.Matchers.isLinux;
 
-import static org.apache.commons.lang3.StringUtils.countMatches;
-
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.hasItem;
@@ -157,6 +155,12 @@ import static java.util.Objects.requireNonNull;
 public class CalciteAssert {
   private CalciteAssert() {}
 
+  // Define string constants before DB to prevent recursive
+  // static initializers
+  private static final String TEST_MYSQL_URL = "jdbc:mysql://localhost/foodmart";
+
+  private static final String TEST_MYSQL_DRIVER = "com.mysql.jdbc.Driver";
+
   /**
    * Which database to use for tests that require a JDBC data source.
    *
@@ -164,10 +168,6 @@ public class CalciteAssert {
    */
   public static final DatabaseInstance DB =
       DatabaseInstance.valueOf(CalciteSystemProperty.TEST_DB.value());
-
-  private static String testMysqlUrl = "jdbc:mysql://localhost/foodmart";
-
-  private static String testMysqlDriver = "com.mysql.jdbc.Driver";
 
   /** Implementation of {@link AssertThat} that does nothing. */
   private static final AssertThat DISABLED =
@@ -498,6 +498,19 @@ public class CalciteAssert {
         throw TestUtil.rethrow(e);
       }
     };
+  }
+
+  private static int countMatches(@Nullable String str, @Nullable String sub) {
+    if (str == null || sub == null || sub.isEmpty()) {
+      return 0;
+    }
+    int count = 0;
+    int idx = 0;
+    while ((idx = str.indexOf(sub, idx)) >= 0) {
+      count++;
+      idx += sub.length();
+    }
+    return count;
   }
 
   public static Consumer<ResultSet> checkMaskedResultContains(
@@ -2045,14 +2058,14 @@ public class CalciteAssert {
             + "/h2/target/foodmart;user=foodmart;password=foodmart",
             "foodmart", "foodmart", "org.h2.Driver", "foodmart"), null, null),
     MYSQL(
-        new ConnectionSpec(testMysqlUrl, "foodmart",
-            "foodmart", testMysqlDriver, "foodmart"), null, null),
+        new ConnectionSpec(TEST_MYSQL_URL, "foodmart",
+            "foodmart", TEST_MYSQL_DRIVER, "foodmart"), null, null),
     STARROCKS(
-        new ConnectionSpec(testMysqlUrl, "foodmart",
-            "foodmart", testMysqlDriver, "foodmart"), null, null),
+        new ConnectionSpec(TEST_MYSQL_URL, "foodmart",
+            "foodmart", TEST_MYSQL_DRIVER, "foodmart"), null, null),
     DORIS(
-        new ConnectionSpec(testMysqlUrl, "foodmart",
-            "foodmart", testMysqlDriver, "foodmart"), null, null),
+        new ConnectionSpec(TEST_MYSQL_URL, "foodmart",
+            "foodmart", TEST_MYSQL_DRIVER, "foodmart"), null, null),
     ORACLE(
         new ConnectionSpec("jdbc:oracle:thin:@localhost:1521:XE", "foodmart",
             "foodmart", "oracle.jdbc.OracleDriver", "FOODMART"), null, null),

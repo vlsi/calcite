@@ -31,16 +31,18 @@ adapters.
 
 ## Building from a source distribution
 
-Prerequisite is Java (JDK 8, 11, 17, 21 or 23)
-and Gradle (version 8.7) on your path.
+Prerequisite is Java (JDK 8, 11, 17, 21 or 24)
+and Gradle (version 8.14.4) on your path.
+The build compiles the code with JDK 25;
+see [the JDK that compiles Calcite](#the-jdk-that-compiles-calcite).
 
 Unpack the source distribution `.tar.gz` file,
 `cd` to the root directory of the unpacked source,
 then build using Gradle:
 
 {% highlight bash %}
-$ tar xvfz apache-calcite-1.41.0-src.tar.gz
-$ cd apache-calcite-1.41.0-src
+$ tar xvfz apache-calcite-1.42.0-src.tar.gz
+$ cd apache-calcite-1.42.0-src
 $ gradle build
 {% endhighlight %}
 
@@ -51,7 +53,9 @@ tests  (but you should use the `gradle` command rather than
 ## Building from Git
 
 Prerequisites are git
-and Java (JDK 8, 11, 17, 21 or 23) on your path.
+and Java (JDK 8, 11, 17, 21 or 24) on your path.
+The build compiles the code with JDK 25;
+see [the JDK that compiles Calcite](#the-jdk-that-compiles-calcite).
 
 Create a local copy of the GitHub repository,
 `cd` to its root directory,
@@ -75,6 +79,35 @@ then you can call `./gradlew generateSources` tasks manually.
 
 [Running tests](#running-tests) describes how to run more or fewer
 tests.
+
+## The JDK that compiles Calcite
+
+Gradle compiles Calcite with JDK 25 (the `jdkBuildVersion` property selects it)
+and passes `--release 8` to `javac`,
+so the classes run on Java 8 and use only the Java 8 API.
+Tests, javadoc, and other tasks that run Java use the JDK that runs Gradle,
+so `JAVA_HOME` selects the JDK the tests run on.
+
+Gradle finds JDK 25 when it is installed in a standard location,
+or in a directory listed in `org.gradle.java.installations.paths`
+(see [toolchain auto-detection](https://docs.gradle.org/8.14.4/userguide/toolchains.html#sec:auto_detection)).
+Otherwise, Gradle downloads it.
+The download works only when Gradle runs on Java 11 or later,
+so if you run Gradle on Java 8, install JDK 25 yourself.
+Without it, compilation fails with:
+
+{% highlight text %}
+Cannot find a Java installation on your machine (...) matching: {languageVersion=25, vendor=any vendor, implementation=vendor-specific, nativeImageCapable=false}. Some toolchain resolvers had internal failures: foojay (Requesting vendor list failed: error code: 1010
+{% endhighlight %}
+
+* `-PjdkBuildVersion=N` (integer, default `25`) selects the major version of
+  the JDK that compiles the code.
+  Error Prone 2.5.1 fails on JDK 25 with
+  `IllegalAccessError: class com.google.errorprone.JavacErrorDescriptionListener ... cannot access class com.sun.tools.javac.tree.JCTree$JCCompilationUnit`,
+  so run it and the Checker Framework with `-PjdkBuildVersion=11`, as CI does.
+* `-Porg.gradle.java.installations.auto-download=false`, also accepted in
+  `gradle.properties`, makes the build fail instead of downloading a JDK.
+  The error then ends with `Toolchain auto-provisioning is not enabled.`
 
 ## Gradle vs the Gradle Wrapper
 
@@ -125,7 +158,7 @@ $ ./gradlew check # verify code style, execute tests
 $ ./gradlew test # execute tests
 $ ./gradlew style # update code formatting (for auto-correctable cases) and verify style
 $ ./gradlew autostyleCheck checkstyleAll # report code style violations
-$ ./gradlew -PenableErrorprone classes # verify Java code with Error Prone compiler, requires Java 11
+$ ./gradlew -PenableErrorprone -PjdkBuildVersion=11 classes # verify Java code with Error Prone compiler on JDK 11
 {% endhighlight %}
 
 You can use `./gradlew assemble` to build the artifacts and skip all tests and verifications.
@@ -705,7 +738,8 @@ signing.gnupg.useLegacyGpg=
 
 Before you start:
 
-* Make sure you are using JDK 8. Note: you need Java 8u202 or later in case you use OpenJDK-based Java.
+* Make sure you are using JDK 8, and that JDK 25 is installed
+  (see [the JDK that compiles Calcite](#the-jdk-that-compiles-calcite)).
 * Make sure build and tests succeed with `-Dcalcite.test.db=hsqldb` (the default)
 
 {% highlight bash %}
@@ -728,8 +762,13 @@ Before you start:
 * Send an email to [dev@calcite.apache.org](mailto:dev@calcite.apache.org) notifying that RC build process
   is starting and therefore `main` branch is in code freeze until further notice.
 * Set up signing keys as described above.
-* Make sure you are using JDK 8. (Compiling with JDK 21 causes
-  [[CALCITE-6616](https://issues.apache.org/jira/browse/CALCITE-6616)].)
+* Generate a report of vulnerabilities that occur among dependencies,
+  using `./gradlew dependencyCheckUpdate dependencyCheckAggregate`.
+  Report to [private@calcite.apache.org](mailto:private@calcite.apache.org)
+  if new critical vulnerabilities are found among dependencies.
+  The task requires a JDK 11 or later so it doesn't appear when using older versions.
+* Make sure you are using JDK 8 for all subsequent steps, and that JDK 25 is installed
+  (see [the JDK that compiles Calcite](#the-jdk-that-compiles-calcite)).
 * Check that `README` and `site/_docs/howto.md` have the correct version number.
 * Check that `site/_docs/howto.md` has the correct Gradle version.
 * Check that `NOTICE` has the current copyright year.
@@ -737,10 +776,6 @@ Before you start:
 * Make sure build and tests succeed
 * Make sure that `./gradlew javadoc` succeeds
   (i.e. gives no errors; warnings are OK)
-* Generate a report of vulnerabilities that occur among dependencies,
-  using `./gradlew dependencyCheckUpdate dependencyCheckAggregate`.
-  Report to [private@calcite.apache.org](mailto:private@calcite.apache.org)
-  if new critical vulnerabilities are found among dependencies.
 * Decide the supported configurations of JDK, operating system and
   Guava.  These will probably be the same as those described in the
   release notes of the previous release.  Document them in the release
@@ -1064,6 +1099,15 @@ See instructions in
 
 ## Processing JIRA account requests
 Here are some email templates that can be used when processing requests for adding a JIRA account as a contributor.
+
+To add a JIRA account as a Calcite contributor, go to the
+[project roles page](https://issues.apache.org/jira/plugins/servlet/project-config/CALCITE/roles),
+use the "Add users to a role" button for the "Contributors" role, and add the
+user's JIRA username. Members of this role can be assigned Calcite JIRA issues.
+
+When adding a new Calcite committer, also add their JIRA account to the
+"Committers" role. When adding a new Calcite PMC member, also add their
+JIRA account to the "PMC" and "Administrators" roles.
 
 ### Account added to contributor list
 {% highlight text %}

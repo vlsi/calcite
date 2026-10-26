@@ -27,6 +27,7 @@ import org.apache.calcite.plan.RelOptCost;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelTraitDef;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.rel.EmptyRowTypePolicy;
 import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelDistributions;
 import org.apache.calcite.rel.RelFieldCollation;
@@ -44,6 +45,7 @@ import org.apache.calcite.rel.core.TableFunctionScan;
 import org.apache.calcite.rel.core.TableModify;
 import org.apache.calcite.rel.core.Window;
 import org.apache.calcite.rel.hint.RelHint;
+import org.apache.calcite.rel.logical.LogicalValues;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
@@ -52,7 +54,10 @@ import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexCorrelVariable;
 import org.apache.calcite.rex.RexFieldCollation;
 import org.apache.calcite.rex.RexInputRef;
+import org.apache.calcite.rex.RexLambdaRef;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.rex.RexNodeAndFieldIndex;
+import org.apache.calcite.rex.RexSubQuery;
 import org.apache.calcite.rex.RexWindowBounds;
 import org.apache.calcite.runtime.CalciteException;
 import org.apache.calcite.schema.SchemaPlus;
@@ -131,6 +136,7 @@ import static org.apache.calcite.test.Matchers.containsStringLinux;
 import static org.apache.calcite.test.Matchers.hasExpandedTree;
 import static org.apache.calcite.test.Matchers.hasFieldNames;
 import static org.apache.calcite.test.Matchers.hasHints;
+import static org.apache.calcite.test.Matchers.hasRelDataType;
 import static org.apache.calcite.test.Matchers.hasTree;
 
 import static org.hamcrest.CoreMatchers.allOf;
@@ -748,6 +754,76 @@ public class RelBuilderTest {
     assertThat(f.apply(createBuilder()), hasTree(expected));
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7657">[CALCITE-7657]
+   * Apply the absorption law to simplify boolean expressions</a>. */
+  @Test void testFilterAndAbsorptionLaw() {
+    // Equivalent SQL:
+    //   SELECT *
+    //   FROM emp
+    //   WHERE deptno = 10 AND (deptno = 10 OR sal > 100)
+    // Should be simplified to:
+    //   SELECT *
+    //   FROM emp
+    //   WHERE deptno = 10
+    final Function<RelBuilder, RelNode> f = b ->
+        b.scan("EMP")
+            .filter(
+                b.and(
+                    b.equals(b.field("DEPTNO"), b.literal(10)),
+                    b.or(
+                        b.equals(b.field("DEPTNO"), b.literal(10)),
+                        b.greaterThan(b.field("SAL"), b.literal(100)))))
+            .build();
+
+    final String expected = "LogicalFilter(condition=[=($7, 10)])\n"
+        + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(f.apply(createBuilder()), hasTree(expected));
+  }
+
+  @Test void testFilterOrAbsorptionLaw() {
+    // Equivalent SQL:
+    //   SELECT *
+    //   FROM emp
+    //   WHERE deptno = 10 OR (deptno = 10 AND sal > 100)
+    // Should be simplified to:
+    //   SELECT *
+    //   FROM emp
+    //   WHERE deptno = 10
+    final Function<RelBuilder, RelNode> f = b ->
+        b.scan("EMP")
+            .filter(
+                b.or(
+                    b.equals(b.field("DEPTNO"), b.literal(10)),
+                    b.and(
+                        b.equals(b.field("DEPTNO"), b.literal(10)),
+                        b.greaterThan(b.field("SAL"), b.literal(100)))))
+            .build();
+
+    final String expected = "LogicalFilter(condition=[=($7, 10)])\n"
+        + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(f.apply(createBuilder()), hasTree(expected));
+  }
+
+  @Test void testFilterAbsorptionLawWithNonDeterministic() {
+    final Function<RelBuilder, RelNode> f = b -> {
+      final RexNode rand =
+          b.greaterThan(
+              b.call(SqlStdOperatorTable.RAND), b.literal(0.5));
+      return b.scan("EMP")
+          .filter(
+              b.and(rand,
+                  b.or(rand,
+                      b.greaterThan(b.field("SAL"), b.literal(100)))))
+          .build();
+    };
+
+    final String expected = "LogicalFilter(condition=[AND(>(RAND(), 0.5E0),"
+        + " OR(>(RAND(), 0.5E0), >($5, 100)))])\n"
+        + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(f.apply(createBuilder()), hasTree(expected));
+  }
+
   @Test void testBadFieldName() {
     final RelBuilder builder = RelBuilder.create(config().build());
     try {
@@ -1112,6 +1188,108 @@ public class RelBuilderTest {
     assertThat(f.apply(createBuilder()), hasTree(expected));
   }
 
+  /** Tests that RelBuilder removes a constant key from a window's
+   * {@code PARTITION BY}, since a constant partition key places every row in
+   * the same partition. */
+  @Test void testProjectOverConstantPartitionKey() {
+    final Function<RelBuilder, RelNode> f = b -> b.scan("EMP")
+        .project(b.field("DEPTNO"),
+            b.aggregateCall(SqlStdOperatorTable.ROW_NUMBER)
+                .over()
+                .partitionBy(b.literal(1))
+                .orderBy(b.field("EMPNO"))
+                .rowsUnbounded()
+                .as("x"))
+        .build();
+    final String expected = ""
+        + "LogicalProject(DEPTNO=[$7], x=[ROW_NUMBER() OVER (ORDER BY $0)])\n"
+        + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(f.apply(createBuilder()), hasTree(expected));
+  }
+
+  /** Tests that RelBuilder keeps non-constant partition keys and drops only the
+   * constant one. */
+  @Test void testProjectOverPartialConstantPartitionKey() {
+    final Function<RelBuilder, RelNode> f = b -> b.scan("EMP")
+        .project(b.field("DEPTNO"),
+            b.aggregateCall(SqlStdOperatorTable.SUM, b.field("SAL"))
+                .over()
+                .partitionBy(b.field("DEPTNO"), b.literal(1))
+                .orderBy(b.field("EMPNO"))
+                .rowsUnbounded()
+                .as("x"))
+        .build();
+    final String expected = ""
+        + "LogicalProject(DEPTNO=[$7], "
+        + "x=[SUM($5) OVER (PARTITION BY $7 ORDER BY $0 RANGE BETWEEN "
+        + "UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)])\n"
+        + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(f.apply(createBuilder()), hasTree(expected));
+  }
+
+  /** Tests that RelBuilder removes a constant key from a window's
+   * {@code ORDER BY}. */
+  @Test void testProjectOverConstantSortKey() {
+    final Function<RelBuilder, RelNode> f = b -> b.scan("EMP")
+        .project(b.field("DEPTNO"),
+            b.aggregateCall(SqlStdOperatorTable.ROW_NUMBER)
+                .over()
+                .partitionBy()
+                .orderBy(b.literal(1), b.field("EMPNO"))
+                .rowsUnbounded()
+                .as("x"))
+        .build();
+    final String expected = ""
+        + "LogicalProject(DEPTNO=[$7], x=[ROW_NUMBER() OVER (ORDER BY $0)])\n"
+        + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(f.apply(createBuilder()), hasTree(expected));
+  }
+
+  /** Tests that RelBuilder removes a sort key that is functionally determined
+   * by the partition keys: with {@code PARTITION BY DEPTNO, SAL ORDER BY
+   * DEPTNO + SAL, EMPNO} the key {@code DEPTNO + SAL} references only fixed
+   * columns and is dropped, leaving {@code ORDER BY EMPNO}. */
+  @Test void testProjectOverFunctionallyDependentSortKey() {
+    final Function<RelBuilder, RelNode> f = b -> b.scan("EMP")
+        .project(b.field("DEPTNO"),
+            b.aggregateCall(SqlStdOperatorTable.ROW_NUMBER)
+                .over()
+                .partitionBy(b.field("DEPTNO"), b.field("SAL"))
+                .orderBy(
+                    b.call(SqlStdOperatorTable.PLUS, b.field("DEPTNO"),
+                        b.field("SAL")),
+                    b.field("EMPNO"))
+                .rowsUnbounded()
+                .as("x"))
+        .build();
+    final String expected = ""
+        + "LogicalProject(DEPTNO=[$7], "
+        + "x=[ROW_NUMBER() OVER (PARTITION BY $7, $5 ORDER BY $0)])\n"
+        + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(f.apply(createBuilder()), hasTree(expected));
+  }
+
+  /** Tests that RelBuilder keeps a sort key that would otherwise be dropped
+   * (here {@code DEPTNO}, which equals the partition key) when the frame is a
+   * RANGE with a value offset, because such a frame derives its bounds from the
+   * sort key values. */
+  @Test void testProjectOverRangeOffsetKeepsSortKey() {
+    final Function<RelBuilder, RelNode> f = b -> b.scan("EMP")
+        .project(b.field("DEPTNO"),
+            b.aggregateCall(SqlStdOperatorTable.SUM, b.field("SAL"))
+                .over()
+                .partitionBy(b.field("DEPTNO"))
+                .orderBy(b.field("DEPTNO"))
+                .rangeBetween(b.preceding(b.literal(5)), b.currentRow())
+                .as("x"))
+        .build();
+    final String expected = ""
+        + "LogicalProject(DEPTNO=[$7], "
+        + "x=[SUM($5) OVER (PARTITION BY $7 ORDER BY $7 RANGE 5 PRECEDING)])\n"
+        + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    assertThat(f.apply(createBuilder()), hasTree(expected));
+  }
+
   @Test void testRename() {
     final RelBuilder builder = RelBuilder.create(config().build());
 
@@ -1293,6 +1471,70 @@ public class RelBuilderTest {
         + "LogicalAggregate(group=[{}], C=[COUNT(DISTINCT $7)])\n"
         + "  LogicalTableScan(table=[[scott, EMP]])\n";
     assertThat(root, hasTree(expected));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-4597">[CALCITE-4597]
+   * Allow RelNodes to have an empty row type (zero fields)</a>.
+   *
+   * <p>Under the default policy, {@link EmptyRowTypePolicy#DISCOURAGED},
+   * {@code RelBuilder} does not throw if it encounters a relational
+   * expression with an empty row type, but tries not to create one: a
+   * {@code GROUP BY ()} with no aggregate calls becomes "VALUES (true)". */
+  @Test void testEmptyRowTypePolicyDiscouraged() {
+    // Equivalent SQL:
+    //   SELECT * FROM emp GROUP BY ()
+    final RelBuilder builder = createBuilder();
+    final RelNode root =
+        builder.scan("EMP")
+            .aggregate(builder.groupKey())
+            .build();
+    assertThat(root, hasTree("LogicalValues(tuples=[[{ true }]])\n"));
+  }
+
+  /** As {@link #testEmptyRowTypePolicyDiscouraged()}, but under the
+   * {@link EmptyRowTypePolicy#ALLOWED} policy, and therefore a
+   * {@code GROUP BY ()} with no aggregate calls becomes a
+   * {@code VALUES} with an empty row type (zero fields). */
+  @Test void testEmptyRowTypePolicyAllowed() {
+    final RelBuilder builder =
+        createBuilder(c -> c.withPreventEmptyFieldList(false)
+            .withEmptyRowTypePolicy(EmptyRowTypePolicy.ALLOWED));
+    final RelNode root =
+        builder.scan("EMP")
+            .aggregate(builder.groupKey())
+            .build();
+    assertThat(root.getRowType().getFieldCount(), is(0));
+    assertThat(root, hasTree("LogicalValues(tuples=[[{  }]])\n"));
+  }
+
+  /** As {@link #testEmptyRowTypePolicyDiscouraged()}, but under the
+   * {@link EmptyRowTypePolicy#FORBIDDEN} policy: creating or pushing a
+   * relational expression with an empty row type throws. */
+  @Test void testEmptyRowTypePolicyForbidden() {
+    final RelBuilder builder =
+        createBuilder(c -> c.withPreventEmptyFieldList(false)
+            .withEmptyRowTypePolicy(EmptyRowTypePolicy.FORBIDDEN));
+
+    // Equivalent SQL:
+    //   SELECT * FROM emp GROUP BY ()
+    final RelBuilder scan = builder.scan("EMP");
+    final IllegalArgumentException e0 =
+        assertThrows(IllegalArgumentException.class,
+            () -> scan.aggregate(scan.groupKey()).build(),
+            "expected empty row type to be forbidden");
+    assertThat(e0.getMessage(), containsString("empty row type"));
+
+    // Pushing a relational expression with an empty row type is also
+    // forbidden
+    final RelDataType emptyRowType = builder.getTypeFactory().builder().build();
+    final RelNode emptyValues =
+        LogicalValues.create(builder.getCluster(), emptyRowType,
+            ImmutableList.of(ImmutableList.of()));
+    final IllegalArgumentException e1 =
+        assertThrows(IllegalArgumentException.class, () -> builder.push(emptyValues),
+        "expected empty row type to be forbidden");
+    assertThat(e1.getMessage(), containsString("empty row type"));
   }
 
   @Test void testAggregate2() {
@@ -2347,6 +2589,72 @@ public class RelBuilderTest {
   }
 
   /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6451">[CALCITE-6451]
+   * Improve Nullability Derivation for Intersect and Minus</a>. */
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testUnionTypeDerivation(boolean all) {
+    final RelBuilder builder = RelBuilder.create(config().build());
+
+    RelDataType input1RowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("b", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("c", SqlTypeName.BIGINT)
+            .nullable(true)
+            .add("d", SqlTypeName.BIGINT)
+            .nullable(true)
+            .build();
+
+    RelDataType input2RowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("b", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("c", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("d", SqlTypeName.BIGINT)
+            .nullable(false)
+            .build();
+
+    RelDataType input3RowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("b", SqlTypeName.BIGINT)
+            .nullable(true)
+            .add("c", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("d", SqlTypeName.BIGINT)
+            .nullable(true)
+            .build();
+
+    RelNode root =
+        builder
+            .values(input1RowType)
+            .values(input2RowType)
+            .values(input3RowType)
+            .union(all, 3)
+            .build();
+
+    RelDataType expectedRowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("b", SqlTypeName.BIGINT)
+            .nullable(true)
+            .add("c", SqlTypeName.BIGINT)
+            .nullable(true)
+            .add("d", SqlTypeName.BIGINT)
+            .nullable(true)
+            .build();
+    assertThat(root.getRowType(), hasRelDataType(expectedRowType));
+  }
+
+  /** Test case for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-1522">[CALCITE-1522]
    * Fix error message for SetOp with incompatible args</a>. */
   @Test void testBadUnionArgsErrorMessage() {
@@ -2550,6 +2858,72 @@ public class RelBuilderTest {
     assertThat(root, hasTree(expected));
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6451">[CALCITE-6451]
+   * Improve Nullability Derivation for Intersect and Minus</a>. */
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testIntersectTypeDerivation(boolean all) {
+    final RelBuilder builder = RelBuilder.create(config().build());
+
+    RelDataType input1RowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("b", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("c", SqlTypeName.BIGINT)
+            .nullable(true)
+            .add("d", SqlTypeName.BIGINT)
+            .nullable(true)
+            .build();
+
+    RelDataType input2RowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(true)
+            .add("b", SqlTypeName.BIGINT)
+            .nullable(true)
+            .add("c", SqlTypeName.BIGINT)
+            .nullable(true)
+            .add("d", SqlTypeName.BIGINT)
+            .nullable(true)
+            .build();
+
+    RelDataType input3RowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("b", SqlTypeName.BIGINT)
+            .nullable(true)
+            .add("c", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("d", SqlTypeName.BIGINT)
+            .nullable(true)
+            .build();
+
+    RelNode root =
+        builder
+            .values(input1RowType)
+            .values(input2RowType)
+            .values(input3RowType)
+            .intersect(all, 3)
+            .build();
+
+    RelDataType expectedRowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("b", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("c", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("d", SqlTypeName.BIGINT)
+            .nullable(true)
+            .build();
+    assertThat(root.getRowType(), hasRelDataType(expectedRowType));
+  }
+
   @Test void testExcept() {
     // Equivalent SQL:
     //   SELECT empno FROM emp
@@ -2575,6 +2949,223 @@ public class RelBuilderTest {
         + "    LogicalFilter(condition=[=($7, 20)])\n"
         + "      LogicalTableScan(table=[[scott, EMP]])\n";
     assertThat(root, hasTree(expected));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6451">[CALCITE-6451]
+   * Improve Nullability Derivation for Intersect and Minus</a>. */
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testExceptTypeDerivation(boolean all) {
+    final RelBuilder builder = RelBuilder.create(config().build());
+
+    RelDataType primaryRowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("b", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("c", SqlTypeName.BIGINT)
+            .nullable(true)
+            .add("d", SqlTypeName.BIGINT)
+            .nullable(true)
+            .build();
+
+    RelDataType secondaryRowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("b", SqlTypeName.BIGINT)
+            .nullable(true)
+            .add("c", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("d", SqlTypeName.BIGINT)
+            .nullable(true)
+            .build();
+
+    RelNode root =
+        builder.values(primaryRowType)
+            .values(secondaryRowType)
+            .minus(all)
+            .build();
+
+    assertThat(root.getRowType(), hasRelDataType(primaryRowType));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6451">[CALCITE-6451]
+   * Improve Nullability Derivation for Intersect and Minus</a>. */
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testExceptTypeDerivationWithRowField(boolean all) {
+    final RelBuilder builder = RelBuilder.create(config().build());
+
+    // a BIGINT NOT NULL, b ROW(x INT NOT NULL, y VARCHAR NULL) NOT NULL
+    RelDataType primaryRowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("b", builder.getTypeFactory().builder()
+                .add("x", SqlTypeName.INTEGER)
+                .nullable(false)
+                .add("y", SqlTypeName.VARCHAR, 10)
+                .nullable(true)
+                .build())
+            .nullableRecord(false)
+            .build();
+
+    // a BIGINT NULL, b ROW(x INT NULL, y VARCHAR NOT NULL) NOT NULL
+    RelDataType secondaryRowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(true)
+            .add("b", builder.getTypeFactory().builder()
+                .add("x", SqlTypeName.INTEGER)
+                .nullable(true)
+                .add("y", SqlTypeName.VARCHAR, 10)
+                .nullable(false)
+                .build())
+            .nullableRecord(false)
+            .build();
+
+    RelNode root =
+        builder.values(primaryRowType)
+            .values(secondaryRowType)
+            .minus(all)
+            .build();
+
+    // follows primary input's nullability
+    assertThat(root.getRowType(), hasRelDataType(primaryRowType));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6451">[CALCITE-6451]
+   * Improve Nullability Derivation for Intersect and Minus</a>. */
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testIntersectTypeDerivationWithRowField(boolean all) {
+    final RelBuilder builder = RelBuilder.create(config().build());
+
+    // a BIGINT NOT NULL, b ROW(x INT NOT NULL, y VARCHAR NULL) NOT NULL
+    RelDataType input1RowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("b", builder.getTypeFactory().builder()
+                .add("x", SqlTypeName.INTEGER)
+                .nullable(false)
+                .add("y", SqlTypeName.VARCHAR, 10)
+                .nullable(true)
+                .build())
+            .nullable(false)
+            .build();
+
+    // a BIGINT NULL, b ROW(x INT NULL, y VARCHAR NOT NULL) NOT NULL
+    RelDataType input2RowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(true)
+            .add("b", builder.getTypeFactory().builder()
+                .add("x", SqlTypeName.INTEGER)
+                .nullable(true)
+                .add("y", SqlTypeName.VARCHAR, 10)
+                .nullable(false)
+                .build())
+            .nullable(false)
+            .build();
+
+    RelNode root =
+        builder
+            .values(input1RowType)
+            .values(input2RowType)
+            .intersect(all)
+            .build();
+
+    // a BIGINT NOT NULL
+    // a BIGINT NULL
+    // => a BIGINT NOT NULL
+    //
+    // b ROW(x INT NOT NULL, y VARCHAR NULL) NOT NULL
+    // b ROW(x INT NULL, y VARCHAR NOT NULL) NOT NULL
+    // => b ROW(x INT NOT NULL, y VARCHAR NOT NULL) NOT NULL
+    RelDataType expectedRowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("b", builder.getTypeFactory().builder()
+                .add("x", SqlTypeName.INTEGER)
+                .nullable(false)
+                .add("y", SqlTypeName.VARCHAR, 10)
+                .nullable(false)
+                .build())
+            .nullable(false)
+            .build();
+    assertThat(root.getRowType(), hasRelDataType(expectedRowType));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6451">[CALCITE-6451]
+   * Improve Nullability Derivation for Intersect and Minus</a>. */
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testUnionTypeDerivationWithRowField(boolean all) {
+    final RelBuilder builder = RelBuilder.create(config().build());
+
+    // a BIGINT NOT NULL, b ROW(x INT NOT NULL, y VARCHAR NULL) NOT NULL
+    RelDataType input1RowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(false)
+            .add("b", builder.getTypeFactory().builder()
+                .add("x", SqlTypeName.INTEGER)
+                .nullable(true)
+                .add("y", SqlTypeName.VARCHAR, 10)
+                .nullable(true)
+                .build())
+            .nullable(true)
+            .build();
+
+    // a BIGINT NULL, b ROW(x INT NULL, y VARCHAR NOT NULL) NOT NULL
+    RelDataType input2RowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(true)
+            .add("b", builder.getTypeFactory().builder()
+                .add("x", SqlTypeName.INTEGER)
+                .nullable(true)
+                .add("y", SqlTypeName.VARCHAR, 10)
+                .nullable(false)
+                .build())
+            .nullable(false)
+            .build();
+
+    RelNode root =
+        builder
+            .values(input1RowType)
+            .values(input2RowType)
+            .union(all)
+            .build();
+
+    // a BIGINT NOT NULL
+    // a BIGINT NULL
+    // => a BIGINT NULL
+    //
+    // b ROW(x INT NULL, y VARCHAR NULL) NULL
+    // b ROW(x INT NULL, y VARCHAR NOT NULL) NOT NULL
+    // => b ROW(x INT NULL, y VARCHAR NULL) NULL
+    RelDataType expectedRowType =
+        new RelDataTypeFactory.Builder(builder.getTypeFactory())
+            .add("a", SqlTypeName.BIGINT)
+            .nullable(true)
+            .add("b", builder.getTypeFactory().builder()
+                .add("x", SqlTypeName.INTEGER)
+                .nullable(true)
+                .add("y", SqlTypeName.VARCHAR, 10)
+                .nullable(true)
+                .build())
+            .nullable(true)
+            .build();
+    assertThat(root.getRowType(), hasRelDataType(expectedRowType));
   }
 
   /** Tests building a simple join. Also checks {@link RelBuilder#size()}
@@ -4384,6 +4975,38 @@ public class RelBuilderTest {
   }
 
   /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7826">[CALCITE-7826]
+   * IS NOT DISTINCT FROM gives wrong result in Enumerable convention when
+   * applied to DECIMAL values of different scales</a>. */
+  @Test void testIsNotDistinctFromDecimal() throws Exception {
+    // Equivalent SQL:
+    //   SELECT a, b, a = b AS eq, a IS NOT DISTINCT FROM b AS indf,
+    //     a IS DISTINCT FROM b AS idf
+    //   FROM (VALUES (1.10, 1.1)) AS t (a, b)
+    // but SqlToRelConverter and RelBuilder.isNotDistinctFrom expand IS [NOT]
+    // DISTINCT FROM, so we call the operators directly. "a" has type
+    // DECIMAL(3, 2) and "b" has type DECIMAL(2, 1).
+    final RelBuilder b = RelBuilder.create(config().build());
+    final RelNode root =
+        b.values(new String[] {"a", "b"},
+                new BigDecimal("1.10"), new BigDecimal("1.1"))
+            .project(b.field("a"), b.field("b"),
+                b.alias(b.equals(b.field("a"), b.field("b")), "eq"),
+                b.alias(
+                    b.call(SqlStdOperatorTable.IS_NOT_DISTINCT_FROM,
+                        b.field("a"), b.field("b")), "indf"),
+                b.alias(
+                    b.call(SqlStdOperatorTable.IS_DISTINCT_FROM,
+                        b.field("a"), b.field("b")), "idf"))
+            .build();
+    try (PreparedStatement preparedStatement = RelRunners.run(root)) {
+      String s = CalciteAssert.toString(preparedStatement.executeQuery());
+      final String result = "a=1.10; b=1.1; eq=true; indf=true; idf=false\n";
+      assertThat(s, is(result));
+    }
+  }
+
+  /** Test case for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-1595">[CALCITE-1595]
    * RelBuilder.call throws NullPointerException if argument types are
    * invalid</a>. */
@@ -5090,28 +5713,42 @@ public class RelBuilderTest {
             hasTree(expected));
   }
 
-  @Test void testSimpleRightCorrelateViaJoinThrowsException() {
-    assertThrows(IllegalArgumentException.class,
-        () -> buildSimpleCorrelateWithJoin(JoinRelType.RIGHT),
-        "Right outer joins with correlated ids are invalid even if id is not used.");
+  @Test void testSimpleRightCorrelateViaJoin() {
+    RelNode root = buildSimpleCorrelateWithJoin(JoinRelType.RIGHT);
+    final String expected = ""
+        + "LogicalJoin(condition=[=($7, $8)], joinType=[right], variablesSet=[[$cor0]])\n"
+        + "  LogicalTableScan(table=[[scott, EMP]])\n"
+        + "  LogicalTableScan(table=[[scott, DEPT]])\n";
+    assertThat(root, hasTree(expected));
   }
 
-  @Test void testSimpleFullCorrelateViaJoinThrowsException() {
-    assertThrows(IllegalArgumentException.class,
-        () -> buildSimpleCorrelateWithJoin(JoinRelType.FULL),
-        "Full outer joins with correlated ids are invalid even if id is not used.");
+  @Test void testSimpleFullCorrelateViaJoin() {
+    RelNode root = buildSimpleCorrelateWithJoin(JoinRelType.FULL);
+    final String expected = ""
+        + "LogicalJoin(condition=[=($7, $8)], joinType=[full], variablesSet=[[$cor0]])\n"
+        + "  LogicalTableScan(table=[[scott, EMP]])\n"
+        + "  LogicalTableScan(table=[[scott, DEPT]])\n";
+    assertThat(root, hasTree(expected));
   }
 
-  @Test void testRightCorrelateViaJoinThrowsException() {
-    assertThrows(IllegalArgumentException.class,
-        () -> buildCorrelateWithJoin(JoinRelType.RIGHT),
-        "Right outer joins with correlated ids are invalid.");
+  @Test void testRightCorrelateViaJoin() {
+    RelNode root = buildCorrelateWithJoin(JoinRelType.RIGHT);
+    final String expected = ""
+        + "LogicalJoin(condition=[=($7, $8)], joinType=[right], variablesSet=[[$cor0]])\n"
+        + "  LogicalTableScan(table=[[scott, EMP]])\n"
+        + "  LogicalFilter(condition=[=($cor0.EMPNO, 'NaN')])\n"
+        + "    LogicalTableScan(table=[[scott, DEPT]])\n";
+    assertThat(root, hasTree(expected));
   }
 
-  @Test void testFullCorrelateViaJoinThrowsException() {
-    assertThrows(IllegalArgumentException.class,
-        () -> buildCorrelateWithJoin(JoinRelType.FULL),
-        "Full outer joins with correlated ids are invalid.");
+  @Test void testFullCorrelateViaJoin() {
+    RelNode root = buildCorrelateWithJoin(JoinRelType.FULL);
+    final String expected = ""
+        + "LogicalJoin(condition=[=($7, $8)], joinType=[full], variablesSet=[[$cor0]])\n"
+        + "  LogicalTableScan(table=[[scott, EMP]])\n"
+        + "  LogicalFilter(condition=[=($cor0.EMPNO, 'NaN')])\n"
+        + "    LogicalTableScan(table=[[scott, DEPT]])\n";
+    assertThat(root, hasTree(expected));
   }
 
   private static RelNode buildSimpleCorrelateWithJoin(JoinRelType type) {
@@ -5211,6 +5848,186 @@ public class RelBuilderTest {
     RelMetadataQuery mq = planAfter.getCluster().getMetadataQuery();
     assertThat(mq.getMinRowCount(planAfter), is(0D));
     assertThat(mq.getMaxRowCount(planAfter), is(Double.POSITIVE_INFINITY));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testFetchExpressionCannotReferenceInputField() {
+    final RelBuilder builder = RelBuilder.create(config().build());
+    builder.scan("DEPT");
+    final RexNode field = builder.field("DEPTNO");
+
+    assertThrows(IllegalArgumentException.class,
+        () -> builder.sortLimit(null, field, ImmutableList.of()));
+    assertThrows(IllegalArgumentException.class,
+        () -> builder.sortLimit(null,
+            builder.call(SqlStdOperatorTable.PLUS, builder.literal(1), field),
+            ImmutableList.of()));
+    assertThrows(IllegalArgumentException.class,
+        () -> builder.sortLimit(null,
+            new RexNodeAndFieldIndex(0, 0, "DEPTNO", field.getType()),
+            ImmutableList.of()));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7662">[CALCITE-7662]
+   * Add expression support for OFFSET</a>. */
+  @Test void testOffsetExpressionCannotReferenceInputField() {
+    final RelBuilder builder = RelBuilder.create(config().build());
+    builder.scan("DEPT");
+    final RexNode field = builder.field("DEPTNO");
+
+    assertThrows(IllegalArgumentException.class,
+        () -> builder.sortLimit(field, null, ImmutableList.of()));
+    assertThrows(IllegalArgumentException.class,
+        () -> builder.sortLimit(
+            builder.call(SqlStdOperatorTable.PLUS, builder.literal(1), field),
+            null, ImmutableList.of()));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testFetchExpressionMustHaveNumericType() {
+    final RelBuilder builder = RelBuilder.create(config().build());
+    builder.scan("DEPT");
+
+    assertThrows(IllegalArgumentException.class,
+        () -> builder.sortLimit(null, builder.literal("x"), ImmutableList.of()));
+    builder.sortLimit(null, builder.literal(new BigDecimal("1.5")),
+        ImmutableList.of());
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7662">[CALCITE-7662]
+   * Add expression support for OFFSET</a>. */
+  @Test void testOffsetExpressionMustHaveNumericType() {
+    final RelBuilder builder = RelBuilder.create(config().build());
+    builder.scan("DEPT");
+
+    assertThrows(IllegalArgumentException.class,
+        () -> builder.sortLimit(builder.literal("x"), null, ImmutableList.of()));
+    builder.sortLimit(builder.literal(new BigDecimal("1.5")), null,
+        ImmutableList.of());
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testFetchExpressionAllowsScalarCallAndDynamicParameter() {
+    final RelBuilder builder = RelBuilder.create(config().build());
+    final RelDataType intType =
+        builder.getTypeFactory().createSqlType(SqlTypeName.INTEGER);
+    builder.scan("DEPT")
+        .sortLimit(null,
+            builder.call(SqlStdOperatorTable.PLUS,
+                builder.getRexBuilder().makeDynamicParam(intType, 0),
+                builder.literal(1)),
+            ImmutableList.of());
+
+    assertThat(
+        builder.build(), hasTree("LogicalSort(fetch=[+(?0, 1)])\n"
+        + "  LogicalTableScan(table=[[scott, DEPT]])\n"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7662">[CALCITE-7662]
+   * Add expression support for OFFSET</a>. */
+  @Test void testOffsetExpressionAllowsScalarCallAndDynamicParameter() {
+    final RelBuilder builder = RelBuilder.create(config().build());
+    final RelDataType intType =
+        builder.getTypeFactory().createSqlType(SqlTypeName.INTEGER);
+    builder.scan("DEPT")
+        .sortLimit(
+            builder.call(SqlStdOperatorTable.PLUS,
+                builder.getRexBuilder().makeDynamicParam(intType, 0),
+                builder.literal(1)),
+            null, ImmutableList.of());
+
+    assertThat(
+        builder.build(), hasTree("LogicalSort(offset=[+(?0, 1)])\n"
+        + "  LogicalTableScan(table=[[scott, DEPT]])\n"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testFetchExpressionCannotContainAggregateWindowOrSubQuery() {
+    final RelBuilder builder = RelBuilder.create(config().build());
+    final RelDataType intType =
+        builder.getTypeFactory().createSqlType(SqlTypeName.INTEGER);
+    builder.scan("DEPT");
+    final RexNode aggregate =
+        builder.call(SqlStdOperatorTable.SUM, builder.literal(1));
+    assertThrows(IllegalArgumentException.class,
+        () -> builder.sortLimit(null, aggregate, ImmutableList.of()));
+
+    final RexNode over =
+        builder.getRexBuilder().makeOver(intType,
+            SqlStdOperatorTable.ROW_NUMBER, ImmutableList.of(),
+            ImmutableList.of(), ImmutableList.of(),
+            RexWindowBounds.UNBOUNDED_PRECEDING,
+            RexWindowBounds.UNBOUNDED_FOLLOWING,
+            true, true, false, false, false);
+    assertThrows(IllegalArgumentException.class,
+        () -> builder.sortLimit(null, over, ImmutableList.of()));
+
+    final RelBuilder subQueryBuilder = RelBuilder.create(config().build());
+    final RexNode subQuery =
+        RexSubQuery.scalar(subQueryBuilder.values(new String[] {"N"}, 1).build());
+    assertThrows(IllegalArgumentException.class,
+        () -> builder.sortLimit(null, subQuery, ImmutableList.of()));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7662">[CALCITE-7662]
+   * Add expression support for OFFSET</a>. */
+  @Test void testOffsetExpressionCannotContainAggregateWindowOrSubQuery() {
+    final RelBuilder builder = RelBuilder.create(config().build());
+    final RelDataType intType =
+        builder.getTypeFactory().createSqlType(SqlTypeName.INTEGER);
+    builder.scan("DEPT");
+    final RexNode aggregate =
+        builder.call(SqlStdOperatorTable.SUM, builder.literal(1));
+    assertThrows(IllegalArgumentException.class,
+        () -> builder.sortLimit(aggregate, null, ImmutableList.of()));
+
+    final RexNode over =
+        builder.getRexBuilder().makeOver(intType,
+            SqlStdOperatorTable.ROW_NUMBER, ImmutableList.of(),
+            ImmutableList.of(), ImmutableList.of(),
+            RexWindowBounds.UNBOUNDED_PRECEDING,
+            RexWindowBounds.UNBOUNDED_FOLLOWING,
+            true, true, false, false, false);
+    assertThrows(IllegalArgumentException.class,
+        () -> builder.sortLimit(over, null, ImmutableList.of()));
+
+    final RelBuilder subQueryBuilder = RelBuilder.create(config().build());
+    final RexNode subQuery =
+        RexSubQuery.scalar(subQueryBuilder.values(new String[] {"N"}, 1).build());
+    assertThrows(IllegalArgumentException.class,
+        () -> builder.sortLimit(subQuery, null, ImmutableList.of()));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testFetchExpressionCannotContainLambda() {
+    final RelBuilder builder = RelBuilder.create(config().build());
+    final RelDataType intType =
+        builder.getTypeFactory().createSqlType(SqlTypeName.INTEGER);
+    builder.scan("DEPT");
+    final RexLambdaRef lambdaRef = new RexLambdaRef(0, "x", intType);
+    final RexNode lambda =
+        builder.getRexBuilder().makeLambdaCall(
+            builder.call(SqlStdOperatorTable.PLUS, lambdaRef, builder.literal(1)),
+            ImmutableList.of(lambdaRef));
+
+    assertThrows(IllegalArgumentException.class,
+        () -> builder.sortLimit(null, lambda, ImmutableList.of()));
+    assertThrows(IllegalArgumentException.class,
+        () -> builder.sortLimit(null, lambdaRef, ImmutableList.of()));
   }
 
   @Test void testAdoptConventionEnumerable() {
@@ -5966,6 +6783,20 @@ public class RelBuilderTest {
 
       assertDoesNotThrow(() -> op.reverse());
       assertTrue(c1.equals(c2));
+    }
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7258">[CALCITE-7258]
+   * RelBuilder.filter should throw if the condition is not BOOLEAN</a>. */
+  @Test void testFilterWithNonBooleanLiteralCondition() {
+    final RelBuilder builder = RelBuilder.create(config().build());
+    try {
+      builder.scan("EMP")
+          .filter(builder.literal("foo"))
+          .build();
+    } catch (Error e) {
+      assertTrue(e.getMessage().contains("Filter condition must have type BOOLEAN"));
     }
   }
 

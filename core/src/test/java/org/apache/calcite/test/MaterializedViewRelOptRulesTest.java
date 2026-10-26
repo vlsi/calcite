@@ -21,7 +21,14 @@ import org.apache.calcite.plan.RelOptMaterialization;
 import org.apache.calcite.plan.RelOptPlanner;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.plan.hep.HepPlanner;
+import org.apache.calcite.plan.hep.HepProgram;
+import org.apache.calcite.plan.hep.HepProgramBuilder;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.rules.materialize.MaterializedViewOnlyAggregateRule;
+import org.apache.calcite.rel.rules.materialize.MaterializedViewOnlyFilterRule;
+import org.apache.calcite.rel.rules.materialize.MaterializedViewRules;
+import org.apache.calcite.tools.Program;
 import org.apache.calcite.tools.Programs;
 import org.apache.calcite.util.Pair;
 
@@ -364,6 +371,36 @@ class MaterializedViewRelOptRulesTest {
         .ok();
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7636">[CALCITE-7636]
+   * Materialized view union rewriting drops rows when the view filter is not
+   * null-rejecting</a>.
+   *
+   * <p>The view is filtered on a predicate over the nullable {@code commission}
+   * column, so the predicate is UNKNOWN for rows where {@code commission} is
+   * null. The query-branch of the union must keep those rows (using
+   * {@code IS NOT TRUE}), otherwise they are dropped from both branches and
+   * whole groups disappear from the result. */
+  @Test void testAggregateMaterializationUnionRewritingNullablePredicate() {
+    sql("select \"deptno\", sum(\"salary\") as s\n"
+            + "from \"emps\" where \"deptno\" > 5 and \"commission\" > 1000\n"
+            + "group by \"deptno\"",
+        "select \"deptno\", sum(\"salary\") as s\n"
+            + "from \"emps\" where \"deptno\" > 5\n"
+            + "group by \"deptno\"")
+        .checkingThatResultContains(""
+            + "EnumerableAggregate(group=[{0}], S=[$SUM0($1)])\n"
+            + "  EnumerableUnion(all=[true])\n"
+            + "    EnumerableAggregate(group=[{1}], S=[$SUM0($3)])\n"
+            + "      EnumerableCalc(expr#0..4=[{inputs}], expr#5=[CAST($t1):INTEGER NOT NULL], "
+            + "expr#6=[5], expr#7=[>($t5, $t6)], expr#8=[1000], expr#9=[CAST($t4):INTEGER], "
+            + "expr#10=[<($t8, $t9)], expr#11=[IS NOT TRUE($t10)], expr#12=[AND($t7, $t11)], "
+            + "proj#0..4=[{exprs}], $condition=[$t12])\n"
+            + "        EnumerableTableScan(table=[[hr, emps]])\n"
+            + "    EnumerableTableScan(table=[[hr, MV0]])")
+        .ok();
+  }
+
   @Test void testJoinAggregateMaterializationNoAggregateFuncs1() {
     sql("select \"empid\", \"depts\".\"deptno\" from \"emps\"\n"
             + "join \"depts\" using (\"deptno\") where \"depts\".\"deptno\" > 10\n"
@@ -507,6 +544,59 @@ class MaterializedViewRelOptRulesTest {
             "EnumerableAggregate(group=[{2}])",
             "EnumerableTableScan(table=[[hr, MV0]])",
             "expr#6=[Sarg[(10..11], [19..20)]], expr#7=[SEARCH($t5, $t6)]")
+        .ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7641">[CALCITE-7641]
+   * Materialize view rules with UnionRewritingPullProgram on a HepPlanner
+   * throws IllegalArgumentException</a>. */
+  @Test void testJoinAggregateMaterializationNoAggregateFuncs9Hep() {
+    // Tester using a HepPlanner instead of Volcano
+    final MaterializedViewTester hepTester =
+        new MaterializedViewTester() {
+          @Override protected List<RelNode> optimize(RelNode queryRel,
+              List<RelOptMaterialization> materializationList) {
+            // Dummy UnionRewritingPullProgram
+            final HepProgram unionRewritingPullProgram = new HepProgramBuilder().build();
+            // MaterializedViewRule with UnionRewritingPullProgram
+            final HepProgram mainProgram = new HepProgramBuilder()
+                .addRuleInstance(MaterializedViewOnlyAggregateRule.Config.DEFAULT
+                    .withUnionRewritingPullProgram(unionRewritingPullProgram).toRule())
+                .build();
+            final HepPlanner hepPlanner = new HepPlanner(mainProgram);
+            final Program program =
+                (planner, rel, requiredOutputTraits, materializations, lattices) -> {
+                  for (RelOptMaterialization materialization : materializations) {
+                    planner.addMaterialization(materialization);
+                  }
+                  planner.setRoot(rel);
+                  return planner.findBestExp();
+                };
+            return ImmutableList.of(
+                program.run(hepPlanner, queryRel, queryRel.getCluster().traitSet(),
+                    materializationList, ImmutableList.of()));
+          }
+        };
+
+    String materialize = "select \"depts\".\"deptno\", \"dependents\".\"empid\"\n"
+        + "from \"depts\"\n"
+        + "join \"dependents\" on (\"depts\".\"name\" = \"dependents\".\"name\")\n"
+        + "join \"locations\" on (\"locations\".\"name\" = \"dependents\".\"name\")\n"
+        + "join \"emps\" on (\"emps\".\"deptno\" = \"depts\".\"deptno\")\n"
+        + "where \"depts\".\"deptno\" > 11 and \"depts\".\"deptno\" < 19\n"
+        + "group by \"depts\".\"deptno\", \"dependents\".\"empid\"";
+    String query = "select \"dependents\".\"empid\"\n"
+        + "from \"depts\"\n"
+        + "join \"dependents\" on (\"depts\".\"name\" = \"dependents\".\"name\")\n"
+        + "join \"locations\" on (\"locations\".\"name\" = \"dependents\".\"name\")\n"
+        + "join \"emps\" on (\"emps\".\"deptno\" = \"depts\".\"deptno\")\n"
+        + "where \"depts\".\"deptno\" > 10 and \"depts\".\"deptno\" < 20\n"
+        + "group by \"dependents\".\"empid\"";
+
+    MaterializedViewFixture.create(query, hepTester)
+        .withMaterializations(ImmutableList.of(Pair.of(materialize, "MV0")))
+        .checkingThatResultContains("EnumerableTableScan(table=[[hr, MV0]])")
         .ok();
   }
 
@@ -917,6 +1007,58 @@ class MaterializedViewRelOptRulesTest {
         .checkingThatResultContains("EnumerableUnion(all=[true])",
                 "EnumerableTableScan(table=[[hr, MV0]])",
                 "expr#6=[Sarg[(10..30]]], expr#7=[SEARCH($t5, $t6)]")
+        .ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7641">[CALCITE-7641]
+   * Materialize view rules with UnionRewritingPullProgram on a HepPlanner
+   * throws IllegalArgumentException</a>. */
+  @Test void testJoinMaterialization10Hep() {
+    // Tester using a HepPlanner instead of Volcano
+    final MaterializedViewTester hepTester =
+        new MaterializedViewTester() {
+          @Override protected List<RelNode> optimize(RelNode queryRel,
+              List<RelOptMaterialization> materializationList) {
+            // Dummy UnionRewritingPullProgram
+            final HepProgram unionRewritingPullProgram = new HepProgramBuilder().build();
+            final HepProgram mainProgram = new HepProgramBuilder()
+                .addRuleInstance(MaterializedViewRules.JOIN)
+                .addRuleInstance(MaterializedViewRules.PROJECT_JOIN)
+                .addRuleInstance(MaterializedViewRules.PROJECT_FILTER)
+                // MaterializedViewOnlyFilterRule with UnionRewritingPullProgram
+                .addRuleInstance(MaterializedViewOnlyFilterRule.Config.DEFAULT
+                    .withUnionRewritingPullProgram(unionRewritingPullProgram).toRule())
+                .build();
+            final HepPlanner hepPlanner = new HepPlanner(mainProgram);
+            final Program program =
+                (planner, rel, requiredOutputTraits, materializations, lattices) -> {
+                  for (RelOptMaterialization materialization : materializations) {
+                    planner.addMaterialization(materialization);
+                  }
+                  planner.setRoot(rel);
+                  return planner.findBestExp();
+                };
+            return ImmutableList.of(
+                program.run(hepPlanner, queryRel, queryRel.getCluster().traitSet(),
+                    materializationList, ImmutableList.of()));
+          }
+        };
+
+    String materialize = "select \"depts\".\"deptno\", \"dependents\".\"empid\"\n"
+        + "from \"depts\"\n"
+        + "join \"dependents\" on (\"depts\".\"name\" = \"dependents\".\"name\")\n"
+        + "join \"emps\" on (\"emps\".\"deptno\" = \"depts\".\"deptno\")\n"
+        + "where \"depts\".\"deptno\" > 30";
+    String query = "select \"dependents\".\"empid\"\n"
+        + "from \"depts\"\n"
+        + "join \"dependents\" on (\"depts\".\"name\" = \"dependents\".\"name\")\n"
+        + "join \"emps\" on (\"emps\".\"deptno\" = \"depts\".\"deptno\")\n"
+        + "where \"depts\".\"deptno\" > 10";
+
+    MaterializedViewFixture.create(query, hepTester)
+        .withMaterializations(ImmutableList.of(Pair.of(materialize, "MV0")))
+        .checkingThatResultContains("EnumerableTableScan(table=[[hr, MV0]])")
         .ok();
   }
 

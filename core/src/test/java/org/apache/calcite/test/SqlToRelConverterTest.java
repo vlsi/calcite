@@ -45,7 +45,11 @@ import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.logical.LogicalTableModify;
 import org.apache.calcite.rel.rules.CoreRules;
 import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.rex.RexBuilder;
+import org.apache.calcite.rex.RexCall;
+import org.apache.calcite.rex.RexCallBinding;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.rex.RexShuttle;
 import org.apache.calcite.sql.SqlExplainLevel;
 import org.apache.calcite.sql.fun.SqlLibrary;
 import org.apache.calcite.sql.type.SqlTypeName;
@@ -55,7 +59,6 @@ import org.apache.calcite.sql.validate.SqlDelegatingConformance;
 import org.apache.calcite.sql.validate.SqlValidatorUtil;
 import org.apache.calcite.sql.validate.implicit.TypeCoercionImpl;
 import org.apache.calcite.test.catalog.MockCatalogReaderExtended;
-import org.apache.calcite.util.Bug;
 import org.apache.calcite.util.TestUtil;
 import org.apache.calcite.util.Util;
 
@@ -76,10 +79,13 @@ import java.util.function.Consumer;
 
 import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.CoreMatchers.is;
+import static org.hamcrest.CoreMatchers.not;
 import static org.hamcrest.CoreMatchers.notNullValue;
 import static org.hamcrest.CoreMatchers.nullValue;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasSize;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * Unit test for {@link org.apache.calcite.sql2rel.SqlToRelConverter}.
@@ -144,6 +150,47 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
   }
 
   /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7268">[CALCITE-7268]
+   * SqlToRelConverter throws exception if lambda contains IN</a>. */
+  @Test void testLambdaExpressionContainsIn() {
+    final String sql = "select \"EXISTS\"(ARRAY[1,2,3,4], (n) -> n IN (1,3))";
+    fixture()
+        .withFactory(c ->
+            c.withOperatorTable(t -> SqlValidatorTest.operatorTableFor(SqlLibrary.SPARK)))
+        .withSql(sql)
+        .ok();
+
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7718">[CALCITE-7718]
+   * Lambda capturing ROW field crashes at compilation with assertion
+   * failure</a>. */
+  @Test void testLambdaExpressionWithStructCaptureMerge() {
+    final String sql = "select \"EXISTS\"(array(1, 2), x -> x = t.r.\"EXPR$0\")\n"
+        + "from (select ROW(1, 2) as r) as t";
+    fixture()
+        .withFactory(c ->
+            c.withOperatorTable(t -> SqlValidatorTest.operatorTableFor(SqlLibrary.SPARK)))
+        .withSql(sql)
+        .ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7718">[CALCITE-7718]
+   * Lambda capturing ROW field crashes at compilation with assertion
+   * failure</a>. */
+  @Test void testLambdaExpressionWithStructCaptureMergeOverScan() {
+    final String sql = "select \"EXISTS\"(array(1, 2), x -> x = t.r.\"EXPR$0\")\n"
+        + "from (select ROW(deptno, sal) as r from emp) as t";
+    fixture()
+        .withFactory(c ->
+            c.withOperatorTable(t -> SqlValidatorTest.operatorTableFor(SqlLibrary.SPARK)))
+        .withSql(sql)
+        .ok();
+  }
+
+  /** Test case for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-3679">[CALCITE-3679]
    * Allow lambda expressions in SQL queries</a>. */
   @Test void testLambdaExpression3() {
@@ -152,6 +199,160 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
         .withFactory(c ->
             c.withOperatorTable(t -> MockSqlOperatorTable.standard().extend()))
         .withSql(sql)
+        .ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7269">[CALCITE-7269]
+   * SqlValidator throws exception if lambda parameter is struct</a>. */
+  @Test void testLambdaExpressionWithRowParameter() {
+    final String sql = "select \"EXISTS\"(array(ROW(true, false)), x -> x.\"EXPR$1\")";
+    fixture()
+        .withFactory(c ->
+            c.withOperatorTable(t -> SqlValidatorTest.operatorTableFor(SqlLibrary.SPARK)))
+        .withSql(sql)
+        .ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7269">[CALCITE-7269]
+   * SqlValidator throws exception if lambda parameter is struct</a>.
+   * A lambda that captures a field access on a struct column of the
+   * enclosing query. */
+  @Test void testLambdaExpressionWithStructCapture() {
+    final String sql = "select \"EXISTS\"(array[f0.c0, f1.c0], x -> x = f1.c2)\n"
+        + "from struct.t";
+    fixture()
+        .withFactory(c ->
+            c.withOperatorTable(t -> SqlValidatorTest.operatorTableFor(SqlLibrary.SPARK)))
+        .withSql(sql)
+        .ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7269">[CALCITE-7269]
+   * SqlValidator throws exception if lambda parameter is struct</a>.
+   * A nested ROW value used both inside a lambda (as a capture) and outside
+   * of it (to extract a field); the two uses must see the same shape. */
+  @Test void testLambdaExpressionStructUsedInsideAndOutside() {
+    final String sql = "select \"EXISTS\"(array(1, 2),"
+        + " x -> x = t.r.\"EXPR$0\".\"EXPR$1\") as e,\n"
+        + " t.r.\"EXPR$0\".\"EXPR$0\" as v\n"
+        + "from (select ROW(ROW(1, 2), 3) as r) as t";
+    fixture()
+        .withFactory(c ->
+            c.withOperatorTable(t -> SqlValidatorTest.operatorTableFor(SqlLibrary.SPARK)))
+        .withSql(sql)
+        .ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7269">[CALCITE-7269]
+   * SqlValidator throws exception if lambda parameter is struct</a>.
+   * A nested field access in the lambda. */
+  @Test void testLambdaExpressionWithNestedRowParameter() {
+    final String sql = "select \"EXISTS\"(array(ROW(ROW(1, 2), 3)),"
+        + " x -> x.\"EXPR$0\".\"EXPR$1\" > 1)";
+    fixture()
+        .withFactory(c ->
+            c.withOperatorTable(t -> SqlValidatorTest.operatorTableFor(SqlLibrary.SPARK)))
+        .withSql(sql)
+        .ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7269">[CALCITE-7269]
+   * SqlValidator throws exception if lambda parameter is struct</a>.
+   * A lambda over an array of nested structs. */
+  @Test void testLambdaExpressionOverStructArrayColumn() {
+    final String sql = "select \"EXISTS\"(employees, e -> e.empno = 1)\n"
+        + "from dept_nested";
+    fixture()
+        .withFactory(c ->
+            c.withOperatorTable(t -> SqlValidatorTest.operatorTableFor(SqlLibrary.SPARK)))
+        .withSql(sql)
+        .ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7269">[CALCITE-7269]
+   * SqlValidator throws exception if lambda parameter is struct</a>. */
+  @Test void testLambdaExpressionNestedAccessOverStructArrayColumn() {
+    final String sql = "select \"EXISTS\"(employees,"
+        + " e -> cardinality(e.detail.skills) > 0)\n"
+        + "from dept_nested";
+    fixture()
+        .withFactory(c ->
+            c.withOperatorTable(t -> SqlValidatorTest.operatorTableFor(SqlLibrary.SPARK)))
+        .withSql(sql)
+        .ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7269">[CALCITE-7269]
+   * SqlValidator throws exception if lambda parameter is struct</a>.
+   * A lambda over an ARRAY sub-query: the flattener splits the sub-query's
+   * struct column into flat columns, and restructures them back under the
+   * {@code Collect} so that the element type, and with it the lambda, are
+   * unchanged. */
+  @Test void testLambdaExpressionOverArrayQuery() {
+    final String sql = "select \"EXISTS\"(array(select ROW(ROW(1, 2), 3)"
+        + " from (values (0))), x -> x.\"EXPR$0\".\"EXPR$1\" = 2)";
+    fixture()
+        .withFactory(c ->
+            c.withOperatorTable(t -> SqlValidatorTest.operatorTableFor(SqlLibrary.SPARK)))
+        .withSql(sql)
+        .ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7269">[CALCITE-7269]
+   * SqlValidator throws exception if lambda parameter is struct</a>.
+   * A lambda over a correlated array column. */
+  @Test void testLambdaExpressionOverCorrelatedStructArrayColumn() {
+    final String sql = "select (select \"EXISTS\"(d.employees,"
+        + " e -> cardinality(e.detail.skills) > 0) from (values (0)))\n"
+        + "from dept_nested as d";
+    fixture()
+        .withFactory(c ->
+            c.withOperatorTable(t -> SqlValidatorTest.operatorTableFor(SqlLibrary.SPARK)))
+        .withSql(sql)
+        .withDecorrelate(false)
+        .withTrim(true)
+        .ok();
+  }
+
+  /** As {@link #testLambdaExpressionOverCorrelatedStructArrayColumn}, but
+   * the parameter {@code e} is captured inside a nested lambda whose own
+   * parameter {@code f} has the same index and type. */
+  @Test void testLambdaExpressionCaptureInNestedLambda() {
+    final String sql = "select (select \"EXISTS\"(d.employees,"
+        + " e -> \"EXISTS\"(t.employees,"
+        + " f -> f.empno = e.empno and cardinality(e.detail.skills) > 0))\n"
+        + "from dept_nested t)\n"
+        + "from dept_nested as d";
+    fixture()
+        .withFactory(c ->
+            c.withOperatorTable(t -> SqlValidatorTest.operatorTableFor(SqlLibrary.SPARK)))
+        .withSql(sql)
+        .withDecorrelate(false)
+        .withTrim(true)
+        .ok();
+  }
+
+  /** As {@link #testLambdaExpressionOverCorrelatedStructArrayColumn}, but
+   * the array's element has three levels of struct nesting; the element
+   * type and the access path pass through flattening unchanged. */
+  @Test void testLambdaExpressionOverCorrelatedDeeplyNestedArray() {
+    final String sql = "select (select \"EXISTS\"(t.arr,"
+        + " x -> x.\"EXPR$0\".\"EXPR$0\".\"EXPR$1\" = 2) from (values (0)))\n"
+        + "from (select array(ROW(ROW(ROW(1, 2), 3), 4)) as arr) as t";
+    fixture()
+        .withFactory(c ->
+            c.withOperatorTable(t -> SqlValidatorTest.operatorTableFor(SqlLibrary.SPARK)))
+        .withSql(sql)
+        .withDecorrelate(false)
+        .withTrim(true)
         .ok();
   }
 
@@ -167,6 +368,19 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
         .ok();
   }
 
+  /** Test case for nested lambda: inner lambda references outer lambda
+   * parameter. Verifies that 'x' in the inner lambda is resolved from the
+   * outer lambda scope, not treated as a table column name. */
+  @Test void testNestedLambdaExpression() {
+    final String sql =
+        "select \"EXISTS\"(array(1,2,3), x -> \"EXISTS\"(array(1,2,3), y -> x + y = 4))";
+    fixture()
+        .withFactory(c ->
+            c.withOperatorTable(t -> SqlValidatorTest.operatorTableFor(SqlLibrary.SPARK)))
+        .withSql(sql)
+        .ok();
+  }
+
   @Test void testDotLiteralAfterRow() {
     final String sql = "select row(1,2).\"EXPR$1\" from emp";
     sql(sql).ok();
@@ -175,6 +389,17 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
   @Test void testDotAfterParenthesizedIdentifier() {
     final String sql = "select (home_address).city from emp_address";
     sql(sql).ok();
+  }
+
+  @Test void testColonFieldAccess() {
+    final SqlConformance colonMode =
+        new SqlDelegatingConformance(SqlConformanceEnum.DEFAULT) {
+          @Override public boolean isColonFieldAccessAllowed() {
+            return true;
+          }
+        };
+    final String sql = "select cast(empno as variant):a.b['c'][0] from emp";
+    sql(sql).withConformance(colonMode).ok();
   }
 
   @Test void testRowValueConstructorWithSubQuery() {
@@ -299,6 +524,137 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     sql(sql).ok();
   }
 
+  /** Checks that every call in the plan for {@code sql} has the type that its
+   * operator derives from its operands. */
+  private void checkCallTypesConsistent(String sql) {
+    final RelNode rel = sql(sql).toRel();
+    final RexBuilder rexBuilder = rel.getCluster().getRexBuilder();
+    final RexShuttle shuttle = new RexShuttle() {
+      @Override public RexNode visitCall(RexCall call) {
+        final RelDataType derived =
+            call.getOperator().inferReturnType(
+                RexCallBinding.create(rexBuilder.getTypeFactory(), call, ImmutableList.of()));
+        assertThat("type of " + call,
+            call.getType().getFullTypeString(), is(derived.getFullTypeString()));
+        return super.visitCall(call);
+      }
+    };
+    new RelHomogeneousShuttle() {
+      @Override public RelNode visit(RelNode other) {
+        other.accept(shuttle);
+        return super.visit(other);
+      }
+    }.visit(rel);
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7741">[CALCITE-7741]
+   * Outer join register incorrect types for their input collections</a>.
+   *
+   * <p>A LEFT JOIN pads with NULLs the right input. */
+  @Test void testJoinConditionTypeLeft() {
+    checkCallTypesConsistent("select e.ename, d.name from emp as e\n"
+        + "left join dept as d on e.ename = trim(d.name)");
+    checkCallTypesConsistent("select e.ename, d.name from emp as e\n"
+        + "left join dept as d on trim(e.ename) = trim(d.name)");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7741">[CALCITE-7741]
+   * Outer join register incorrect types for their input collections</a>.
+   *
+   * <p>An ON condition that reads only the NULL-padded side. */
+  @Test void testJoinConditionTypeOnePaddedSideOnly() {
+    checkCallTypesConsistent("select e.ename, d.name from emp as e\n"
+        + "left join dept as d on trim(d.name) = cast(d.deptno as varchar(10))");
+    checkCallTypesConsistent("select e.ename, d.name from emp as e\n"
+        + "left join dept as d on trim(d.name) = 'x'");
+    checkCallTypesConsistent("select e.ename, d.name from dept as d\n"
+        + "right join emp as e on trim(d.name) = 'x'");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7741">[CALCITE-7741]
+   * Outer join register incorrect types for their input collections</a>.
+   *
+   * <p>A RIGHT JOIN, whose output NULL pads the left input. */
+  @Test void testJoinConditionTypeRight() {
+    checkCallTypesConsistent("select e.ename, d.name from dept as d\n"
+        + "right join emp as e on e.ename = trim(d.name)");
+    checkCallTypesConsistent("select e.ename, d.name from dept as d\n"
+        + "right join emp as e on trim(d.name) = trim(e.ename)");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7741">[CALCITE-7741]
+   * Outer join register incorrect types for their input collections</a>.
+   *
+   * <p>A FULL JOIN, whose output NULL pads both inputs. */
+  @Test void testJoinConditionTypeFull() {
+    checkCallTypesConsistent("select e.ename, d.name from emp as e\n"
+        + "full join dept as d on trim(e.ename) = trim(d.name)");
+    checkCallTypesConsistent("select e.ename, d.name from dept as d\n"
+        + "full join emp as e on trim(d.name) = trim(e.ename)");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7741">[CALCITE-7741]
+   * Outer join register incorrect types for their input collections</a>.
+   *
+   * <p>An ON condition over a column that a nested outer join
+   * has already padded: there the column really is nullable, so the condition
+   * must see it as nullable. */
+  @Test void testJoinConditionTypeNestedOuter() {
+    checkCallTypesConsistent("select e.ename from emp as e\n"
+        + "left join (dept as d left join emp as e2\n"
+        + "    on trim(d.name) = trim(e2.ename))\n"
+        + "  on trim(e.ename) = trim(e2.ename)");
+    checkCallTypesConsistent("select e.ename from\n"
+        + "(emp as e2 right join dept as d\n"
+        + "    on trim(e2.ename) = trim(d.name))\n"
+        + "  right join emp as e on trim(e2.ename) = trim(e.ename)");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7741">[CALCITE-7741]
+   * Outer join register incorrect types for their input collections</a>.
+   *
+   * <p>An inner join nested inside the padded side of an outer
+   * join: the padding the outer join applies must not affect the condition of the inner join. */
+  @Test void testJoinConditionTypeInnerUnderOuter() {
+    checkCallTypesConsistent("select e.ename from emp as e\n"
+        + "left join (emp as e2 join dept as d on trim(e2.ename) = trim(d.name))\n"
+        + "  on trim(e.ename) = trim(d.name)");
+    checkCallTypesConsistent("select e.ename from\n"
+        + "(emp as e2 join dept as d on trim(e2.ename) = trim(d.name))\n"
+        + "  right join emp as e on trim(e.ename) = trim(d.name)");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7741">[CALCITE-7741]
+   * Outer join register incorrect types for their input collections</a>.
+   *
+   * <p>A join condition over an expression other than TRIM, and
+   * for an INNER JOIN, which pads nothing. */
+  @Test void testJoinConditionTypeOtherExpressions() {
+    checkCallTypesConsistent("select e.ename from emp as e\n"
+        + "left join dept as d on upper(e.ename) = upper(d.name)");
+    checkCallTypesConsistent("select e.ename from emp as e\n"
+        + "left join dept as d on char_length(e.ename) = char_length(d.name)");
+    checkCallTypesConsistent("select e.ename from emp as e\n"
+        + "join dept as d on trim(e.ename) = trim(d.name)");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7741">[CALCITE-7741]
+   * Outer join register incorrect types for their input collections</a>.
+   *
+   * <p>A LATERAL table on the padded side of an outer join. */
+  @Test void testJoinConditionTypeLateral() {
+    checkCallTypesConsistent("select * from dept as d\n"
+        + "left join lateral (select * from emp as e where e.deptno = d.deptno) as l on true");
+  }
+
   @Test void testJoinOnIn() {
     final String sql = "select * from emp join dept\n"
         + " on emp.deptno = dept.deptno and emp.empno in (1, 3)";
@@ -335,6 +691,17 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     final String sql = "select * from emp left join dept\n"
         + "on emp.empno = 1\n"
         + "or exists (select deptno from emp where empno > dept.deptno + 5)";
+    sql(sql).withExpand(false).ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-4792">[CALCITE-4792]
+   * SqlToRel should populate corralateId for join with corralated query in ON condition</a>.
+   */
+  @Test void testJoinOnCorrelatedSubQuery() {
+    final String sql = "select * from emp inner join dept\n"
+        + "on emp.deptno = dept.deptno\n"
+        + "and exists (select 1 from emp e2 where e2.deptno = dept.deptno)";
     sql(sql).withExpand(false).ok();
   }
 
@@ -449,6 +816,46 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     final String sql = "SELECT deptno, name\n"
         + "FROM emp JOIN dept using (deptno)";
     sql(sql).ok();
+  }
+
+  /** Similar to {@link #testJoinUsingWithUnqualifiedCommonColumn()},
+   * but with an unqualified common column in ORDER BY. */
+  @Test void testJoinUsingWithUnqualifiedCommonColumnInOrderBy() {
+    sql("SELECT name\n"
+        + "FROM emp JOIN dept using (deptno)\n"
+        + "ORDER BY deptno").ok();
+  }
+
+  /** Similar to {@link #testJoinUsingWithUnqualifiedCommonColumn()},
+   * but NATURAL JOIN and an unqualified common column in ORDER BY. */
+  @Test void testJoinNaturalWithUnqualifiedCommonColumnInOrderBy() {
+    sql("SELECT name\n"
+        + "FROM emp NATURAL JOIN dept\n"
+        + "ORDER BY deptno").ok();
+  }
+
+  /** Similar to {@link #testJoinUsingWithUnqualifiedCommonColumn()},
+   * but FULL JOIN and an unqualified common column in ORDER BY. */
+  @Test void testFullJoinUsingWithUnqualifiedCommonColumnInOrderBy() {
+    sql("SELECT name\n"
+        + "FROM emp FULL JOIN dept using (deptno)\n"
+        + "ORDER BY deptno DESC").ok();
+  }
+
+  /** Similar to {@link #testJoinUsingWithAggregate()},
+   * but with GROUP BY and an unqualified common column in ORDER BY. */
+  @Test void testJoinUsingWithUnqualifiedCommonColumnInGroupByAndOrderBy() {
+    sql("SELECT deptno, count(*)\n"
+        + "FROM emp JOIN dept using (deptno)\n"
+        + "GROUP BY deptno ORDER BY deptno").ok();
+  }
+
+  /** Similar to {@link #testJoinNaturalWithAggregate()},
+   * but with GROUP BY and an unqualified common column in ORDER BY. */
+  @Test void testJoinNaturalWithUnqualifiedCommonColumnInGroupByAndOrderBy() {
+    sql("SELECT deptno, count(*)\n"
+        + "FROM emp NATURAL JOIN dept\n"
+        + "GROUP BY deptno ORDER BY deptno DESC").ok();
   }
 
   /** Similar to {@link #testJoinUsingWithUnqualifiedCommonColumn()},
@@ -869,6 +1276,13 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     sql(sql).ok();
   }
 
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7366">[CALCITE-7366]
+   * RexLiteral.valueMatchesType throws for a MAP type</a>. */
+  @Test void testStringToMapCast() {
+    final String sql = "SELECT CAST('a' AS MAP<INT, INT>)";
+    sql(sql).ok();
+  }
+
   @Test void testGroupBug281b() {
     // Try to confuse it with spurious columns.
     final String sql = "select name, foo from (\n"
@@ -909,6 +1323,16 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
         + "  deptno, sum(sal * 2) filter (where empno not in (1, 2)), count(*)\n"
         + "from emp\n"
         + "group by deptno";
+    sql(sql).ok();
+  }
+
+  @Test void testNotInSingleValue() {
+    final String sql = "select * from emp where deptno not in (10)";
+    sql(sql).ok();
+  }
+
+  @Test void testNotInMultiValue() {
+    final String sql = "select * from emp where deptno not in (10, 20)";
     sql(sql).ok();
   }
 
@@ -1207,6 +1631,15 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     sql(sql).ok();
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7662">[CALCITE-7662]
+   * Add expression support for OFFSET</a>. */
+  @Test void testOffsetWithExpression() {
+    final String sql =
+        "select empno from emp offset 1 + abs(-2) rows";
+    sql(sql).ok();
+  }
+
   @Test void testFetch() {
     final String sql = "select empno from emp fetch next 5 rows only";
     sql(sql).ok();
@@ -1214,6 +1647,15 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
 
   @Test void testFetchWithDynamicParameter() {
     final String sql = "select empno from emp fetch next ? rows only";
+    sql(sql).ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testFetchWithExpression() {
+    final String sql =
+        "select empno from emp fetch next (1 + abs(-2)) rows only";
     sql(sql).ok();
   }
 
@@ -1593,6 +2035,48 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     sql(sql).ok();
   }
 
+  /** Test cases for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7530">[CALCITE-7530]
+   * FOR SYSTEM_TIME AS OF on CTE causes NPE while validation</a>. */
+  @Test void testSnapshotOnCteOverTemporalTable() {
+    final String sql = "with cte as (select * from products_temporal)\n"
+        + "select * from cte for system_time as of\n"
+        + "   TIMESTAMP '2026-01-01 00:00:00'";
+    sql(sql).ok();
+  }
+
+  @Test void testJoinCteOverTemporalTable() {
+    final String sql = "with cte as (select * from products_temporal)\n"
+        + "select stream * from orders\n"
+        + "join cte for system_time as of orders.rowtime\n"
+        + "on orders.productid = cte.productid";
+    sql(sql).ok();
+  }
+
+  @Test void testSnapshotOnNestedCteOverTemporalTable() {
+    final String sql = "with cte1 as (select * from products_temporal),\n"
+        + "     cte2 as (select * from cte1)\n"
+        + "select * from cte2 for system_time as of\n"
+        + "  TIMESTAMP '2011-01-02 00:00:00'";
+    sql(sql).ok();
+  }
+
+  @Test void testCteUsedWithAndWithoutSnapshot() {
+    final String sql = "with cte as (select * from products_temporal)\n"
+        + "select * from cte\n"
+        + "union all\n"
+        + "select * from cte for system_time as of\n"
+        + "  TIMESTAMP '2011-01-02 00:00:00'";
+    sql(sql).ok();
+  }
+
+  @Test void testSnapshotOnCteOverNonTemporalTable() {
+    final String sql = "with cte as (select * from emp)\n"
+        + "select * from cte for system_time as of\n"
+        + "  TIMESTAMP '2011-01-02 00:00:00'";
+    sql(sql).ok();
+  }
+
   /** Test case for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-1732">[CALCITE-1732]
    * IndexOutOfBoundsException when using LATERAL TABLE with more than one
@@ -1811,6 +2295,20 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     sql(sql).withDecorrelate(false).ok();
   }
 
+  /** Test case for CURSOR containing UNION ALL. */
+  @Test void testCollectionTableWithCursorParamUnion() {
+    final String sql = "select * from table(dedup("
+        + "cursor(select ename from emp union all select ename from emp), 'NAME'))";
+    sql(sql).withDecorrelate(false).ok();
+  }
+
+  /** Test case for CURSOR containing UNION (distinct). */
+  @Test void testCollectionTableWithCursorParamUnionDistinct() {
+    final String sql = "select * from table(dedup("
+        + "cursor(select ename from emp union select ename from emp), 'NAME'))";
+    sql(sql).withDecorrelate(false).ok();
+  }
+
   @Test void testUnnest() {
     final String sql = "select*from unnest(multiset[1,2])";
     sql(sql).ok();
@@ -1866,6 +2364,65 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     sql(sql).withConformance(SqlConformanceEnum.PRESTO).ok();
   }
 
+  /**
+   * Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7547">[CALCITE-7547]
+   * BIG_QUERY conformance should allow field access on
+   * UNNEST(array_of_struct) AS alias</a>.
+   */
+  @Test void testAliasUnnestArrayPlanWithSingleColumnBigQuery() {
+    final String sql = "select d.deptno, employee.empno\n"
+        + "from dept_nested_expanded as d,\n"
+        + " UNNEST(d.employees) as t(employee)";
+    sql(sql).withConformance(SqlConformanceEnum.BIG_QUERY).ok();
+  }
+
+  /**
+   * Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7547">[CALCITE-7547]
+   * BIG_QUERY conformance should allow field access on
+   * UNNEST(array_of_struct) AS alias</a>.
+   */
+  @Test void testAliasUnnestArrayPlanWithDoubleColumnBigQuery() {
+    final String sql = "select d.deptno, e, k.empno\n"
+        + "from dept_nested_expanded as d CROSS JOIN\n"
+        + " UNNEST(d.admins, d.employees) as t(e, k)";
+    sql(sql).withConformance(SqlConformanceEnum.BIG_QUERY).ok();
+  }
+
+  /**
+   * Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7546">[CALCITE-7546]
+   * NullPointerException in SqlToRelConverter for UNNEST(array) AS alias under
+   * conformance with allowAliasUnnestItems=true</a>.
+   */
+  @Test void testAliasUnnestArrayPlanWithoutColumnList() {
+    final String sql = "select d.deptno, e.empno\n"
+        + "from dept_nested_expanded as d,\n"
+        + " UNNEST(d.employees) as e";
+    sql(sql).withConformance(SqlConformanceEnum.PRESTO).ok();
+  }
+
+  @Test void testAliasUnnestScalarArrayPlanWithoutColumnList() {
+    final String sql = "select d.deptno, a\n"
+        + "from dept_nested_expanded as d,\n"
+        + " UNNEST(d.admins) as a";
+    sql(sql).withConformance(SqlConformanceEnum.PRESTO).ok();
+  }
+
+  /**
+   * Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7546">[CALCITE-7546]
+   * NullPointerException in SqlToRelConverter for UNNEST(array) AS alias under
+   * conformance with allowAliasUnnestItems=true</a>, using the exact array
+   * literal reproduction from the issue.
+   */
+  @Test void testAliasUnnestArrayLiteralPlanWithoutColumnList() {
+    final String sql = "select t\n"
+        + "from UNNEST(ARRAY[1, 2, 3]) as t";
+    sql(sql).withConformance(SqlConformanceEnum.PRESTO).ok();
+  }
+
   @Test void testArrayOfRecord() {
     sql("select employees[1].detail.skills[2+3].desc from dept_nested").ok();
   }
@@ -1913,6 +2470,14 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
   @Test void testMultisetOfColumns() {
     final String sql = "select 'abc',multiset[deptno,sal] from emp";
     sql(sql).withExpand(true).ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7847">[CALCITE-7847]
+   * Implicit coercion casts MULTISET operands of a comparison to ARRAY, and
+   * loses the nullability of ROW operands</a>. */
+  @Test void testMultisetComparisonCoercion() {
+    sql("select multiset[deptno] = multiset[cast(deptno as decimal(5, 2))] from dept").ok();
   }
 
   @Test void testMultisetOfColumnsRex() {
@@ -2028,6 +2593,29 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     sql(sql).withDecorrelate(true).withExpand(false).ok();
   }
 
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-4765">[CALCITE-4765]
+   * Complex correlated EXISTS sub-queries used as scalar subqueries
+   * can return wrong results</a>. */
+  @Test void testExistsCorrelatedSubQuery() {
+    final String sql = "select * from emp e1 where exists (\n"
+        + "  select * from (\n"
+        + "    select e2.deptno from emp e2\n"
+        + "    where e2.comm = e1.comm) as table3\n"
+        + "  where table3.deptno <> e1.deptno)";
+    sql(sql).withDecorrelate(false).ok();
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-4765">[CALCITE-4765]
+   * Complex correlated EXISTS sub-queries used as scalar subqueries
+   * can return wrong results</a>. */
+  @Test void testExistsCorrelatedSubQuery2() {
+    final String sql = "SELECT *, EXISTS(select * from (\n"
+        + "  SELECT e2.deptno FROM emp e2 where e1.comm = e2.comm) as table3\n"
+        + "  where table3.deptno <> e1.deptno)\n"
+        + "from emp e1";
+    sql(sql).withDecorrelate(false).ok();
+  }
+
   @Test void testExistsCorrelatedLimit() {
     final String sql = "select*from emp where exists (\n"
         + "  select 1 from dept where emp.deptno=dept.deptno limit 1)";
@@ -2089,6 +2677,24 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     sql(sql).withExpand(false).ok();
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7562">[CALCITE-7562]
+   * SqlToRel misses CAST in case IN expression without type coercion</a>. */
+  @Test void testInDateColumnWithoutTypeCoercion() {
+    final String sql =
+        "select * from emp_b where birthdate in ('2000-06-30', '2000-09-27')";
+    sql(sql).withTypeCoercion(false).ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7562">[CALCITE-7562]
+   * SqlToRel misses CAST in case IN expression without type coercion</a>. */
+  @Test void testInDateColumnWithTypeCoercion() {
+    final String sql =
+        "select * from emp_b where birthdate in ('2000-06-30', '2000-09-27')";
+    sql(sql).ok();
+  }
+
   @Test void testInValueListLong() {
     // Go over the default threshold of 20 to force a sub-query.
     final String sql = "select empno from emp where deptno in"
@@ -2120,6 +2726,31 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     final String sql = "select empno from emp where deptno not in"
         + " (select deptno from dept)";
     sql(sql).ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7821">[CALCITE-7821]
+   * Correlated query crashes SqlToRelConverter</a>. */
+  @Test void testNotInCorrelatedNullable() {
+    final String sql = "select * from emp as t where t.mgr not in"
+        + " (select s.mgr from emp as s where s.empno = t.empno)";
+    sql(sql).withExpand(true).ok();
+  }
+
+  /** As {@link #testNotInCorrelatedNullable()}, but without decorrelation. */
+  @Test void testNotInCorrelatedNullableNoDecorrelate() {
+    final String sql = "select * from emp as t where t.mgr not in"
+        + " (select s.mgr from emp as s where s.empno = t.empno)";
+    sql(sql).withExpand(true).withDecorrelate(false).ok();
+  }
+
+  /** As {@link #testNotInCorrelatedNullable()}, but in HAVING, where the
+   * outer query is an aggregate. */
+  @Test void testNotInCorrelatedNullableHaving() {
+    final String sql = "select deptno from emp as e group by deptno\n"
+        + "having deptno not in\n"
+        + " (select s.mgr from emp as s where s.deptno = e.deptno)";
+    sql(sql).withExpand(true).ok();
   }
 
   @Test void testAllValueList() {
@@ -2197,7 +2828,7 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     // -- it's not forced into 2-valued by the "... IS TRUE" wrapper as in the
     // WHERE clause -- so the translation is more complicated.
     final String sql = "select name, deptno in (\n"
-        + "  select case when true then deptno else null end from emp)\n"
+        + "  select case when deptno > 0 then deptno else null end from emp)\n"
         + "from dept";
     sql(sql).ok();
   }
@@ -2207,7 +2838,7 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     // -- it's not forced into 2-valued by the "... IS TRUE" wrapper as in the
     // WHERE clause -- so the translation is more complicated.
     final String sql = "select name, deptno in (\n"
-        + "  select case when true then deptno else null end from emp)\n"
+        + "  select case when deptno > 0 then deptno else null end from emp)\n"
         + "from dept";
     sql(sql).withExpand(false).ok();
   }
@@ -2218,14 +2849,14 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
         + "group by deptno\n"
         + "having count(*) > 2\n"
         + "and deptno in (\n"
-        + "  select case when true then deptno else null end from emp)";
+        + "  select case when deptno > 0 then deptno else null end from emp)";
     sql(sql).withExpand(false).ok();
   }
 
   @Test void testUncorrelatedScalarSubQueryInOrderRex() {
     final String sql = "select ename\n"
         + "from emp\n"
-        + "order by (select case when true then deptno else null end from emp) desc,\n"
+        + "order by (select case when deptno > 0 then deptno else null end from emp) desc,\n"
         + "  ename";
     sql(sql).withExpand(false).ok();
   }
@@ -2234,7 +2865,7 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     final String sql = "select sum(sal) as s\n"
         + "from emp\n"
         + "group by deptno\n"
-        + "order by (select case when true then deptno else null end from emp) desc,\n"
+        + "order by (select case when deptno > 0 then deptno else null end from emp) desc,\n"
         + "  count(*)";
     sql(sql).withExpand(false).ok();
   }
@@ -2250,14 +2881,14 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
    * an extra NOT. Both queries require 3-valued logic. */
   @Test void testNotInUncorrelatedSubQueryInSelect() {
     final String sql = "select empno, deptno not in (\n"
-        + "  select case when true then deptno else null end from dept)\n"
+        + "  select case when deptno > 0 then deptno else null end from dept)\n"
         + "from emp";
     sql(sql).ok();
   }
 
   @Test void testNotInUncorrelatedSubQueryInSelectRex() {
     final String sql = "select empno, deptno not in (\n"
-        + "  select case when true then deptno else null end from dept)\n"
+        + "  select case when deptno > 0 then deptno else null end from dept)\n"
         + "from emp";
     sql(sql).withExpand(false).ok();
   }
@@ -2456,6 +3087,13 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
   @Test void testTableFunctionTumble() {
     final String sql = "select *\n"
         + "from table(tumble(table Shipments, descriptor(rowtime), INTERVAL '1' MINUTE))";
+    sql(sql).ok();
+  }
+
+  @Test void testTableFunctionTumbleConvert() {
+    final String sql = "with t as (select CAST(rowtime AS TIMESTAMP(2)) as rowtime FROM Shipments) "
+        + "select *\n"
+        + "from table(tumble(table t, descriptor(rowtime), INTERVAL '1.5' SECOND))";
     sql(sql).ok();
   }
 
@@ -2849,6 +3487,23 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     sql(sql).ok();
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6648">[CALCITE-6648]
+   * IGNORE NULLS / RESPECT NULLS window function option can result in a type
+   * validation error in SqlToRelConverter</a>.
+   */
+  @Test void testOverNullTreatmentWithOffsetRowsFrame() {
+    final String sql = "select\n"
+        + "first_value(deptno) ignore nulls over "
+        + "(order by empno rows 1 preceding),\n"
+        + "last_value(deptno) respect nulls over "
+        + "(order by empno rows 1 preceding),\n"
+        + "nth_value(deptno, 2) ignore nulls over "
+        + "(order by empno rows 1 preceding)\n"
+        + "from emp";
+    sql(sql).ok();
+  }
+
   /**
    * Tests that a window with a FOLLOWING bound becomes BETWEEN CURRENT ROW
    * AND FOLLOWING.
@@ -2905,10 +3560,6 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
   }
 
   @Test void testInterval() {
-    // temporarily disabled per DTbug 1212
-    if (!Bug.DT785_FIXED) {
-      return;
-    }
     final String sql =
         "values(cast(interval '1' hour as interval hour to second))";
     sql(sql).ok();
@@ -3391,6 +4042,23 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     sql(sql).ok();
   }
 
+  /**
+   * Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7276">[CALCITE-7276]
+   * SqlToRelConverter throws exception for UPDATE if identifier expansion disabled</a>.
+   */
+  @Test void testUpdateWithIdentifierExpansionDisabled() {
+    final String sql = "update emp set empno = empno + 1";
+    sql(sql)
+        .withFactory(f ->
+            f.withValidator((opTab, catalogReader, typeFactory, config)
+                -> SqlValidatorUtil.newValidator(opTab, catalogReader,
+                typeFactory, config.withIdentifierExpansion(false))))
+        .withTrim(false)
+        .ok();
+  }
+
+
   @Test void testUpdateSubQuery() {
     final String sql = "update emp\n"
         + "set empno = (\n"
@@ -3490,6 +4158,114 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
         + "when not matched then insert (empno, ename, deptno, sal)\n"
         + "values(t.empno, t.ename, 10, t.sal * .15)";
     sql(sql).ok();
+  }
+
+  /** Tests a MERGE whose UPDATE contains a correlated sub-query referencing a
+   * target column that has the same name as a source column. */
+  @Test void testMergeUpdateCorrelatedSubQuery() {
+    final String sql = "merge into empnullables e\n"
+        + "using (select * from emp) t\n"
+        + "on e.empno = t.empno\n"
+        + "when matched then update\n"
+        + "set sal = (select d.deptno from dept d where d.deptno = e.deptno)";
+    sql(sql).withExpand(false).ok();
+  }
+
+  /** Tests a MERGE whose UPDATE contains a correlated sub-query, with
+   * sub-queries expanded into joins ({@code expand = true}). */
+  @Test void testMergeUpdateCorrelatedSubQueryExpanded() {
+    final String sql = "merge into empnullables e\n"
+        + "using (select * from emp) t\n"
+        + "on e.empno = t.empno\n"
+        + "when matched then update\n"
+        + "set sal = (select d.deptno from dept d where d.deptno = e.deptno)";
+    sql(sql).withExpand(true).ok();
+  }
+
+  /** As {@link #testMergeUpdateCorrelatedSubQueryExpanded()}, but without
+   * decorrelation, so that the plan keeps the {@code LogicalCorrelate}. */
+  @Test void testMergeUpdateCorrelatedSubQueryExpandedNoDecorrelate() {
+    final String sql = "merge into empnullables e\n"
+        + "using (select * from emp) t\n"
+        + "on e.empno = t.empno\n"
+        + "when matched then update\n"
+        + "set sal = (select d.deptno from dept d where d.deptno = e.deptno)";
+    sql(sql).withExpand(true).withDecorrelate(false).ok();
+  }
+
+  /** Tests a MERGE with an expanded sub-query in the UPDATE and an INSERT
+   * branch, which turns the join of the source and the target into a LEFT
+   * join. */
+  @Test void testMergeUpdateSubQueryExpandedWithInsert() {
+    final String sql = "merge into empnullables e\n"
+        + "using (select * from emp) t\n"
+        + "on e.empno = t.empno\n"
+        + "when matched then update\n"
+        + "set sal = (select max(d.deptno) from dept d)\n"
+        + "when not matched then insert (empno, ename, sal)\n"
+        + "values (t.empno, t.ename, 10)";
+    sql(sql).withExpand(true).ok();
+  }
+
+  /** Tests a MERGE whose UPDATE contains an uncorrelated sub-query, with
+   * sub-queries expanded into joins ({@code expand = true}). */
+  @Test void testMergeUpdateUncorrelatedSubQueryExpanded() {
+    final String sql = "merge into empnullables e\n"
+        + "using (select * from emp) t\n"
+        + "on e.empno = t.empno\n"
+        + "when matched then update\n"
+        + "set sal = (select max(d.deptno) from dept d)";
+    sql(sql).withExpand(true).ok();
+  }
+
+  /** Tests a MERGE whose INSERT values contain an uncorrelated sub-query,
+   * with sub-queries expanded into joins ({@code expand = true}). */
+  @Test void testMergeInsertSubQueryExpanded() {
+    final String sql = "merge into empnullables e\n"
+        + "using (select * from emp) t\n"
+        + "on e.empno = t.empno\n"
+        + "when matched then update set sal = 1\n"
+        + "when not matched then insert (empno, sal)\n"
+        + "values (t.empno, (select max(deptno) from dept))";
+    sql(sql).withExpand(true).ok();
+  }
+
+  /** As {@link #testMergeInsertSubQueryExpanded()}, but with sub-queries not
+   * expanded. */
+  @Test void testMergeInsertSubQuery() {
+    final String sql = "merge into empnullables e\n"
+        + "using (select * from emp) t\n"
+        + "on e.empno = t.empno\n"
+        + "when matched then update set sal = 1\n"
+        + "when not matched then insert (empno, sal)\n"
+        + "values (t.empno, (select max(deptno) from dept))";
+    sql(sql).withExpand(false).ok();
+  }
+
+  /** Tests a MERGE whose INSERT values contain a sub-query correlated to the
+   * source, with sub-queries expanded into joins. */
+  @Test void testMergeInsertCorrelatedSubQueryExpanded() {
+    final String sql = "merge into empnullables e\n"
+        + "using (select * from emp) t\n"
+        + "on e.empno = t.empno\n"
+        + "when not matched then insert (empno, sal)\n"
+        + "values (t.empno,\n"
+        + "  (select d.deptno from dept d where d.deptno = t.deptno))";
+    sql(sql).withExpand(true).ok();
+  }
+
+  /** Tests a MERGE into a modifiable view. The insert row is built for the
+   * view, as the update part, and the modification is on the view; the MERGE
+   * is not rewritten to the underlying table, so the values of the columns
+   * constrained by the view (DEPTNO = 20) are not set. */
+  @Test void testMergeModifiableView() {
+    final String sql = "merge into EMP_MODIFIABLEVIEW e\n"
+        + "using (select * from emp) t\n"
+        + "on e.empno = t.empno\n"
+        + "when matched then update set sal = t.sal\n"
+        + "when not matched then insert (empno, ename, sal)\n"
+        + "values (t.empno, t.ename, t.sal)";
+    sql(sql).withExtendedTester().ok();
   }
 
   @Test void testSelectView() {
@@ -4142,6 +4918,41 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     sql(sql).withExpand(false).withDecorrelate(false).ok();
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7405">[CALCITE-7405]
+   * Correlated subquery where outer tree is affected by bloat optimization
+   * causing project fusion</a>. */
+  @Test void testCorrelationInProjectionWithBloatFusion() {
+    final String sql = "select e1.sal + "
+        + "(select sum(e2.sal) from emp e2 where e2.deptno = d.deptno)\n"
+        + "from dept d join emp e1 on  d.deptno + 1 = e1.deptno";
+    sql(sql)
+        .withExpand(false)
+        .withDecorrelate(false)
+        .withConfig(srcc ->
+            srcc.addRelBuilderConfigTransform(rbc ->
+                rbc.withBloat(100).withPushJoinCondition(true)))
+        .ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7405">[CALCITE-7405]
+   * Correlated subquery using a compound expression from input projection that is not ultimately
+   * projected by query, and where outer tree is affected by bloat optimization causing project
+   * fusion and elimination of compound expression required by correlation</a>. */
+  @Test void testCorrelationInProjectionWithBloatFusionAndCompoundNonProjectedCorrelation() {
+    final String sql = "select d2.name, "
+        + "(select sum(e.sal) from emp e where e.deptno = d2.compound)\n"
+        + "from (select d.name, d.deptno + 1 as compound from dept d) as d2";
+    sql(sql)
+        .withExpand(false)
+        .withDecorrelate(false)
+        .withConfig(srcc ->
+            srcc.addRelBuilderConfigTransform(rbc ->
+                rbc.withBloat(100)))
+        .ok();
+  }
+
   @Test void testCustomColumnResolving() {
     final String sql = "select k0 from struct.t";
     sql(sql).ok();
@@ -4349,6 +5160,22 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     sql(sql).ok();
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7723">[CALCITE-7723]
+   * Queries using Collect with ROW results throw AssertionFailure</a>. */
+  @Test void testArraySubqueryOfNestedRow() {
+    final String sql = "SELECT ARRAY(SELECT ROW(ROW(1, 2), 3) FROM (VALUES (0)))";
+    sql(sql).ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7723">[CALCITE-7723]
+   * Queries using Collect with ROW results throw AssertionFailure</a>. */
+  @Test void testMapSubqueryOfNestedRow() {
+    final String sql = "SELECT MAP(SELECT ROW(1, 2), 'x' FROM (VALUES (0)))";
+    sql(sql).ok();
+  }
+
   @Test void testArraySubqueryOrderByProjectedField() {
     final String sql = "SELECT ARRAY(SELECT empno FROM emp ORDER BY empno)";
     sql(sql).ok();
@@ -4438,6 +5265,19 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
         + "from SALES.CUSTOMER as t1,\n"
         + "lateral (select t2 as fake_col3\n"
         + "         from unnest(t1.fake_col) as t2) as t3";
+    sql(sql).withDynamicTable().ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7776">[CALCITE-7776]
+   * UNNEST WITH ORDINALITY over a column of type ANY has no ORDINALITY
+   * column</a>. A column of a dynamic table has type ANY; UNNEST WITH
+   * ORDINALITY over such a column must still produce an ORDINALITY
+   * column, so that both it and the unnested value can be aliased. */
+  @Test void testDynamicSchemaUnnestWithOrdinality() {
+    final String sql = "select t1.c_nationkey, t3.fake_col3, t3.o\n"
+        + "from SALES.CUSTOMER as t1,\n"
+        + "unnest(t1.fake_col) with ordinality as t3(fake_col3, o)";
     sql(sql).withDynamicTable().ok();
   }
 
@@ -5196,6 +6036,13 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
         .ok();
   }
 
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7589">[CALCITE-7589]
+   * JOIN ... USING might fail with disabled type coercion</a>. */
+  @Test void testNaturalJoinCastNoCoercion2() {
+    final String sql = "select * from emp join dept using(deptno)";
+    sql(sql).withTypeCoercion(false).ok();
+  }
+
   /** Tests LEFT JOIN LATERAL with multiple columns from outer. */
   @Test void testLeftJoinLateral4() {
     final String sql = "select * from (values (4,5)) as t(c,d)\n"
@@ -5675,6 +6522,14 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     expr(expr).ok();
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-5093">[CALCITE-5093]
+   * Quantified comparison operators (e.g. ANY) should support ARRAY arguments</a>. */
+  @Test void testArrayType() {
+    String expr = "1 = any(array[1, 2, 3])";
+    expr(expr).withExpand(false).ok();
+  }
+
   @Test void testFunctionExprInOver() {
     String sql = "select ename, row_number() over(partition by char_length(ename)\n"
         + " order by deptno desc) as rn\n"
@@ -5945,5 +6800,177 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
         + "  from emp e2\n"
         + "  where e1.deptno = e2.deptno)";
     sql(sql).withExpand(false).ok();
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6963">[CALCITE-6963]
+   * SqlToRelConverter fails when subquery is in join on clause</a>. */
+  @Test void testSubqueryInJoinOnClause() {
+    final String sql = "select t1.* from emp t1\n"
+        + "left join dept t2 on t1.deptno = t2.deptno\n"
+        + "and t1.ename in (select t3.ename from emp t3 )";
+    sql(sql).ok();
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-5597">[CALCITE-5597]
+   * SELECT DISTINCT query with ORDER BY column will get error result</a>. */
+  @Test void testDistinctOrderByRand() {
+    final String sql = "select distinct deptno, deptno, empno, 1, 'a' from emp order by rand(), 1";
+    sql(sql).ok();
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7085">[CALCITE-7085]
+   * JOIN USING with unqualified common column fails in a conformance where
+   * allowQualifyingCommonColumn is false (e.g. Oracle, Presto)</a>. */
+  @Test void testJoinUsingWithConformanceOracle() {
+    final String sql = "SELECT deptno, name\n"
+        + "FROM emp JOIN dept using (deptno)";
+    sql(sql).withConformance(SqlConformanceEnum.ORACLE_10).ok();
+  }
+
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7085">[CALCITE-7085]
+   * JOIN USING with unqualified common column fails in a conformance where
+   * allowQualifyingCommonColumn is false (e.g. Oracle, Presto)</a>. */
+  @Test void testLeftJoinUsingWithConformanceOracle() {
+    final String sql = "SELECT deptno, name\n"
+        + "FROM emp LEFT OUTER JOIN dept using (deptno)";
+    sql(sql).withConformance(SqlConformanceEnum.ORACLE_10).ok();
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7085">[CALCITE-7085]
+   * JOIN USING with unqualified common column fails in a conformance where
+   * allowQualifyingCommonColumn is false (e.g. Oracle, Presto)</a>. */
+  @Test void testRightJoinUsingWithConformanceOracle() {
+    final String sql = "SELECT deptno, name\n"
+        + "FROM emp RIGHT OUTER JOIN dept using (deptno)";
+    sql(sql).withConformance(SqlConformanceEnum.ORACLE_10).ok();
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7085">[CALCITE-7085]
+   * JOIN USING with unqualified common column fails in a conformance where
+   * allowQualifyingCommonColumn is false (e.g. Oracle, Presto)</a>. */
+  @Test void testJoinUsingWithConformancePresto() {
+    final String sql = "SELECT deptno, name\n"
+        + "FROM emp JOIN dept using (deptno)";
+    sql(sql).withConformance(SqlConformanceEnum.PRESTO).ok();
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7304">[CALCITE-7304]
+   * Floor/Ceil can not simplify with WEEK TimeUnit</a>. */
+  @Test void testSimplifyNestedFloorWeekFromSql() {
+    final String sql = "select floor(floor(hiredate TO DAY) TO WEEK) from emp";
+    final RelNode rel = sql(sql).toRel();
+    final HepProgramBuilder programBuilder = HepProgram.builder();
+    programBuilder.addRuleInstance(CoreRules.PROJECT_REDUCE_EXPRESSIONS);
+    final HepPlanner planner = new HepPlanner(programBuilder.build());
+    planner.setRoot(rel);
+    final RelNode optimized = planner.findBestExp();
+    final String plan = RelOptUtil.toString(optimized);
+    // After PROJECT_REDUCE_EXPRESSIONS, nested floor(floor(x TO DAY) TO WEEK)
+    // should be simplified to floor(x TO WEEK).
+    assertThat(plan, not(containsString("FLOOR(FLOOR")));
+    assertThat(plan, containsString("FLOOR($4, FLAG(WEEK))"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7692">[CALCITE-7692]
+   * FLOOR/CEIL of INTERVAL produces wrong results</a>.
+   *
+   * <p>FLOOR and CEIL of an interval expression, literal or not, are rewritten
+   * as arithmetic that rounds to a multiple of the interval's leading unit. */
+  @Test void testFloorCeilOfInterval() {
+    final String sql = "select floor(x) as f, ceil(x) as c\n"
+        + "from (values (interval '3:4:5' hour to second)) as t(x)";
+    sql(sql).ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7692">[CALCITE-7692]
+   * FLOOR/CEIL of INTERVAL produces wrong results</a>.
+   *
+   * <p>The rewrite evaluates its operand more than once, which is unsound
+   * for a non-deterministic operand; conversion must fail rather than
+   * produce incorrect results. */
+  @Test void testFloorOfNonDeterministicInterval() {
+    final String sql = "select floor(x * rand()) as f\n"
+        + "from (values (interval '3:4:5' hour to second)) as t(x)";
+    final UnsupportedOperationException e =
+        assertThrows(UnsupportedOperationException.class,
+            () -> sql(sql).toRel());
+    assertThat(e.getMessage(),
+        is("FLOOR of a non-deterministic interval expression is not"
+            + " supported"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7451">[CALCITE-7451]
+   * REINTERPRET should not be used in logical plans</a>.
+   *
+   * <p>Casting an interval to an exact numeric type, which the TIMESTAMPDIFF
+   * family of functions relies on, remains a CAST call in the logical plan;
+   * it used to be rewritten in terms of the deprecated REINTERPRET
+   * operator. */
+  @Test void testCastIntervalToNumericNoReinterpret() {
+    final String sql = "select cast(x as integer) as i,\n"
+        + " cast(x as decimal(6, 1)) as d,\n"
+        + " timestampdiff(minute, ts, ts) as m\n"
+        + "from (values (interval '90' minute,\n"
+        + "  timestamp '2020-01-01 00:00:00')) as t(x, ts)";
+    final String plan = RelOptUtil.toString(sql(sql).toRel());
+    assertThat(plan, not(containsString("Reinterpret")));
+    sql(sql).ok();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7451">[CALCITE-7451]
+   * REINTERPRET should not be used in logical plans</a>.
+   *
+   * <p>The deprecated REINTERPRET operator must not appear in a logical plan;
+   * FLOOR and CEIL of an interval literal used to produce one. */
+  @Test void testFloorCeilOfIntervalLiteral() {
+    final String sql = "select floor(interval '3:4:5' hour to second) as f,\n"
+        + " ceil(interval '3:4:5' hour to second) as c\n"
+        + "from emp";
+    final String plan = RelOptUtil.toString(sql(sql).toRel());
+    assertThat(plan, not(containsString("Reinterpret")));
+    sql(sql).ok();
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-5406">[CALCITE-5406]
+   * Support the SELECT DISTINCT ON statement for PostgreSQL dialect</a>. */
+  @Test void testDistinctOnSimple() {
+    final String sql = "SELECT DISTINCT ON (deptno) empno, ename\n"
+        + "FROM emp\n"
+        + "ORDER BY deptno, empno";
+    sql(sql).withConformance(SqlConformanceEnum.LENIENT).ok();
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-5406">[CALCITE-5406]
+   * Support the SELECT DISTINCT ON statement for PostgreSQL dialect</a>. */
+  @Test void testDistinctOnMultiple() {
+    final String sql = "SELECT DISTINCT ON (deptno, job) empno, ename\n"
+        + "FROM emp\n"
+        + "ORDER BY deptno, job, hiredate DESC";
+    sql(sql).withConformance(SqlConformanceEnum.LENIENT).ok();
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-5406">[CALCITE-5406]
+   * Support the SELECT DISTINCT ON statement for PostgreSQL dialect</a>. */
+  @Test void testDistinctOnWithLimit() {
+    final String sql = "SELECT DISTINCT ON (deptno) empno, ename\n"
+        + "FROM emp\n"
+        + "ORDER BY deptno, empno\n"
+        + "LIMIT 5";
+    sql(sql).withConformance(SqlConformanceEnum.LENIENT).ok();
   }
 }

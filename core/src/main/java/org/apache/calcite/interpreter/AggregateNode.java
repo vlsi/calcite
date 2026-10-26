@@ -22,6 +22,7 @@ import org.apache.calcite.adapter.enumerable.AggImpState;
 import org.apache.calcite.adapter.enumerable.JavaRowFormat;
 import org.apache.calcite.adapter.enumerable.PhysType;
 import org.apache.calcite.adapter.enumerable.PhysTypeImpl;
+import org.apache.calcite.adapter.enumerable.RexImplementorTables;
 import org.apache.calcite.adapter.enumerable.RexToLixTranslator;
 import org.apache.calcite.adapter.enumerable.impl.AggAddContextImpl;
 import org.apache.calcite.adapter.java.JavaTypeFactory;
@@ -143,7 +144,9 @@ public class AggregateNode extends AbstractSingleNode<Aggregate> {
       final JavaTypeFactory typeFactory =
           (JavaTypeFactory) rel.getCluster().getTypeFactory();
       int stateOffset = 0;
-      final AggImpState agg = new AggImpState(0, call, false);
+      final AggImpState agg =
+          new AggImpState(0, call, false,
+              RexImplementorTables.of(rel.getCluster()));
       int stateSize = requireNonNull(agg.state, "agg.state").size();
 
       final BlockBuilder builder2 = new BlockBuilder();
@@ -379,18 +382,28 @@ public class AggregateNode extends AbstractSingleNode<Aggregate> {
       }
       Row key = builder.build();
 
-      if (!accumulators.containsKey(key)) {
-        AccumulatorList list = new AccumulatorList();
+      AccumulatorList list = accumulators.get(key);
+      if (list == null) {
+        list = new AccumulatorList();
         for (AccumulatorFactory factory : accumulatorFactories) {
           list.add(factory.get());
         }
         accumulators.put(key, list);
       }
 
-      accumulators.get(key).send(row);
+      list.send(row);
     }
 
     public void end(Sink sink) throws InterruptedException {
+      if (accumulators.isEmpty() && grouping.isEmpty()) {
+        // The empty grouping set (the grand total) produces a row even when
+        // the input is empty, just as a query with no GROUP BY does.
+        final AccumulatorList list = new AccumulatorList();
+        for (AccumulatorFactory factory : accumulatorFactories) {
+          list.add(factory.get());
+        }
+        accumulators.put(Row.of(), list);
+      }
       for (Map.Entry<Row, AccumulatorList> e : accumulators.entrySet()) {
         final Row key = e.getKey();
         final AccumulatorList list = e.getValue();

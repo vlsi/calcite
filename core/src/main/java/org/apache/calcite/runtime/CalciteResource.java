@@ -164,6 +164,20 @@ public interface CalciteResource {
   @BaseMessage("Values passed to {0} operator must have compatible types")
   ExInst<SqlValidatorException> incompatibleValueType(String a0);
 
+  @BaseMessage("{0} expression must have a numeric type; actual type is ''{1}''")
+  ExInst<SqlValidatorException> offsetFetchExpressionMustBeNumeric(String kind,
+      String type);
+
+  @BaseMessage("{0} expression cannot reference table column ''{1}''")
+  ExInst<SqlValidatorException> offsetFetchExpressionCannotReferenceColumn(
+      String kind, String column);
+
+  @BaseMessage("{0} expression evaluated to NULL")
+  ExInst<SqlValidatorException> offsetFetchExpressionEvaluatedToNull(String kind);
+
+  @BaseMessage("{0} must not be negative")
+  ExInst<SqlValidatorException> offsetFetchValueMustNotBeNegative(String kind);
+
   @BaseMessage("Values in expression list must have compatible types")
   ExInst<SqlValidatorException> incompatibleTypesInList();
 
@@ -244,8 +258,14 @@ public interface CalciteResource {
   ExInst<SqlValidatorException> paramNotFoundInFunctionDidYouMean(String a0,
       String a1, String a2);
 
+  @BaseMessage("Lambda closure is not allowed in this conformance: reference to ''{0}'' from enclosing scope")
+  ExInst<SqlValidatorException> lambdaClosureNotAllowed(String identifier);
+
   @BaseMessage("Param ''{0}'' not found in lambda expression ''{1}''")
   ExInst<SqlValidatorException> paramNotFoundInLambdaExpression(String a0, String a1);
+
+  @BaseMessage("Duplicate lambda parameter ''{0}''")
+  ExInst<SqlValidatorException> duplicateLambdaParameter(String paramName);
 
   @BaseMessage("Operand {0} must be a query")
   ExInst<SqlValidatorException> needQueryOp(String a0);
@@ -331,6 +351,9 @@ public interface CalciteResource {
   @BaseMessage("Cannot specify condition (NATURAL keyword, or ON or USING clause) following CROSS JOIN")
   ExInst<SqlValidatorException> crossJoinDisallowsCondition();
 
+  @BaseMessage("UNNEST is only supported with INNER, LEFT, CROSS, or COMMA join, not ''{0}''")
+  ExInst<SqlValidatorException> unnestInvalidJoinType(String a0);
+
   @BaseMessage("Cannot specify NATURAL keyword with ON or USING clause")
   ExInst<SqlValidatorException> naturalDisallowsOnOrUsing();
 
@@ -341,8 +364,8 @@ public interface CalciteResource {
   ExInst<SqlValidatorException> naturalOrUsingColumnNotCompatible(String a0,
       String a1, String a2);
 
-  @BaseMessage("OVER clause is necessary for window functions")
-  ExInst<SqlValidatorException> absentOverClause();
+  @BaseMessage("window function {0} requires an OVER clause")
+  ExInst<SqlValidatorException> absentOverClause(String a0);
 
   @BaseMessage("MEASURE not valid in aggregate or DISTINCT query")
   ExInst<SqlValidatorException> measureInAggregateQuery();
@@ -504,6 +527,15 @@ public interface CalciteResource {
 
   @BaseMessage("QUALIFY expression ''{0}'' must contain a window function")
   ExInst<SqlValidatorException> qualifyExpressionMustContainWindowFunction(String a0);
+
+  @BaseMessage("SELECT DISTINCT ON is not supported under the current SQL conformance level")
+  ExInst<SqlValidatorException> distinctOnNotAllowed();
+
+  @BaseMessage("SELECT DISTINCT ON requires an ORDER BY clause")
+  ExInst<SqlValidatorException> distinctOnRequiresOrderBy();
+
+  @BaseMessage("SELECT DISTINCT ON expressions must match ORDER BY expressions")
+  ExInst<SqlValidatorException> distinctOnOrderByMismatch();
 
   @BaseMessage("ROW/RANGE not allowed with RANK, DENSE_RANK, ROW_NUMBER, PERCENTILE_CONT/DISC or LAG/LEAD functions")
   ExInst<SqlValidatorException> rankWithFrame();
@@ -729,7 +761,7 @@ public interface CalciteResource {
   @BaseMessage("Map requires an even number of arguments")
   ExInst<SqlValidatorException> mapRequiresEvenArgCount();
 
-  @BaseMessage("Function ''{0}'' should all be of type map, but it is ''{1}''")
+  @BaseMessage("Arguments of function ''{0}'' should all be of type MAP, but ''{1}'' was found")
   ExInst<SqlValidatorException> typesShouldAllBeMap(String funcName, String type);
 
   @BaseMessage("Incompatible types")
@@ -807,6 +839,30 @@ public interface CalciteResource {
   @BaseMessage("SELECT * requires a FROM clause")
   ExInst<SqlValidatorException> selectStarRequiresFrom();
 
+  @BaseMessage("EXCLUDE/EXCEPT clause must follow a STAR expression")
+  ExInst<CalciteException> selectExcludeRequiresStar();
+
+  @BaseMessage("REPLACE clause must follow a STAR expression")
+  ExInst<CalciteException> selectReplaceRequiresStar();
+
+  @BaseMessage("SELECT * EXCLUDE/EXCEPT list contains unknown column(s): {0}")
+  ExInst<SqlValidatorException> selectStarExcludeListContainsUnknownColumns(String columns);
+
+  @BaseMessage("ROW(* EXCLUDE/EXCEPT list) contains unknown column(s): {0}")
+  ExInst<SqlValidatorException> rowStarExcludeListContainsUnknownColumns(String columns);
+
+  @BaseMessage("SELECT * EXCLUDE/EXCEPT list cannot exclude all columns")
+  ExInst<SqlValidatorException> selectStarExcludeCannotExcludeAllColumns();
+
+  @BaseMessage("ROW(* EXCLUDE/EXCEPT list) cannot exclude all columns")
+  ExInst<SqlValidatorException> rowStarExcludeCannotExcludeAllColumns();
+
+  @BaseMessage("SELECT * REPLACE list contains unknown column(s): {0}")
+  ExInst<SqlValidatorException> selectStarReplaceListContainsUnknownColumns(String columns);
+
+  @BaseMessage("SELECT * REPLACE list contains duplicate column(s): {0}")
+  ExInst<SqlValidatorException> selectStarReplaceListContainsDuplicateColumns(String columns);
+
   @BaseMessage("Group function ''{0}'' can only appear in GROUP BY clause")
   ExInst<SqlValidatorException> groupFunctionMustAppearInGroupByClause(String funcName);
 
@@ -879,11 +935,32 @@ public interface CalciteResource {
   @BaseMessage("A recursive query only supports binary UNION [ALL] operator")
   ExInst<SqlValidatorException> recursiveWithMustHaveTwoChildUnionSetOp();
 
+  @BaseMessage("CYCLE requires WITH RECURSIVE")
+  ExInst<SqlValidatorException> cycleRequiresRecursive();
+
+  @BaseMessage("CYCLE requires a UNION [ALL] with a recursive SELECT containing exactly one direct reference to its WITH item")
+  ExInst<SqlValidatorException> cycleRequiresRecursiveSelect();
+
+  @BaseMessage("CYCLE is not supported with aggregation, DISTINCT, or window functions in the recursive SELECT")
+  ExInst<SqlValidatorException> cycleRecursiveSelectNotSupported();
+
+  @BaseMessage("CYCLE column ''{0}'' is not a column of WITH item ''{1}''")
+  ExInst<SqlValidatorException> cycleColumnNotFound(String column, String withItem);
+
+  @BaseMessage("CYCLE generated column ''{0}'' conflicts with another column")
+  ExInst<SqlValidatorException> cycleColumnConflict(String column);
+
+  @BaseMessage("CYCLE mark and default must be distinct, non-null Boolean or compatible single-character string literals")
+  ExInst<SqlValidatorException> cycleInvalidMarkValues();
+
   @BaseMessage("First column of ORDER BY must be of type TIMESTAMP")
   ExInst<SqlValidatorException> firstColumnOfOrderByMustBeTimestamp();
 
   @BaseMessage("Extended columns not allowed under the current SQL conformance level")
   ExInst<SqlValidatorException> extendNotAllowed();
+
+  @BaseMessage("Aggregate function referencing outer column is not allowed under the current SQL conformance level")
+  ExInst<SqlValidatorException> correlatedAggregateNotAllowed();
 
   @BaseMessage("Rolled up column ''{0}'' is not allowed in {1}")
   ExInst<SqlValidatorException> rolledUpNotAllowed(String column, String context);
@@ -1142,7 +1219,7 @@ public interface CalciteResource {
   @BaseMessage("ASOF JOIN MATCH_CONDITION must be a comparison between columns from the two inputs")
   ExInst<SqlValidatorException> asofMatchMustBeComparison();
 
-  @BaseMessage("ASOF JOIN condition must be a conjunction of equality comparisons")
+  @BaseMessage("ASOF JOIN condition must be a conjunction of equality comparisons of columns from both sides")
   ExInst<SqlValidatorException> asofConditionMustBeComparison();
 
   @BaseMessage("ASOF JOIN does not support correlated subqueries")
@@ -1160,6 +1237,21 @@ public interface CalciteResource {
   @BaseMessage("Unequal number of entries in ROW expressions")
   ExInst<SqlValidatorException> unequalRowSizes();
 
+  @BaseMessage("Star is not allowed in ROW constructor outside of query context")
+  ExInst<SqlValidatorException> rowStarNotAllowed();
+
   @BaseMessage("Cannot infer return type for {0}; operand types: {1}")
   ExInst<SqlValidatorException> cannotInferReturnType(String operator, String types);
+
+  @BaseMessage("SELECT BY cannot be used with GROUP BY")
+  ExInst<SqlValidatorException> selectByCannotWithGroupBy();
+
+  @BaseMessage("SELECT BY cannot be used with ORDER BY")
+  ExInst<SqlValidatorException> selectByCannotWithOrderBy();
+
+  @BaseMessage("The argument of DESCRIPTOR must be an identifier")
+  ExInst<SqlValidatorException> descriptorMustBeIdentifier();
+
+  @BaseMessage("Duplicate name ''{0}'' in MATCH_RECOGNIZE MEASURE alias list")
+  ExInst<CalciteException> measureAliasDuplicate(String aliasName);
 }

@@ -21,21 +21,62 @@ import org.apache.calcite.jdbc.JavaTypeFactoryImpl;
 import org.apache.calcite.linq4j.Enumerable;
 import org.apache.calcite.linq4j.tree.Expression;
 import org.apache.calcite.linq4j.tree.Expressions;
+import org.apache.calcite.rel.RelCollation;
+import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.sql.type.SqlTypeName;
+import org.apache.calcite.util.BuiltInMethod;
 
 import com.google.common.collect.ImmutableList;
 
 import org.junit.jupiter.api.Test;
 
 import static org.hamcrest.CoreMatchers.is;
+import static org.hamcrest.CoreMatchers.not;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsString;
 
 /**
  * Test for {@link org.apache.calcite.adapter.enumerable.PhysTypeImpl}.
  */
 public final class PhysTypeTest {
   private static final JavaTypeFactory TYPE_FACTORY = new JavaTypeFactoryImpl();
+
+  @Test void testArrayComparerForPlainStructsAndScalarCollections() {
+    final RelDataType integer = TYPE_FACTORY.createSqlType(SqlTypeName.INTEGER);
+    final RelDataType row = TYPE_FACTORY.builder().add("n", integer).build();
+    for (RelDataType columnType : ImmutableList.of(integer, row,
+        TYPE_FACTORY.builder().add("r", row).build(),
+        TYPE_FACTORY.createArrayType(integer, -1),
+        TYPE_FACTORY.createMapType(integer, integer),
+        TYPE_FACTORY.builder().add("a", TYPE_FACTORY.createArrayType(integer, -1)).build())) {
+      assertComparer(columnType, JavaRowFormat.ARRAY, BuiltInMethod.ARRAY_COMPARER);
+    }
+    // Formats without their own comparer still need the existing ROW fallback.
+    assertComparer(row, JavaRowFormat.LIST, BuiltInMethod.DEEP_COMPARER);
+    assertComparer(row, JavaRowFormat.SCALAR, BuiltInMethod.DEEP_COMPARER);
+  }
+
+  @Test void testDeepComparerForStructsInCollections() {
+    final RelDataType integer = TYPE_FACTORY.createSqlType(SqlTypeName.INTEGER);
+    final RelDataType row = TYPE_FACTORY.builder().add("n", integer).build();
+    final RelDataType array = TYPE_FACTORY.createArrayType(row, -1);
+    for (RelDataType columnType : ImmutableList.of(array,
+        TYPE_FACTORY.createMultisetType(row, -1),
+        TYPE_FACTORY.createMapType(integer, row),
+        TYPE_FACTORY.createMapType(row, integer),
+        TYPE_FACTORY.createArrayType(array, -1),
+        TYPE_FACTORY.builder().add("a", array).build())) {
+      assertComparer(columnType, JavaRowFormat.ARRAY, BuiltInMethod.DEEP_COMPARER);
+    }
+  }
+
+  private static void assertComparer(RelDataType columnType, JavaRowFormat format,
+      BuiltInMethod expected) {
+    final RelDataType rowType = TYPE_FACTORY.builder().add("v", columnType).build();
+    final PhysType physType = PhysTypeImpl.of(TYPE_FACTORY, rowType, format, false);
+    assertThat(columnType.toString(), physType.comparer(), is(Expressions.call(expected.method)));
+  }
 
   /** Test case for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-2677">[CALCITE-2677]
@@ -97,5 +138,34 @@ public final class PhysTypeTest {
         + "}\n"
         + ")";
     assertThat(expected, is(Expressions.toString(e)));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7206">[CALCITE-7206]
+   * Duplicate 'compare' method in the Enumerable merge join comparator when the
+   * row Java class is Object</a>.
+   *
+   * <p>When the row is a single column whose Java class is {@link Object} (for
+   * example a merge join key of type {@code ANY}), the primary
+   * {@code compare(Object, Object)} method and the generated bridge method have
+   * the same signature, so the emitted {@link java.util.Comparator} must not
+   * declare the bridge method twice or it fails to compile. */
+  @Test void testMergeJoinComparatorWithObjectRowHasNoDuplicateBridge() {
+    final RelDataType rowType =
+        TYPE_FACTORY.createStructType(
+            ImmutableList.of(
+                TYPE_FACTORY.createSqlType(SqlTypeName.ANY)),
+            ImmutableList.of("anyField"));
+    final PhysType rowPhysType =
+        PhysTypeImpl.of(TYPE_FACTORY, rowType, JavaRowFormat.SCALAR, false);
+    final RelCollation collation = RelCollations.of(0);
+    final Expression comparator =
+        rowPhysType.generateMergeJoinComparator(collation);
+    final String generated = Expressions.toString(comparator);
+    // The primary compare method is still generated ...
+    assertThat(generated, containsString("public int compare(Object v0, Object v1)"));
+    // ... but the bridge compare(Object o0, Object o1) would collide with it and
+    // must therefore be omitted.
+    assertThat(generated, not(containsString("Object o0, Object o1")));
   }
 }

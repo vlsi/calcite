@@ -19,6 +19,7 @@ package org.apache.calcite.rex;
 import org.apache.calcite.linq4j.Linq4j;
 import org.apache.calcite.plan.RelOptPredicateList;
 import org.apache.calcite.rel.metadata.NullSentinel;
+import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.util.NlsString;
 import org.apache.calcite.util.Pair;
 import org.apache.calcite.util.Util;
@@ -96,6 +97,10 @@ public class RexAnalyzer {
       values.add(0); // 00:00:00.000
       values.add(86_399_000); // 23:59:59.000
       break;
+    case ARRAY:
+    case MAP:
+    case MULTISET:
+      break;
     default:
       throw new AssertionError("don't know values for " + variable
           + " of type " + variable.getType());
@@ -132,6 +137,12 @@ public class RexAnalyzer {
     }
 
     @Override public Void visitCall(RexCall call) {
+      if (SqlKind.CHECKED_ARITHMETIC.contains(call.getKind())) {
+        // RexInterpreter computes with unbounded values, so it cannot tell
+        // whether checked arithmetic overflows
+        ++unsupportedCount;
+        return null;
+      }
       switch (call.getKind()) {
       case CAST:
       case M2V:

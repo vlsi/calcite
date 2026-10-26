@@ -26,6 +26,7 @@ import org.apache.calcite.plan.volcano.RelSubset;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.SingleRel;
 import org.apache.calcite.rel.core.Aggregate;
+import org.apache.calcite.rel.core.Calc;
 import org.apache.calcite.rel.core.Correlate;
 import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.rel.core.Intersect;
@@ -37,16 +38,19 @@ import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.core.TableScan;
 import org.apache.calcite.rel.core.Union;
 import org.apache.calcite.rel.core.Values;
+import org.apache.calcite.rel.core.Window;
 import org.apache.calcite.rel.logical.LogicalValues;
 import org.apache.calcite.rel.metadata.RelMdUtil;
 import org.apache.calcite.rel.type.RelDataType;
-import org.apache.calcite.rex.RexDynamicParam;
 import org.apache.calcite.rex.RexLiteral;
+import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.tools.RelBuilder;
 import org.apache.calcite.tools.RelBuilderFactory;
 
 import org.immutables.value.Value;
 
+import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.function.Predicate;
@@ -189,6 +193,19 @@ public abstract class PruneEmptyRules {
       RemoveEmptySingleRule.RemoveEmptySingleRuleConfig.FILTER.toRule();
 
   /**
+   * Rule that converts a {@link org.apache.calcite.rel.core.Calc}
+   * to empty if its child is empty.
+   *
+   * <p>Examples:
+   *
+   * <ul>
+   * <li>Calc(Empty) becomes Empty
+   * </ul>
+   */
+  public static final RelOptRule CALC_INSTANCE =
+      RemoveEmptySingleRule.RemoveEmptySingleRuleConfig.CALC.toRule();
+
+  /**
    * Rule that converts a {@link org.apache.calcite.rel.core.Sort}
    * to empty if its child is empty.
    *
@@ -233,6 +250,19 @@ public abstract class PruneEmptyRules {
       RemoveEmptySingleRule.RemoveEmptySingleRuleConfig.AGGREGATE.toRule();
 
   /**
+   * Rule that converts a {@link org.apache.calcite.rel.core.Window}
+   * to empty if its child is empty.
+   *
+   * <p>Examples:
+   *
+   * <ul>
+   * <li>Window(Empty) becomes Empty
+   * </ul>
+   */
+  public static final RelOptRule WINDOW_INSTANCE =
+      RemoveEmptySingleRule.RemoveEmptySingleRuleConfig.WINDOW.toRule();
+
+  /**
    * Rule that converts a {@link org.apache.calcite.rel.core.Join}
    * to empty if its left child is empty.
    *
@@ -259,6 +289,7 @@ public abstract class PruneEmptyRules {
    * <li>Join(Scan(Emp), Empty, RIGHT) becomes Empty
    * <li>Join(Scan(Emp), Empty, SEMI) becomes Empty
    * <li>Join(Scan(Emp), Empty, ANTI) becomes Scan(Emp)
+   * <li>Join(Scan(Emp), Empty, LEFT_MARK) becomes Project(Scan(Emp), FALSE)
    * </ul>
    */
   public static final RelOptRule JOIN_RIGHT_INSTANCE =
@@ -356,12 +387,18 @@ public abstract class PruneEmptyRules {
       RemoveEmptySingleRuleConfig FILTER = ImmutableRemoveEmptySingleRuleConfig.of()
           .withDescription("PruneEmptyFilter")
           .withOperandFor(Filter.class, singleRel -> true);
+      RemoveEmptySingleRuleConfig CALC = ImmutableRemoveEmptySingleRuleConfig.of()
+          .withDescription("PruneEmptyCalc")
+          .withOperandFor(Calc.class, singleRel -> true);
       RemoveEmptySingleRuleConfig SORT = ImmutableRemoveEmptySingleRuleConfig.of()
           .withDescription("PruneEmptySort")
           .withOperandFor(Sort.class, singleRel -> true);
       RemoveEmptySingleRuleConfig AGGREGATE = ImmutableRemoveEmptySingleRuleConfig.of()
           .withDescription("PruneEmptyAggregate")
-          .withOperandFor(Aggregate.class, Aggregate::isNotGrandTotal);
+          .withOperandFor(Aggregate.class, aggregate -> !aggregate.hasEmptyGroup());
+      RemoveEmptySingleRuleConfig WINDOW = ImmutableRemoveEmptySingleRuleConfig.of()
+          .withDescription("PruneEmptyWindow")
+          .withOperandFor(Window.class, singleRel -> true);
 
       @Override default RemoveEmptySingleRule toRule() {
         return new RemoveEmptySingleRule(this);
@@ -498,11 +535,9 @@ public abstract class PruneEmptyRules {
       return new RemoveEmptySingleRule(this) {
         @Override public boolean matches(final RelOptRuleCall call) {
           Sort sort = call.rel(0);
-          return sort.fetch != null
-              && !(sort.fetch instanceof RexDynamicParam)
-              && RexLiteral.longValue(sort.fetch) == 0;
+          return sort.fetch instanceof RexLiteral
+              && BigDecimal.ZERO.equals(RexLiteral.bigDecimalValue(sort.fetch));
         }
-
       };
     }
   }
@@ -564,6 +599,17 @@ public abstract class PruneEmptyRules {
           if (join.getJoinType() == JoinRelType.ANTI) {
             // In case of anti join: Join(X, Empty, ANTI) becomes X
             call.transformTo(join.getLeft());
+            return;
+          }
+          if (join.getJoinType() == JoinRelType.LEFT_MARK) {
+            // In case of left mark join with empty right: Join(X, Empty, LEFT_MARK)
+            // The mark column is always FALSE when right is empty
+            relBuilder.push(left);
+            List<RexNode> projects = new ArrayList<>(relBuilder.fields());
+            projects.add(relBuilder.literal(false));
+            relBuilder.project(projects)
+                .convert(join.getRowType(), true);
+            call.transformTo(relBuilder.build());
             return;
           }
           call.transformTo(relBuilder.push(join).empty().build());

@@ -391,6 +391,24 @@ public abstract class RelToSqlConverterUtil {
   }
 
   /**
+   * Transformation Map type from {@code MAP<VARCHAR,INTEGER>} to {@code Map<STRING,INTEGER>}.
+   */
+  public static SqlDataTypeSpec getCastSpecSparkSqlMapType(SqlDialect dialect,
+      RelDataType type, SqlParserPos pos) {
+    MapSqlType mapSqlType = (MapSqlType) type;
+    SqlDataTypeSpec keySpec = (SqlDataTypeSpec) dialect.getCastSpec(mapSqlType.getKeyType());
+    SqlDataTypeSpec valueSpec =
+        (SqlDataTypeSpec) dialect.getCastSpec(mapSqlType.getValueType());
+    SqlDataTypeSpec nonNullKeySpec =
+        requireNonNull(keySpec, "keySpec").withNullable(false);
+    SqlDataTypeSpec nonNullValueSpec =
+        requireNonNull(valueSpec, "valueSpec").withNullable(false);
+    SqlMapTypeNameSpec sqlMapTypeNameSpec =
+        new SqlMapTypeNameSpec(nonNullKeySpec, nonNullValueSpec, pos);
+    return new SqlDataTypeSpec(sqlMapTypeNameSpec, SqlParserPos.ZERO);
+  }
+
+  /**
    * ClickHouseSqlMapTypeNameSpec to parse or unparse SQL MAP type to {@code Map(VARCHAR, VARCHAR)}.
    */
   public static class ClickHouseSqlMapTypeNameSpec extends SqlMapTypeNameSpec {
@@ -445,4 +463,19 @@ public abstract class RelToSqlConverterUtil {
       writer.endList(frame);
     }
   }
+
+  /**
+   * Unparses REGEXP function calls by converting from function call format
+   * (e.g., REGEXP(column, pattern)) to infix operator format (e.g., column REGEXP pattern).
+   */
+  public static void unparseRegexp(SqlWriter writer, SqlCall call, int leftPrec, int rightPrec) {
+    if ("REGEXP".equals(call.getOperator().getName())) {
+      final SqlWriter.Frame frame = writer.startList(SqlWriter.FrameTypeEnum.SIMPLE, "(", ")");
+      call.operand(0).unparse(writer, leftPrec, rightPrec);
+      writer.sep("REGEXP", true);
+      call.operand(1).unparse(writer, leftPrec, rightPrec);
+      writer.endList(frame);
+    }
+  }
+
 }

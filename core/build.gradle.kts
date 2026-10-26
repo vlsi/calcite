@@ -69,7 +69,6 @@ dependencies {
     implementation("commons-codec:commons-codec")
     implementation("net.hydromatic:aggdesigner-algorithm")
     implementation("org.apache.commons:commons-dbcp2")
-    implementation("org.apache.commons:commons-lang3")
     implementation("org.apache.commons:commons-math3")
     implementation("org.apache.commons:commons-text")
     implementation("org.jooq:joou-java-6")
@@ -213,8 +212,10 @@ tasks.withType<AutostyleTask>().configureEach {
 }
 
 tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
-    kotlinOptions {
-        jvmTarget = "1.8"
+    compilerOptions {
+        jvmTarget.set(
+                org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8
+        )
     }
 }
 ide {

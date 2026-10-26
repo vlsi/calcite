@@ -39,8 +39,11 @@ pluginManagement {
         idv("net.ltgt.errorprone")
         idv("org.jetbrains.gradle.plugin.idea-ext")
         idv("org.nosphere.apache.rat")
-        idv("org.owasp.dependencycheck")
+        if (JavaVersion.current() >= JavaVersion.VERSION_11) {
+            idv("org.owasp.dependencycheck")
+        }
         idv("org.sonarqube")
+        idv("org.gradle.toolchains.foojay-resolver-convention")
         kotlin("jvm") version "kotlin".v()
     }
     if (extra.has("enableMavenLocal") && extra["enableMavenLocal"].toString().ifBlank { "true" }.toBoolean()) {
@@ -52,6 +55,7 @@ pluginManagement {
 }
 
 plugins {
+    id("org.gradle.toolchains.foojay-resolver-convention")
     id("com.gradle.develocity")
     id("com.gradle.common-custom-user-data-gradle-plugin")
 }

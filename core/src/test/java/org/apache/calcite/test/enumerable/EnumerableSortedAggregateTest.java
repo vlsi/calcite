@@ -50,6 +50,58 @@ public class EnumerableSortedAggregateTest {
             "deptno=20; max_salary=8000.0; num_employee=1");
   }
 
+  @Test void aggOnEmptyInput() {
+    tester(false, new HrSchema())
+        .query("select max(deptno) as m, count(*) as c "
+            + "from emps where deptno > 100")
+        .explainContains(
+            "EnumerableAggregate(group=[{}], m=[MAX($1)], c=[COUNT()])\n"
+                + "  EnumerableCalc")
+        .returnsOrdered("m=null; c=0");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6087">[CALCITE-6087]
+   * EnumerableSortedAggregate returns incorrect result when input is empty</a>. */
+  @Test void sortedAggRuleRejectsEmptyGroupSet() {
+    tester(false, new HrSchema())
+        .query("select max(deptno) as m, count(*) as c "
+            + "from emps where deptno > 100")
+        .withHook(Hook.PLANNER, (Consumer<RelOptPlanner>) planner -> {
+          planner.removeRule(EnumerableRules.ENUMERABLE_AGGREGATE_RULE);
+          planner.addRule(EnumerableRules.ENUMERABLE_SORTED_AGGREGATE_RULE);
+        })
+        .throws_("There are not enough rules to produce a node with desired properties");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6089">[CALCITE-6089]
+   * EnumerableSortedAggregate fails with ClassCastException: class X cannot be
+   * cast to class org.apache.calcite.runtime.FlatLists$ComparableList</a>. */
+  @Test void sortedAggCountUnionRejectsEmptyGroupSet() {
+    tester(false, new HrSchema())
+        .query("select count(*) as c from ( "
+            + "select * from emps where deptno=10 "
+            + "union all "
+            + "select * from emps where deptno=20)")
+        .withHook(Hook.PLANNER, (Consumer<RelOptPlanner>) planner -> {
+          planner.removeRule(EnumerableRules.ENUMERABLE_AGGREGATE_RULE);
+          planner.addRule(EnumerableRules.ENUMERABLE_SORTED_AGGREGATE_RULE);
+        })
+        .throws_("There are not enough rules to produce a node with desired properties");
+  }
+
+  /** As {@link #sortedAggCountUnionRejectsEmptyGroupSet()}, but with the
+   * default rules. */
+  @Test void sortedAggCountUnion() {
+    tester(false, new HrSchema())
+        .query("select count(*) as c from ( "
+            + "select * from emps where deptno=10 "
+            + "union all "
+            + "select * from emps where deptno=20)")
+        .returnsOrdered("c=4");
+  }
+
   @Test void sortedAggTwoGroupKeys() {
     tester(false, new HrSchema())
         .query(
@@ -131,6 +183,106 @@ public class EnumerableSortedAggregateTest {
             "commission=500; num_dept=1",
             "commission=1000; num_dept=1",
             "commission=null; num_dept=1");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-5101">[CALCITE-5101]
+   * LISTAGG(DISTINCT ...) WITHIN GROUP fails with ArrayIndexOutOfBoundsException</a>. */
+  @Test void listAggDistinctWithinGroupOrderByNonGroupColumn() {
+    // FAILING CASE: LISTAGG(DISTINCT ...) WITHIN GROUP (ORDER BY non-group-column)
+    // Previously threw: ArrayIndexOutOfBoundsException: Index 2 out of bounds for length 2
+    // Now fixed: ORDER BY salary is properly projected and remapped.
+    // Within each group, names are ordered by salary (ascending).
+    // deptno=10: Sebastian (7000), Bill (10000), Theodore (11500)
+    // deptno=20: Eric (8000)
+    tester(false, new HrSchema())
+        .query("select deptno, "
+            + "LISTAGG(DISTINCT name) WITHIN GROUP (ORDER BY salary) as names "
+            + "from emps group by deptno")
+        .returnsUnordered(
+            "deptno=10; names=Sebastian,Bill,Theodore",
+            "deptno=20; names=Eric");
+  }
+
+  @Test void listAggDistinctWithoutOrderBy() {
+    // WORKING CASE: LISTAGG(DISTINCT ...) without ORDER BY - always worked
+    tester(false, new HrSchema())
+        .query("select deptno, "
+            + "LISTAGG(DISTINCT name) as names "
+            + "from emps group by deptno")
+        .returnsUnordered(
+            "deptno=10; names=Bill,Sebastian,Theodore",
+            "deptno=20; names=Eric");
+  }
+
+  @Test void listAggWithoutDistinctWithinGroupOrderBy() {
+    // WORKING CASE: LISTAGG(...) WITHIN GROUP (ORDER BY non-group-column)
+    // without DISTINCT - always worked
+    tester(false, new HrSchema())
+        .query("select deptno, "
+            + "LISTAGG(name) WITHIN GROUP (ORDER BY salary) as names "
+            + "from emps group by deptno")
+        .returnsUnordered(
+            "deptno=10; names=Sebastian,Bill,Theodore",
+            "deptno=20; names=Eric");
+  }
+
+  @Test void listAggDistinctWithinGroupOrderByAggColumn() {
+    // WORKING CASE: LISTAGG(DISTINCT ...) WITHIN GROUP (ORDER BY aggregated-column)
+    // - always worked because the aggregated column is in the re-grouped input
+    tester(false, new HrSchema())
+        .query("select deptno, "
+            + "LISTAGG(DISTINCT name) WITHIN GROUP (ORDER BY name) as names "
+            + "from emps group by deptno")
+        .returnsUnordered(
+            "deptno=10; names=Bill,Sebastian,Theodore",
+            "deptno=20; names=Eric");
+  }
+
+  @Test void listAggMultipleDistinctWithinGroupOrderByNonGroupColumn() {
+    // Test case for multiple DISTINCT aggregates with different ORDER BY columns
+    // Previously threw: ArrayIndexOutOfBoundsException
+    // ORDER BY salary for first agg (not a group key), ORDER BY name for second
+    // This tests that collation indices are properly remapped in rewriteUsingGroupingSets
+    tester(false, new HrSchema())
+        .query("select deptno, "
+            + "LISTAGG(DISTINCT name) WITHIN GROUP (ORDER BY salary) as names_by_salary, "
+            + "LISTAGG(DISTINCT commission) WITHIN GROUP (ORDER BY name) as commissions_by_name "
+            + "from emps group by deptno")
+        .returnsUnordered(
+            "deptno=10; names_by_salary=Theodore,Sebastian,Bill; commissions_by_name=250,1000",
+            "deptno=20; names_by_salary=Eric; commissions_by_name=500");
+  }
+
+  @Test void groupingSetsWithDistinctAggAndCollationReferencingOutsideGroupingSets() {
+    // Test that result collation is safely reduced when ORDER BY references
+    // columns not present in all grouping sets.
+    // Why result collation can have fewer elements than input collation:
+    // - Input collation may reference {salary, deptno, name}
+    // - fullGroupSet contains only {deptno, name} (columns in some grouping sets)
+    // - salary is NOT in fullGroupSet (not part of any GROUPING SETS combination)
+    // - In GROUPING SETS ((deptno), (name), ()), salary has inconsistent values
+    //   within each logical group, so sorting by it would be meaningless
+    // - Result collation safely drops salary and keeps only {deptno, name}
+    // This tests that AggregateExpandDistinctAggregatesRule.remapCollationForGroupingSets
+    // correctly filters out columns not in fullGroupSet.
+    // The key point: this query should not throw ArrayIndexOutOfBoundsException.
+    tester(false, new HrSchema())
+        .query("select deptno, name, "
+            + "LISTAGG(DISTINCT salary) WITHIN GROUP (ORDER BY salary) as salaries "
+            + "from emps "
+            + "group by grouping sets ((deptno), (name), ())")
+        .returnsUnordered(
+            // Grouping by deptno - contains the 3 salaries from deptno=10
+            "deptno=10; name=null; salaries=10000.0,7000.0,11500.0",
+            "deptno=20; name=null; salaries=8000.0",
+            // Grouping by name - single salary per name
+            "deptno=null; name=Bill; salaries=10000.0",
+            "deptno=null; name=Eric; salaries=8000.0",
+            "deptno=null; name=Sebastian; salaries=7000.0",
+            "deptno=null; name=Theodore; salaries=11500.0",
+            // Grand total - all 4 distinct salaries
+            "deptno=null; name=null; salaries=10000.0,8000.0,7000.0,11500.0");
   }
 
   private CalciteAssert.AssertThat tester(boolean forceDecorrelate,

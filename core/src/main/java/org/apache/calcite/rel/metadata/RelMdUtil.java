@@ -25,10 +25,10 @@ import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rel.core.Minus;
 import org.apache.calcite.rel.core.Project;
+import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.core.Union;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexCall;
-import org.apache.calcite.rex.RexDynamicParam;
 import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexLocalRef;
@@ -56,6 +56,7 @@ import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 
 import static com.google.common.base.Preconditions.checkArgument;
@@ -465,6 +466,35 @@ public class RelMdUtil {
   }
 
   /**
+   * Returns the numeric value stored in a literal as a double.
+   *
+   * <p>Throws when the literal exceeds {@link Double#MAX_VALUE} instead of
+   * silently rounding to infinity. Doubles still approximate large integers (53
+   * bits of mantissa), so the returned value becomes only an approximation
+   * when numbers are very large.
+   */
+  public static double literalValueApproximatedByDouble(@Nullable RexNode node,
+      double defaultValue) {
+    if (!(node instanceof RexLiteral)) {
+      return defaultValue;
+    }
+    final Number number = RexLiteral.numberValue(node);
+    final BigDecimal decimal = NumberUtil.toBigDecimal(number);
+    if (decimal == null) {
+      throw new IllegalArgumentException(
+          "literal value " + number + " cannot be converted to BigDecimal");
+    }
+    if (decimal.signum() < 0) {
+      return defaultValue;
+    }
+    if (decimal.abs().compareTo(BigDecimal.valueOf(Double.MAX_VALUE)) > 0) {
+      throw new IllegalArgumentException(
+          "literal value " + decimal + " exceeds double range");
+    }
+    return decimal.doubleValue();
+  }
+
+  /**
    * Returns default estimates for selectivities, in the absence of stats.
    *
    * @param predicate predicate for which selectivity will be computed; null
@@ -813,6 +843,9 @@ public class RelMdUtil {
   public static @Nullable Double getJoinRowCount(RelMetadataQuery mq, Join join,
       RexNode condition) {
     if (!join.getJoinType().projectsRight()) {
+      if (join.getJoinType() == JoinRelType.LEFT_MARK) {
+        return mq.getRowCount(join.getLeft());
+      }
       // Create a RexNode representing the selectivity of the
       // semijoin filter and pass it to getSelectivity
       RexNode semiJoinSelectivity =
@@ -1014,14 +1047,29 @@ public class RelMdUtil {
     if (fetch == null) {
       return true;
     }
+    final RelNode strippedInput = input.stripped();
+    if (strippedInput instanceof Sort) {
+      final Sort sort = (Sort) strippedInput;
+      if (Objects.equals(offset, sort.offset)
+          && Objects.equals(fetch, sort.fetch)) {
+        return true;
+      }
+    }
     final Double rowCount = mq.getMaxRowCount(input);
-    if (rowCount == null || offset instanceof RexDynamicParam || fetch instanceof RexDynamicParam) {
+    if (rowCount == null
+        || (offset != null && !(offset instanceof RexLiteral))
+        || !(fetch instanceof RexLiteral)) {
       // Cannot be determined
       return false;
     }
-    final long offsetVal = offset == null ? 0 : RexLiteral.longValue(offset);
-    final long limit = RexLiteral.longValue(fetch);
-    return (double) offsetVal + (double) limit >= rowCount;
+    final BigDecimal offsetVal = offset == null
+        ? BigDecimal.ZERO
+        : RexLiteral.bigDecimalValue(offset);
+    final BigDecimal limit = RexLiteral.bigDecimalValue(fetch);
+    if (!Double.isFinite(rowCount)) {
+      return false;
+    }
+    return offsetVal.add(limit).compareTo(BigDecimal.valueOf(rowCount)) >= 0;
   }
 
   /**

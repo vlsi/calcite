@@ -34,6 +34,7 @@ import org.apache.calcite.rel.RelInput;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.core.CorrelationId;
+import org.apache.calcite.rel.hint.RelHint;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rel.type.RelDataTypeField;
@@ -53,6 +54,7 @@ import org.apache.calcite.rex.RexWindow;
 import org.apache.calcite.rex.RexWindowBound;
 import org.apache.calcite.rex.RexWindowBounds;
 import org.apache.calcite.rex.RexWindowExclusion;
+import org.apache.calcite.runtime.SqlFunctions;
 import org.apache.calcite.sql.SqlAggFunction;
 import org.apache.calcite.sql.SqlFunction;
 import org.apache.calcite.sql.SqlIdentifier;
@@ -77,6 +79,7 @@ import org.apache.calcite.util.Sarg;
 import org.apache.calcite.util.TimeString;
 import org.apache.calcite.util.TimestampString;
 import org.apache.calcite.util.Util;
+import org.apache.calcite.util.UuidValue;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
@@ -100,7 +103,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
 
 import static org.apache.calcite.rel.RelDistributions.EMPTY;
 import static org.apache.calcite.util.Static.RESOURCE;
@@ -120,7 +122,7 @@ public class RelJson {
       ImmutableList.of(NlsString.class, BigDecimal.class, ByteString.class,
       Boolean.class, TimestampString.class, DateString.class, TimeString.class);
 
-  private final Map<String, Constructor> constructorMap = new HashMap<>();
+  private final Map<String, Constructor<? extends RelNode>> constructorMap = new HashMap<>();
   private final @Nullable JsonBuilder jsonBuilder;
   private final InputTranslator inputTranslator;
   private final SqlOperatorTable operatorTable;
@@ -209,9 +211,9 @@ public class RelJson {
 
   public RelNode create(Map<String, Object> map) {
     String type = get(map, "type");
-    Constructor constructor = getConstructor(type);
+    Constructor<? extends RelNode> constructor = getConstructor(type);
     try {
-      return (RelNode) constructor.newInstance(map);
+      return constructor.newInstance(map);
     } catch (InstantiationException | ClassCastException | InvocationTargetException
         | IllegalAccessException e) {
       throw new RuntimeException(
@@ -219,12 +221,11 @@ public class RelJson {
     }
   }
 
-  public Constructor getConstructor(String type) {
-    Constructor constructor = constructorMap.get(type);
+  public Constructor<? extends RelNode> getConstructor(String type) {
+    Constructor<? extends RelNode> constructor = constructorMap.get(type);
     if (constructor == null) {
-      Class clazz = typeNameToClass(type);
+      Class<? extends RelNode> clazz = typeNameToClass(type);
       try {
-        //noinspection unchecked
         constructor = clazz.getConstructor(RelInput.class);
       } catch (NoSuchMethodException e) {
         throw new RuntimeException("class does not have required constructor, "
@@ -239,18 +240,19 @@ public class RelJson {
    * Converts a type name to a class. E.g. {@code getClass("LogicalProject")}
    * returns {@link org.apache.calcite.rel.logical.LogicalProject}.class.
    */
-  public Class typeNameToClass(String type) {
+  public Class<? extends RelNode> typeNameToClass(String type) {
     if (!type.contains(".")) {
       for (String package_ : PACKAGES) {
         try {
-          return Class.forName(package_ + type);
+          return Class.forName(package_ + type, false, RelJson.class.getClassLoader())
+              .asSubclass(RelNode.class);
         } catch (ClassNotFoundException e) {
           // ignore
         }
       }
     }
     try {
-      return Class.forName(type);
+      return Class.forName(type, false, RelJson.class.getClassLoader()).asSubclass(RelNode.class);
     } catch (ClassNotFoundException e) {
       throw new RuntimeException("unknown type " + type);
     }
@@ -296,6 +298,15 @@ public class RelJson {
       i -= rowType.getFieldCount();
     }
     throw new RuntimeException("input field " + input + " is out of range");
+  }
+
+  public Object toJson(SqlParserPos pos) {
+    final Map<String, @Nullable Object> map = jsonBuilder().map();
+    map.put("line", pos.getLineNum());
+    map.put("column", pos.getColumnNum());
+    map.put("end_line", pos.getEndLineNum());
+    map.put("end_column", pos.getEndColumnNum());
+    return map;
   }
 
   public Object toJson(RelCollationImpl node) {
@@ -449,12 +460,25 @@ public class RelJson {
     return map;
   }
 
+  /** Converts a literal's value to JSON. A non-finite approximate value becomes
+   * a string, because JSON has no syntax for NaN or infinity and the
+   * {@link java.math.BigDecimal} that the reader parses numbers into cannot
+   * represent one either. */
+  private @Nullable Object toJsonLiteralValue(@Nullable Object value) {
+    if (value instanceof Double && !Double.isFinite((Double) value)) {
+      return value.toString();
+    }
+    return toJson(value);
+  }
+
   public @Nullable Object toJson(@Nullable Object value) {
     if (value == null
         || value instanceof Number
         || value instanceof String
         || value instanceof Boolean) {
       return value;
+    } else if (value instanceof SqlParserPos) {
+      return toJson((SqlParserPos) value);
     } else if (value instanceof RexNode) {
       return toJson((RexNode) value);
     } else if (value instanceof RexWindow) {
@@ -487,6 +511,8 @@ public class RelJson {
       return toJson((RelDataTypeField) value);
     } else if (value instanceof RelDistribution) {
       return toJson((RelDistribution) value);
+    } else if (value instanceof RelHint) {
+      return toJson((RelHint) value);
     } else if (value instanceof Sarg) {
       //noinspection unchecked,rawtypes
       return toJson((Sarg) value);
@@ -498,12 +524,70 @@ public class RelJson {
       return toJson((Range) value);
     } else if (value instanceof ByteString) {
       return toJson(((ByteString) value).toString(16));
-    } else if (value instanceof UUID) {
+    } else if (value instanceof UuidValue) {
       return toJson(value.toString());
     } else {
       throw new UnsupportedOperationException("type not serializable as JSON: "
           + value + " (type " + value.getClass().getCanonicalName() + ")");
     }
+  }
+
+  /** Serializes a {@link RelHint} as a JSON map. */
+  public Object toJson(RelHint node) {
+    final Map<String, @Nullable Object> map = jsonBuilder().map();
+    map.put("name", node.hintName);
+    map.put("inheritPath", node.inheritPath);
+    if (!node.listOptions.isEmpty()) {
+      map.put("options", node.listOptions);
+    }
+    if (!node.kvOptions.isEmpty()) {
+      map.put("kvOptions", node.kvOptions);
+    }
+    if (node.pos != SqlParserPos.ZERO) {
+      map.put("pos", toJson(node.pos));
+    }
+    return map;
+  }
+
+  /** Converts a JSON object, such as produced by {@link #toJson(RelHint)},
+   * into a {@link RelHint}. */
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  public RelHint toHint(Map<String, @Nullable Object> map) {
+    final RelHint.Builder builder = RelHint.builder(get(map, "name"));
+    final List<Integer> inheritPath = get(map, "inheritPath");
+    if (!inheritPath.isEmpty()) {
+      builder.inheritPath(inheritPath);
+    }
+    final List<String> options = (List<String>) map.get("options");
+    if (options != null) {
+      builder.hintOptions(options);
+    }
+    final Map<String, String> kvOptions = (Map<String, String>) map.get("kvOptions");
+    if (kvOptions != null) {
+      builder.hintOptions(kvOptions);
+    }
+    final Map<String, Object> pos = (Map<String, Object>) map.get("pos");
+    if (pos != null) {
+      builder.position(
+          new SqlParserPos(get(pos, "line"), get(pos, "column"),
+          get(pos, "end_line"), get(pos, "end_column")));
+    }
+    return builder.build();
+  }
+
+  /** Converts a JSON list, such as produced by {@link #toJson(RelHint)},
+   * into a list of {@link RelHint}s. Returns an empty list if {@code o} is
+   * null. */
+  @SuppressWarnings("unchecked")
+  public List<RelHint> toHints(@Nullable Object o) {
+    if (o == null) {
+      return ImmutableList.of();
+    }
+    final ImmutableList.Builder<RelHint> hints = ImmutableList.builder();
+    for (Object hint : (List) o) {
+      hints.add(toHint((Map<String, @Nullable Object>) hint));
+    }
+    return hints.build();
   }
 
   public <C extends Comparable<C>> Object toJson(Sarg<C> node) {
@@ -598,7 +682,7 @@ public class RelJson {
       map.put("literal",
           value instanceof Enum
               ? RelEnumTypes.fromEnum((Enum) value)
-              : toJson(value));
+              : toJsonLiteralValue(value));
       map.put("type", toJson(node.getType()));
       return map;
     case INPUT_REF:
@@ -641,6 +725,9 @@ public class RelJson {
       if (node instanceof RexCall) {
         final RexCall call = (RexCall) node;
         map = jsonBuilder().map();
+        if (call.getParserPosition() != SqlParserPos.ZERO) {
+          map.put("pos", toJson(call.getParserPosition()));
+        }
         map.put("op", toJson(call.getOperator()));
         final List<@Nullable Object> list = jsonBuilder().list();
         for (RexNode operand : call.getOperands()) {
@@ -797,7 +884,7 @@ public class RelJson {
             exclude = RexWindowExclusion.EXCLUDE_NO_OTHER;
           }
           final boolean distinct = get((Map<String, Object>) map, "distinct");
-          return rexBuilder.makeOver(type, operator, rexOperands, partitionKeys,
+          return rexBuilder.makeOver(SqlParserPos.ZERO, type, operator, rexOperands, partitionKeys,
               ImmutableList.copyOf(orderKeys),
               requireNonNull(lowerBound, "lowerBound"),
               requireNonNull(upperBound, "upperBound"),
@@ -860,7 +947,12 @@ public class RelJson {
         } else if (sqlTypeName == SqlTypeName.BINARY || sqlTypeName == SqlTypeName.VARBINARY) {
           literal = ByteString.of((String) literal, 16);
         } else if (sqlTypeName == SqlTypeName.UUID) {
-          literal = UUID.fromString((String) literal);
+          literal = SqlFunctions.stringToUuid((String) literal);
+        } else if (literal instanceof String
+            && SqlTypeName.APPROX_TYPES.contains(sqlTypeName)) {
+          // A non-finite value that toJson wrote as a string because JSON
+          // cannot represent it as a number.
+          literal = Double.valueOf((String) literal);
         }
         return rexBuilder.makeLiteral(literal, type);
       }

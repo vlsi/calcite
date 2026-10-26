@@ -30,6 +30,7 @@ import org.apache.calcite.runtime.Resources;
 import org.apache.calcite.runtime.SqlFunctions;
 import org.apache.calcite.runtime.Utilities;
 import org.apache.calcite.sql.SqlCollation;
+import org.apache.calcite.sql.SqlNodeList;
 import org.apache.calcite.sql.dialect.CalciteSqlDialect;
 import org.apache.calcite.sql.fun.SqlLibrary;
 import org.apache.calcite.sql.util.IdPair;
@@ -56,6 +57,7 @@ import org.hamcrest.Matcher;
 import org.hamcrest.StringDescription;
 import org.hamcrest.TypeSafeMatcher;
 import org.junit.jupiter.api.Test;
+import org.locationtech.jts.util.Assert;
 
 import java.io.PrintWriter;
 import java.io.Serializable;
@@ -237,6 +239,45 @@ class UtilTest {
     assertThatScientific("-Infinity", is("-Infinity"));
     assertThatScientific("NaN", is("NaN"));
     assertThatScientific("-0.0", is("-0.0E0"));
+  }
+
+  @Test void testRightPad() {
+    assertThat(Util.rightPad("a", 1, 'x'), is("a"));
+    assertThat(Util.rightPad("a", 2, 'x'), is("ax"));
+    assertThat(Util.rightPad("a", 4, 'x'), is("axxx"));
+    assertThat(Util.rightPad("", 3, 'x'), is("xxx"));
+  }
+
+  @Test void testJoinNullable() {
+    final List<@Nullable Object> parts = Arrays.asList("a", null, "b");
+    assertThat(Util.joinNullable(parts, ":"), is("a::b"));
+    assertThat(Util.joinNullable(Collections.emptyList(), ","), is(""));
+    assertThat(Util.joinNullable(Arrays.asList(null, null), ":"), is(":"));
+  }
+
+  @Test void testReplaceChars() {
+    assertNull(Util.replaceChars((String) null, "ab", "x"));
+    assertThat(Util.replaceChars("", "ab", "x"), is(""));
+
+    final String s = "abc";
+    assertThat(Util.replaceChars(s, null, "x"), sameInstance(s));
+    assertThat(Util.replaceChars(s, "", "x"), sameInstance(s));
+    assertThat(Util.replaceChars(s, "x", "y"), sameInstance(s));
+
+    assertThat(Util.replaceChars("abc", "ab", null), is("c"));
+    assertThat(Util.replaceChars("abc", "abc", "12"), is("12"));
+    assertThat(Util.replaceChars("abc", "a", "a"), is("abc"));
+    assertNotSame("abc", Util.replaceChars("abc", "a", "a"));
+  }
+
+  @Test void testReplaceIgnoreCase() {
+    final String s = "abc";
+    assertThat(Util.replaceIgnoreCase(s, "", "x"), sameInstance(s));
+    assertThat(Util.replaceIgnoreCase(s, "ZZ", "x"), sameInstance(s));
+
+    assertThat(Util.replaceIgnoreCase("aBAba", "ab", "x"), is("xxa"));
+    assertThat(Util.replaceIgnoreCase("xxxx", "X", "yz"), is("yzyzyzyz"));
+    assertThat(Util.replaceIgnoreCase("aaaa", "aa", "b"), is("bb"));
   }
 
   @Test void testToJavaId() throws UnsupportedEncodingException {
@@ -2961,6 +3002,69 @@ class UtilTest {
     assertThat(s2, hasToString(s.toString()));
   }
 
+  /** Tests that {@link NlsString#compareTo} is consistent with
+   * {@link NlsString#equals}: {@code x.compareTo(y) == 0} iff
+   * {@code x.equals(y)} for values that differ in charset or collation. */
+  @Test void testNlsStringCompareToConsistency() {
+    // ("hello","LATIN1",null) vs ("hello","UTF-8",null) -> equals=false, compareTo!=0
+    final NlsString latin1 = new NlsString("hello", "LATIN1", null);
+    final NlsString utf8 = new NlsString("hello", "UTF-8", null);
+    assertThat(latin1.equals(utf8), is(false));
+    assertThat(latin1.compareTo(utf8), not(equalTo(0)));
+
+    // ("hello","UTF-8",null) vs ("hello","UTF-8",IMPLICIT) -> equals=false, compareTo!=0
+    final NlsString noColl = new NlsString("hello", "UTF-8", null);
+    final NlsString withColl =
+        new NlsString("hello", "UTF-8", SqlCollation.IMPLICIT);
+    assertThat(noColl.equals(withColl), is(false));
+    assertThat(noColl.compareTo(withColl), not(equalTo(0)));
+
+    // ("hello","UTF-8",IMPLICIT) vs ("hello","UTF-8",IMPLICIT) -> equals=true, compareTo==0
+    final NlsString a = new NlsString("hello", "UTF-8", SqlCollation.IMPLICIT);
+    final NlsString b = new NlsString("hello", "UTF-8", SqlCollation.IMPLICIT);
+    assertThat(a.equals(b), is(true));
+    assertThat(a.compareTo(b), is(0));
+
+    // ("hello",null,null) vs ("hello",null,null) -> equals=true, compareTo==0
+    final NlsString n1 = new NlsString("hello", null, null);
+    final NlsString n2 = new NlsString("hello", null, null);
+    assertThat(n1.equals(n2), is(true));
+    assertThat(n1.compareTo(n2), is(0));
+
+    // ("hello",null,null) vs ("hello","UTF-8",null) -> equals=false, compareTo!=0
+    final NlsString n3 = new NlsString("hello", null, null);
+    final NlsString n4 = new NlsString("hello", "UTF-8", null);
+    assertThat(n3.equals(n4), is(false));
+    assertThat(n3.compareTo(n4), not(equalTo(0)));
+  }
+
+  @Test void testNlsStringTreeSetRetainsDistinctValues() {
+    // 4 values, same string "hello", different charset: TreeSet must keep all 4
+    // Before fix: compareTo ignored charset, TreeSet collapsed them into 1
+    final NlsString s1 = new NlsString("hello", "LATIN1", null);
+    final NlsString s2 = new NlsString("hello", "UTF-8", null);
+    final NlsString s3 = new NlsString("hello", "UTF-16", null);
+    final NlsString s4 = new NlsString("hello", null, null);
+
+    final SortedSet<NlsString> set = new TreeSet<>(Arrays.asList(s1, s2, s3, s4));
+    assertThat(set, hasSize(4));
+
+    // Add exact duplicate of s1: set size unchanged
+    final NlsString s1dup = new NlsString("hello", "LATIN1", null);
+    set.add(s1dup);
+    assertThat(set, hasSize(4));
+  }
+
+  @Test void testCollationEncoding() {
+    SqlCollation collation =
+        new SqlCollation(
+            SqlCollation.Coercibility.COERCIBLE, Locale.ENGLISH,
+            Util.getDefaultCharset(), "primary");
+    SqlNodeList list = collation.asList();
+    SqlCollation decoded = SqlCollation.fromSqlList(list);
+    Assert.equals(collation, decoded);
+  }
+
   @Test void testXmlOutput() {
     final StringWriter w = new StringWriter();
     final XmlOutput o = new XmlOutput(w);
@@ -3240,5 +3344,18 @@ class UtilTest {
     final StringDescription d = new StringDescription();
     m.describeTo(d);
     return d.toString();
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7556">[CALCITE-7556]
+   * NameMultimap.remove(key, value) leaves an empty key bucket behind</a>. */
+  @Test void testNameMultimapRemoveLastValueRemovesKey() {
+    final NameMultimap<Integer> map = new NameMultimap<>();
+    map.put("baz", 1);
+
+    assertTrue(map.remove("baz", 1));
+    assertThat(map.range("baz", true), hasSize(0));
+    assertThat(map.containsKey("baz", true), is(false));
+    assertThat(map.containsKey("BAZ", false), is(false));
+    assertThat(map.map(), aMapWithSize(0));
   }
 }

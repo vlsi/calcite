@@ -17,7 +17,10 @@
 package org.apache.calcite.test;
 import org.apache.calcite.avatica.util.ByteString;
 import org.apache.calcite.avatica.util.DateTimeUtils;
+import org.apache.calcite.linq4j.Enumerable;
+import org.apache.calcite.linq4j.function.Function1;
 import org.apache.calcite.runtime.CalciteException;
+import org.apache.calcite.runtime.FlatLists;
 import org.apache.calcite.runtime.SqlFunctions;
 import org.apache.calcite.runtime.Utilities;
 
@@ -41,6 +44,9 @@ import static org.apache.calcite.avatica.util.DateTimeUtils.MILLIS_PER_DAY;
 import static org.apache.calcite.avatica.util.DateTimeUtils.dateStringToUnixDate;
 import static org.apache.calcite.avatica.util.DateTimeUtils.timeStringToUnixDate;
 import static org.apache.calcite.avatica.util.DateTimeUtils.timestampStringToUnixDate;
+import static org.apache.calcite.runtime.SqlFunctions.FlatProductInputType.LIST;
+import static org.apache.calcite.runtime.SqlFunctions.FlatProductInputType.SCALAR;
+import static org.apache.calcite.runtime.SqlFunctions.FlatProductInputType.STRUCT;
 import static org.apache.calcite.runtime.SqlFunctions.arraysOverlap;
 import static org.apache.calcite.runtime.SqlFunctions.charLength;
 import static org.apache.calcite.runtime.SqlFunctions.concat;
@@ -85,10 +91,12 @@ import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.CoreMatchers.nullValue;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.closeTo;
+import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.hasToString;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -107,6 +115,113 @@ class SqlFunctionsTest {
 
   static <E> List<E> list() {
     return ImmutableList.of();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7837">[CALCITE-7837]
+   * ARRAY_MIN, ARRAY_MAX and SORT_ARRAY throw ClassCastException for ROW elements</a>. */
+  @Test void testArrayComparisonWithSpecialFloatingPointValues() {
+    final List<Double> values =
+        list(Double.NaN, null, Double.NEGATIVE_INFINITY, 1D, Double.POSITIVE_INFINITY);
+    assertThat(SqlFunctions.arrayMax(values), is(Double.NaN));
+    assertThat(SqlFunctions.arrayMin(values), is(Double.NEGATIVE_INFINITY));
+    assertThat(SqlFunctions.sortArray(values, true),
+        is(list(null, Double.NEGATIVE_INFINITY, 1D, Double.POSITIVE_INFINITY, Double.NaN)));
+    assertThat(SqlFunctions.sortArray(values, false),
+        is(list(Double.NaN, Double.POSITIVE_INFINITY, 1D, Double.NEGATIVE_INFINITY, null)));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7837">[CALCITE-7837]
+   * ARRAY_MIN, ARRAY_MAX and SORT_ARRAY throw ClassCastException for ROW elements</a>. */
+  @Test void testArrayRowComparisonWithSpecialFloatingPointValues() {
+    for (double special : new double[] {
+        Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY}) {
+      final boolean specialFirst = Double.compare(special, 1D) < 0;
+      checkArrayRowComparison(FlatLists.ofComparable(list(special)),
+          FlatLists.ofComparable(list(1D)), specialFirst);
+      checkArrayRowComparison(new Object[] {special}, new Object[] {1D}, specialFirst);
+      checkArrayRowComparison(new Object[] {new Object[] {special}},
+          new Object[] {new Object[] {1D}}, specialFirst);
+    }
+    for (float special : new float[] {
+        Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY}) {
+      final boolean specialFirst = Float.compare(special, 1F) < 0;
+      checkArrayRowComparison(FlatLists.ofComparable(list(special)),
+          FlatLists.ofComparable(list(1F)), specialFirst);
+      checkArrayRowComparison(new Object[] {special}, new Object[] {1F}, specialFirst);
+      checkArrayRowComparison(new Object[] {new Object[] {special}},
+          new Object[] {new Object[] {1F}}, specialFirst);
+    }
+  }
+
+  private static void checkArrayRowComparison(Object specialRow, Object normalRow,
+      boolean specialFirst) {
+    final List<Object> rows = list(specialRow, normalRow, null);
+    final Object min = specialFirst ? specialRow : normalRow;
+    final Object max = specialFirst ? normalRow : specialRow;
+    assertSame(max, SqlFunctions.arrayMax(rows));
+    assertSame(min, SqlFunctions.arrayMin(rows));
+    assertThat(SqlFunctions.sortArray(new ArrayList<>(rows), true), is(list(null, min, max)));
+    assertThat(SqlFunctions.sortArray(new ArrayList<>(rows), false), is(list(max, min, null)));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7836">[CALCITE-7836]
+   * Array functions return incorrect results for ROW elements</a>. */
+  @Test void testArrayFunctionsWithRows() {
+    // A custom Python script ran the SQL regression cases in sql/row-equality.iq
+    // against Apache Spark 3.5.5 (adapting ARRAY and ROW syntax) and confirmed
+    // all results. The cases below add Java representation, MAP and hash
+    // collision coverage that was not checked against Spark.
+    final Object[][] rows = {
+        {1, "Foo"},
+        {null, "Foo"},
+        {new Object[] {1, "Foo"}, 10},
+        {list(new Object[] {1, "Foo"}, new Object[] {2, null}), 10},
+        {Collections.singletonMap("key", new Object[] {1, null}), 10},
+        {-31}, // Deep hash code is zero.
+        {-30} // Deep hash code collides with the replacement for zero.
+    };
+    for (Object[] row : rows) {
+      // Copy the outer row; the nested containers are checked separately below.
+      checkArrayFunctionsWithRows(row, row.clone());
+    }
+    checkArrayFunctionsWithRows(new Object[] {new Object[] {1, null}, 10},
+        new Object[] {list(1, null), 10});
+    checkArrayFunctionsWithRows(
+        new Object[] {list(new Object[] {1, "Foo"}, new Object[] {2, null}), 10},
+        new Object[] {list(new Object[] {1, "Foo"}, new Object[] {2, null}), 10});
+    checkArrayFunctionsWithRows(
+        new Object[] {Collections.singletonMap("key", new Object[] {1, null})},
+        new Object[] {Collections.singletonMap("key", new Object[] {1, null})});
+    assertThat(SqlFunctions.distinct(list(new Object[] {-31}, new Object[] {-30})).size(),
+        is(2));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7836">[CALCITE-7836]
+   * Array functions return incorrect results for ROW elements</a>. */
+  @Test void testArrayFunctionsWithMixedValues() {
+    // These Java representation and mixed-type checks are Calcite-specific.
+    // SQL regression cases for all eight functions were checked separately
+    // against Apache Spark 3.5.5 using a custom Python script; see sql/row-equality.iq.
+    checkArrayFunctionsWithRows(1, 1);
+    checkArrayFunctionsWithRows("Foo", "Foo");
+    checkArrayFunctionsWithRows(new byte[] {1, 2}, new byte[] {1, 2});
+    checkArrayFunctionsWithRows(list(1, null), new Object[] {1, null});
+    checkArrayFunctionsWithRows(
+        Collections.singletonMap("key", new Object[] {1, null}),
+        Collections.singletonMap("key", new Object[] {1, null}));
+
+    final Object row = new Object[] {1, "Foo"};
+    final List<Object> input = new ArrayList<>(list(2, row, null, "Foo", 2));
+    final List<?> result = SqlFunctions.distinct(input);
+    input.clear();
+    assertThat(result, is(list(2, row, null, "Foo")));
+    assertThat(result.get(1), is(row));
+    assertThat(result.subList(1, 3), is(list(row, null)));
+    assertThat(Arrays.asList(result.toArray()), is(list(2, row, null, "Foo")));
   }
 
   @Test void testArraysOverlap() {
@@ -144,6 +259,7 @@ class SqlFunctionsTest {
 
   @Test void testToString() {
     assertThat(SqlFunctions.toString(0f), is("0E0"));
+    assertThat(SqlFunctions.toString(-0f), is("-0E0"));
     assertThat(SqlFunctions.toString(1f), is("1.0"));
     assertThat(SqlFunctions.toString(1.5f), is("1.5"));
     assertThat(SqlFunctions.toString(-1.5f), is("-1.5"));
@@ -151,8 +267,12 @@ class SqlFunctionsTest {
     assertThat(SqlFunctions.toString(-0.0625f), is("-0.0625"));
     assertThat(SqlFunctions.toString(0.0625f), is("0.0625"));
     assertThat(SqlFunctions.toString(-5e-12f), is("-5.0E-12"));
+    assertThat(SqlFunctions.toString(Float.NaN), is("NaN"));
+    assertThat(SqlFunctions.toString(Float.POSITIVE_INFINITY), is("Infinity"));
+    assertThat(SqlFunctions.toString(Float.NEGATIVE_INFINITY), is("-Infinity"));
 
     assertThat(SqlFunctions.toString(0d), is("0E0"));
+    assertThat(SqlFunctions.toString(-0d), is("-0E0"));
     assertThat(SqlFunctions.toString(1d), is("1.0"));
     assertThat(SqlFunctions.toString(1.5d), is("1.5"));
     assertThat(SqlFunctions.toString(-1.5d), is("-1.5"));
@@ -160,6 +280,9 @@ class SqlFunctionsTest {
     assertThat(SqlFunctions.toString(-0.0625d), is("-0.0625"));
     assertThat(SqlFunctions.toString(0.0625d), is("0.0625"));
     assertThat(SqlFunctions.toString(-5e-12d), is("-5.0E-12"));
+    assertThat(SqlFunctions.toString(Double.NaN), is("NaN"));
+    assertThat(SqlFunctions.toString(Double.POSITIVE_INFINITY), is("Infinity"));
+    assertThat(SqlFunctions.toString(Double.NEGATIVE_INFINITY), is("-Infinity"));
 
     assertThat(SqlFunctions.toString(new BigDecimal("0")), is("0"));
     assertThat(SqlFunctions.toString(new BigDecimal("1")), is("1"));
@@ -242,8 +365,13 @@ class SqlFunctionsTest {
     // it is treated like empty string, if both values are null, returns null.
     // As the following tests show.
     assertThat(concatWithNull("a", null), is("a"));
-    assertThat(concatWithNull(null, null), is(nullValue()));
+    assertThat(concatWithNull((String) null, null), is(nullValue()));
     assertThat(concatWithNull(null, "b"), is("b"));
+    // Binary strings
+    assertThat(concatWithNull(b("0a"), b("0b")), is(b("0a0b")));
+    assertThat(concatWithNull(b("0a"), null), is(b("0a")));
+    assertThat(concatWithNull(null, b("0b")), is(b("0b")));
+    assertThat(concatWithNull((ByteString) null, null), is(nullValue()));
   }
 
   @Test void testConcatMulti() {
@@ -254,6 +382,9 @@ class SqlFunctionsTest {
     assertThat(concatMulti((String) null), is("null"));
     assertThat(concatMulti((String) null, null), is("nullnull"));
     assertThat(concatMulti("a", null, "b"), is("anullb"));
+    // Binary strings
+    assertThat(concatMulti(b("0a"), b("0b"), b("0c")), is(b("0a0b0c")));
+    assertThat(concatMulti(new ByteString[0]), is(ByteString.EMPTY));
   }
 
   @Test void testConcatMultiWithNull() {
@@ -263,6 +394,14 @@ class SqlFunctionsTest {
     assertThat(concatMultiWithNull((String) null, ""), is(""));
     assertThat(concatMultiWithNull((String) null, null, null), is(""));
     assertThat(concatMultiWithNull("a", null, "b"), is("ab"));
+    // Binary strings; null is treated as an empty binary string
+    assertThat(concatMultiWithNull(b("0a"), null, b("0c")), is(b("0a0c")));
+    assertThat(concatMultiWithNull((ByteString) null, null), is(ByteString.EMPTY));
+  }
+
+  /** Creates a {@link ByteString} from a hex string. */
+  private static ByteString b(String hex) {
+    return ByteString.of(hex, 16);
   }
 
   @Test void testConcatMultiWithSeparator() {
@@ -1084,14 +1223,17 @@ class SqlFunctionsTest {
 
     assertThat(SqlFunctions.splitPart("abc,,ghi", ",", 2), is(""));
     assertThat(SqlFunctions.splitPart("", ",", 1), is(""));
-    assertThat(SqlFunctions.splitPart("abc", "", 1), is(""));
-
-    assertThat(SqlFunctions.splitPart(null, ",", 1), is(""));
-    assertThat(SqlFunctions.splitPart("abc,def", null, 1), is(""));
+    // Tested on Postgres 17: empty delimiter
+    assertThat(SqlFunctions.splitPart("abc", "", 1), is("abc"));
+    assertThat(SqlFunctions.splitPart("abc", "", 2), is(""));
     assertThat(SqlFunctions.splitPart("abc,def", ",", 0), is(""));
 
     assertThat(SqlFunctions.splitPart("abc,def", ",", 3), is(""));
     assertThat(SqlFunctions.splitPart("abc,def", ",", -3), is(""));
+
+    // Test case for https://issues.apache.org/jira/browse/CALCITE-7468
+    // The SPLIT_PART implementation is incorrect for regex patterns
+    assertThat(SqlFunctions.splitPart("abc.def", ".", 1), is("abc"));
   }
 
   @Test void testByteString() {
@@ -1505,6 +1647,117 @@ class SqlFunctionsTest {
     assertThat(SqlFunctions.multisetUnionDistinct(z, z), is(z));
     assertThat(SqlFunctions.multisetUnionDistinct(z, addc),
         isListOf("a", "c", "d"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7842">[CALCITE-7842]
+   * Multiset operators return incorrect results for ROW elements</a>. */
+  @Test void testMultisetWithRows() {
+    final Object row = new Object[] {1, "Foo"};
+    final Object equalRow = new Object[] {1, "Foo"};
+    final Object otherRow = new Object[] {2, "Bar"};
+    final List<Object> left = list(row, equalRow, otherRow);
+    final List<Object> right = list(equalRow);
+    assertThat(SqlFunctions.memberOf(row, right), is(true));
+    assertThat(SqlFunctions.memberOf(otherRow, right), is(false));
+    assertThat(SqlFunctions.isASet(left), is(false));
+    assertThat(SqlFunctions.isASet(list(row, otherRow)), is(true));
+    assertThat(SqlFunctions.submultisetOf(list(row, otherRow), left), is(true));
+    assertThat(SqlFunctions.submultisetOf(list(row, equalRow), right), is(false));
+    assertThat(SqlFunctions.multisetIntersectAll(left, right), is(list(row)));
+    assertThat(SqlFunctions.multisetIntersectDistinct(left, right), is(list(row)));
+    assertThat(SqlFunctions.multisetExceptAll(left, right), is(list(equalRow, otherRow)));
+    assertThat(SqlFunctions.multisetExceptDistinct(left, right), is(list(otherRow)));
+    final List<?> union = SqlFunctions.multisetUnionDistinct(list(row, equalRow), right);
+    assertThat(union, hasSize(1));
+    assertSame(row, union.get(0));
+    assertThat(SqlFunctions.multisetUnionAll(left, right),
+        is(list(row, equalRow, otherRow, equalRow)));
+    assertThat(left, is(list(row, equalRow, otherRow)));
+    assertThat(right, is(list(equalRow)));
+
+    final List<?> distinct =
+        SqlFunctions.multisetUnionDistinct(Collections.singletonList(new Object[] {-31}),
+        Collections.singletonList(new Object[] {-30}));
+    assertThat(distinct, hasSize(2));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7842">[CALCITE-7842]
+   * Multiset operators return incorrect results for ROW elements</a>. */
+  @Test void testMultisetIntersectAllCounts() {
+    final Object a1 = new Object[] {1, null};
+    final Object a2 = new Object[] {1, null};
+    final Object b = new Object[] {2, "Bar"};
+    final Object equalB = new Object[] {2, "Bar"};
+    final List<Object> left = list(a1, b, a2, null, new Object[] {1, null}, b, null);
+    final List<Object> right = list(equalB, a2, null, a1, null, null, "other");
+    assertThat(SqlFunctions.multisetIntersectAll(left, right), is(list(a1, b, a2, null, null)));
+    assertThat(SqlFunctions.multisetIntersectAll(right, left),
+        is(list(right.get(0), right.get(1), null, right.get(3), null)));
+
+    // Deep hash zero and its replacement collide, but represent different rows.
+    final Object zeroHash = new Object[] {-31};
+    final Object collision = new Object[] {-30};
+    assertThat(
+        SqlFunctions.multisetIntersectAll(list(zeroHash, collision, zeroHash),
+        list(new Object[] {-31}, new Object[] {-30}, new Object[] {-30})),
+        is(list(zeroHash, collision)));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7842">[CALCITE-7842]
+   * Multiset operators return incorrect results for ROW elements</a>. */
+  @Test void testMultisetExceptAllCounts() {
+    final Object a1 = new Object[] {1, null};
+    final Object a2 = new Object[] {1, null};
+    final Object a3 = new Object[] {1, null};
+    final Object b = new Object[] {2, "Bar"};
+    final Object equalB = new Object[] {2, "Bar"};
+    final List<Object> left = list(a1, b, a2, null, a3, b, null);
+    final List<Object> right = list(equalB, a2, null, a1, null, null, "other");
+    assertThat(SqlFunctions.multisetExceptAll(left, right), is(list(a3, b)));
+    assertThat(SqlFunctions.multisetExceptAll(right, left), is(list(null, "other")));
+    assertThat(SqlFunctions.multisetExceptAll(left, list()), is(left));
+    assertThat(SqlFunctions.multisetExceptAll(left, left), is(list()));
+    assertThat(left, is(list(a1, b, a2, null, a3, b, null)));
+    assertThat(right, is(list(equalB, a2, null, a1, null, null, "other")));
+
+    // Deep hash zero and its replacement collide, but represent different rows.
+    final Object zeroHash = new Object[] {-31};
+    final Object collision = new Object[] {-30};
+    assertThat(
+        SqlFunctions.multisetExceptAll(list(zeroHash, collision, zeroHash),
+        list(new Object[] {-31}, new Object[] {-30}, new Object[] {-30})),
+        is(Collections.singletonList(zeroHash)));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7842">[CALCITE-7842]
+   * Multiset operators return incorrect results for ROW elements</a>. */
+  @Test void testSubmultisetOfCounts() {
+    final Object row = new Object[] {1, null};
+    final Object equalRow = new Object[] {1, null};
+    final Object other = new Object[] {2, null};
+    final List<Object> sub = list(row, equalRow, null);
+    final List<Object> multiset = list(equalRow, other, null);
+    assertThat(SqlFunctions.submultisetOf(sub, multiset), is(false));
+    assertThat(SqlFunctions.submultisetOf(sub, list(equalRow, row, null, other)), is(true));
+    assertThat(SqlFunctions.submultisetOf(list(null, null), list(null, other)), is(false));
+    assertThat(SqlFunctions.submultisetOf(list(null, null), list(null, null)), is(true));
+    assertThat(SqlFunctions.submultisetOf(list(), list()), is(true));
+    assertThat(sub, is(list(row, equalRow, null)));
+    assertThat(multiset, is(list(equalRow, other, null)));
+
+    // Deep hash zero and its replacement collide, but represent different rows.
+    final Object zeroHash = new Object[] {-31};
+    final Object collision = new Object[] {-30};
+    assertThat(
+        SqlFunctions.submultisetOf(list(zeroHash, zeroHash),
+        list(new Object[] {-31}, collision)), is(false));
+    assertThat(
+        SqlFunctions.submultisetOf(list(zeroHash, collision),
+        list(new Object[] {-30}, new Object[] {-31})), is(true));
   }
 
   @Test void testMd5() {
@@ -2035,19 +2288,30 @@ class SqlFunctionsTest {
     return toLong(java.sql.Timestamp.valueOf(str));
   }
   @Test void testLeftShift() {
-    // Test 1-byte array
+    // For every shift amount, cross-check the byte-array shift against the
+    // equivalent shift computed on the value's integer interpretation. The byte
+    // array is treated as a little-endian bit string of width 8 * length (index
+    // 0 is the least-significant byte), and leftShift always shifts left by the
+    // amount normalized modulo that width (so a negative amount wraps into range
+    // rather than reversing direction).
     byte[] data1 = {(byte) 0x0F}; // 00001111
     for (int shift = -10; shift <= 10; shift++) {
       byte[] result = SqlFunctions.leftShift(data1.clone(), shift);
-      // Just verify it doesn't crash and returns correct length
       assertEquals(1, result.length);
+      int norm = Math.floorMod(shift, 8);
+      int expected = ((data1[0] & 0xFF) << norm) & 0xFF;
+      assertEquals((byte) expected, result[0]);
     }
 
-    // Test 2-byte array
     byte[] data2 = {(byte) 0x12, (byte) 0x34};
     for (int shift = -18; shift <= 18; shift++) {
       byte[] result = SqlFunctions.leftShift(data2.clone(), shift);
       assertEquals(2, result.length);
+      int value = (data2[0] & 0xFF) | ((data2[1] & 0xFF) << 8); // little-endian
+      int norm = Math.floorMod(shift, 16);
+      int expected = (value << norm) & 0xFFFF;
+      assertEquals((byte) expected, result[0]);
+      assertEquals((byte) (expected >>> 8), result[1]);
     }
 
     // Verify specific known cases
@@ -2056,5 +2320,386 @@ class SqlFunctionsTest {
 
     assertArrayEquals(new byte[]{(byte) 0x80, (byte) 0x00},
         SqlFunctions.leftShift(new byte[]{(byte) 0x40, (byte) 0x00}, 1));
+  }
+
+  @Test void testRightShift() {
+    // Scalar arithmetic (sign-preserving) right shift. Binary right shift is
+    // intentionally not supported (see [CALCITE-7651]), so there is no
+    // byte-array overload to exercise here.
+    assertEquals(2, SqlFunctions.rightShift(8, 2));
+    assertEquals(-5, SqlFunctions.rightShift(-20, 2));
+  }
+
+  @Test void testCombineQueryResults() {
+    // Test combining two equal-length lists
+    List<Integer> list1 = Arrays.asList(1, 2, 3);
+    List<Integer> list2 = Arrays.asList(10, 20, 30);
+    List<Object[]> result = SqlFunctions.combineQueryResults(new List[]{list1, list2});
+
+    assertThat(result, hasSize(3));
+    assertArrayEquals(new Object[]{1, 10}, result.get(0));
+    assertArrayEquals(new Object[]{2, 20}, result.get(1));
+    assertArrayEquals(new Object[]{3, 30}, result.get(2));
+
+    // Test combining lists of different lengths (shorter list padded with nulls)
+    List<String> listA = Arrays.asList("a", "b");
+    List<String> listB = Arrays.asList("x", "y", "z", "w");
+    result = SqlFunctions.combineQueryResults(new List[]{listA, listB});
+
+    assertThat(result, hasSize(4));
+    assertArrayEquals(new Object[]{"a", "x"}, result.get(0));
+    assertArrayEquals(new Object[]{"b", "y"}, result.get(1));
+    assertArrayEquals(new Object[]{null, "z"}, result.get(2));
+    assertArrayEquals(new Object[]{null, "w"}, result.get(3));
+
+    // Test with empty list
+    List<Integer> emptyList = Collections.emptyList();
+    List<Integer> nonEmpty = Arrays.asList(100, 200);
+    result = SqlFunctions.combineQueryResults(new List[]{emptyList, nonEmpty});
+
+    assertThat(result, hasSize(2));
+    assertArrayEquals(new Object[]{null, 100}, result.get(0));
+    assertArrayEquals(new Object[]{null, 200}, result.get(1));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7560">[CALCITE-7560]
+   * SqlFunctions.DateParseFunction.parseTimestamp(..., timeZone) accepts unknown
+   * time zones and silently falls back to GMT</a>. */
+  @Test void testParseTimestampRejectsUnknownTimeZone() {
+    final SqlFunctions.DateParseFunction parse = new SqlFunctions.DateParseFunction();
+
+    // A valid time zone is accepted.
+    assertThat(
+        parse.parseTimestamp("%Y-%m-%d %H:%M:%S", "2024-01-01 00:00:00", "UTC"),
+        is(parse.parseTimestamp("%Y-%m-%d %H:%M:%S", "2024-01-01 00:00:00")));
+
+    // An unknown time zone is rejected rather than silently reinterpreted as GMT.
+    assertThrows(RuntimeException.class,
+        () -> parse.parseTimestamp("%Y-%m-%d %H:%M:%S",
+            "2024-01-01 00:00:00", "Asia/Sanghai"));
+  }
+
+  // Tests for ZipPaddedEnumerator, accessed via the public SqlFunctions.flatZip API.
+
+  /** Invokes {@link SqlFunctions#flatZip} over scalar collections and collects output rows. */
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  private static List<List<Object>> zipScalars(
+      boolean withOrdinality, List<Comparable>... inputs) {
+    final int n = inputs.length;
+    final int[] fieldCounts = new int[n];
+    Arrays.fill(fieldCounts, 1);
+    final SqlFunctions.FlatProductInputType[] types =
+        new SqlFunctions.FlatProductInputType[n];
+    Arrays.fill(types, SCALAR);
+    final Function1<Object, Enumerable<FlatLists.ComparableList<Comparable>>> fn =
+        SqlFunctions.flatZip(fieldCounts, withOrdinality, types, false);
+    final Object arg = n == 1 ? inputs[0] : inputs;
+    final List<List<Object>> rows = new ArrayList<>();
+    for (FlatLists.ComparableList<Comparable> row : fn.apply(arg)) {
+      rows.add(new ArrayList<>(row));
+    }
+    return rows;
+  }
+
+  @Test void testZipPaddedSingleCollectionWithOrdinality() {
+    // Single scalar collection with ordinality uses ZipPaddedEnumerator, not
+    // the LIST_AS_ENUMERABLE shortcut.
+    List<List<Object>> rows = zipScalars(true, Arrays.asList(10, 20, 30));
+    assertThat(rows, hasSize(3));
+    assertThat(rows.get(0), is(list(10, 1)));
+    assertThat(rows.get(1), is(list(20, 2)));
+    assertThat(rows.get(2), is(list(30, 3)));
+  }
+
+  @Test void testZipPaddedEqualLength() {
+    List<List<Object>> rows =
+        zipScalars(false, Arrays.asList(10, 20), Arrays.asList(4, 5));
+    assertThat(rows, hasSize(2));
+    assertThat(rows.get(0), is(list(10, 4)));
+    assertThat(rows.get(1), is(list(20, 5)));
+  }
+
+  @Test void testZipPaddedFirstLonger() {
+    List<List<Object>> rows =
+        zipScalars(false, Arrays.asList(10, 20, 30), Arrays.asList(4, 5));
+    assertThat(rows, hasSize(3));
+    assertThat(rows.get(0), is(list(10, 4)));
+    assertThat(rows.get(1), is(list(20, 5)));
+    assertThat(rows.get(2), is(Arrays.asList(30, null)));
+  }
+
+  @Test void testZipPaddedSecondLonger() {
+    List<List<Object>> rows =
+        zipScalars(false, Arrays.asList(10), Arrays.asList(4, 5, 6));
+    assertThat(rows, hasSize(3));
+    assertThat(rows.get(0), is(list(10, 4)));
+    assertThat(rows.get(1), is(Arrays.asList(null, 5)));
+    assertThat(rows.get(2), is(Arrays.asList(null, 6)));
+  }
+
+  @Test void testZipPaddedBothEmpty() {
+    List<List<Object>> rows =
+        zipScalars(false, Collections.emptyList(), Collections.emptyList());
+    assertThat(rows, hasSize(0));
+  }
+
+  @Test void testZipPaddedOneEmpty() {
+    List<List<Object>> rows =
+        zipScalars(false, Arrays.asList(4, 5), Collections.emptyList());
+    assertThat(rows, hasSize(2));
+    assertThat(rows.get(0), is(Arrays.asList(4, null)));
+    assertThat(rows.get(1), is(Arrays.asList(5, null)));
+  }
+
+  @Test void testZipPaddedWithOrdinality() {
+    List<List<Object>> rows =
+        zipScalars(true, Arrays.asList(10, 20, 30), Arrays.asList(4, 5));
+    assertThat(rows, hasSize(3));
+    assertThat(rows.get(0), is(list(10, 4, 1)));
+    assertThat(rows.get(1), is(list(20, 5, 2)));
+    assertThat(rows.get(2), is(Arrays.asList(30, null, 3)));
+  }
+
+  @Test void testZipPaddedStructElements() {
+    // Two LIST (struct) collections of width 2: [(1,2),(3,4)] and [(10,20)]
+    // → [1,2,10,20], [3,4,null,null]
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    final Function1<Object, Enumerable<FlatLists.ComparableList<Comparable>>> fn =
+        SqlFunctions.flatZip(new int[]{2, 2}, false,
+            new SqlFunctions.FlatProductInputType[]{LIST, LIST}, false);
+    final List<List<Comparable>> col1 =
+        Arrays.asList(FlatLists.of(1, 2), FlatLists.of(3, 4));
+    final List<List<Comparable>> col2 =
+        Collections.singletonList(FlatLists.of(10, 20));
+    final List<List<Object>> rows = new ArrayList<>();
+    for (FlatLists.ComparableList<Comparable> row
+        : fn.apply(new Object[]{col1, col2})) {
+      rows.add(new ArrayList<>(row));
+    }
+    assertThat(rows, hasSize(2));
+    assertThat(rows.get(0), is(list(1, 2, 10, 20)));
+    assertThat(rows.get(1), is(Arrays.asList(3, 4, null, null)));
+  }
+
+  /** The runtime representation of {@code ARRAY[ROW(1, 'x'), ROW(2, 'y')]}:
+   * a list whose elements are the field lists of each ROW. */
+  private static List<List<Comparable>> rowArray() {
+    return Arrays.asList(FlatLists.of(1, "x"), FlatLists.of(2, "y"));
+  }
+
+  @Test void testZipPaddedWholeStructElements() {
+    // Models the Trino semantics of
+    //   UNNEST(ARRAY[ROW(1, 'x'), ROW(2, 'y')], ARRAY[10, 20]) AS t(s, i):
+    // the STRUCT collection keeps each ROW element whole, so column s holds
+    // the element as an Object[]; the scalar column i zips alongside.
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    final Function1<Object, Enumerable<FlatLists.ComparableList<Comparable>>> fn =
+        SqlFunctions.flatZip(
+            new int[]{-1, -1}, // one output column per collection
+            false,             // no ordinality
+            new SqlFunctions.FlatProductInputType[]{STRUCT, SCALAR}, false);
+
+    final List<List<Object>> rows = new ArrayList<>();
+    for (FlatLists.ComparableList<Comparable> row
+        : fn.apply(new Object[]{rowArray(), Arrays.asList(10, 20)})) {
+      rows.add(new ArrayList<>(row));
+    }
+
+    // Expected rows: ({1, 'x'}, 10) and ({2, 'y'}, 20).
+    assertThat(rows, hasSize(2));
+    assertArrayEquals(new Object[]{1, "x"}, (Object[]) rows.get(0).get(0));
+    assertThat(rows.get(0).get(1), is(10));
+    assertArrayEquals(new Object[]{2, "y"}, (Object[]) rows.get(1).get(0));
+    assertThat(rows.get(1).get(1), is(20));
+  }
+
+  @Test void testZipPaddedNullStructElement() {
+    // A null element of an expanded ROW ARRAY is a null List, which
+    // must be expanded to one null per ROW field rather than dereferencing the list.
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    final Function1<Object, Enumerable<FlatLists.ComparableList<Comparable>>> fn =
+        SqlFunctions.flatZip(
+            new int[]{2, -1}, // two columns from the struct, one scalar column
+            false,            // no ordinality
+            new SqlFunctions.FlatProductInputType[]{LIST, SCALAR}, false);
+
+    final List<List<Object>> rows = new ArrayList<>();
+    for (FlatLists.ComparableList<Comparable> row
+        : fn.apply(new Object[]{
+            Arrays.asList(FlatLists.of(1, "x"), null),
+            Arrays.asList(10, 20)})) {
+      rows.add(new ArrayList<>(row));
+    }
+
+    assertThat(rows, hasSize(2));
+    assertThat(rows.get(0), is(Arrays.asList(1, "x", 10)));
+    assertThat(rows.get(1), is(Arrays.asList(null, null, 20)));
+  }
+
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  @Test void testFlatZipSingleWholeStructCollection() {
+    // Models the Trino semantics of
+    //   UNNEST(ARRAY[ROW(1, 'x'), ROW(2, 'y')]) AS t(s):
+    // the output has the single ROW-typed column s, which PhysTypeImpl stores
+    // in SCALAR row format, so each output row is the bare Object[] struct
+    // value rather than a singleton list.
+    final Function1<Object, Enumerable<FlatLists.ComparableList<Comparable>>> fn =
+        SqlFunctions.flatZip(
+            new int[]{-1}, false,
+            new SqlFunctions.FlatProductInputType[]{STRUCT}, false);
+
+    final List<Object> rows = new ArrayList<>();
+    for (Object row : (Enumerable) fn.apply(rowArray())) {
+      rows.add(row);
+    }
+
+    // Expected rows: {1, 'x'} and {2, 'y'}.
+    assertThat(rows, hasSize(2));
+    assertArrayEquals(new Object[]{1, "x"}, (Object[]) rows.get(0));
+    assertArrayEquals(new Object[]{2, "y"}, (Object[]) rows.get(1));
+
+    // UNNEST of a null array yields no rows.
+    assertThat(((Enumerable) fn.apply(null)).any(), is(false));
+  }
+
+  // Tests for the outer mode of flatZip (Uncollect.isOuter): an empty or
+  // NULL collection produces one all-NULL output row instead of none.
+
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  @Test void testFlatZipOuterScalar() {
+    // Models SELECT u.x FROM t LEFT JOIN UNNEST(t.arr) AS u(x) ON TRUE
+    final Function1<Object, Enumerable<FlatLists.ComparableList<Comparable>>> fn =
+        SqlFunctions.flatZip(new int[]{-1}, false,
+            new SqlFunctions.FlatProductInputType[]{SCALAR}, true);
+
+    // arr = [1, 2]
+    assertThat(((Enumerable) fn.apply(Arrays.asList(1, 2))).toList(),
+        is(Arrays.asList(1, 2)));
+    // arr = []
+    assertThat(((Enumerable) fn.apply(Collections.emptyList())).toList(),
+        is(Collections.singletonList(null)));
+    // arr = NULL
+    assertThat(((Enumerable) fn.apply(null)).toList(),
+        is(Collections.singletonList(null)));
+  }
+
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  @Test void testFlatZipOuterWholeStruct() {
+    // Models, under PRESTO conformance (struct elements kept whole),
+    // SELECT u.s FROM t LEFT JOIN UNNEST(t.arr) AS u(s) ON TRUE.
+    final Function1<Object, Enumerable<FlatLists.ComparableList<Comparable>>> fn =
+        SqlFunctions.flatZip(new int[]{-1}, false,
+            new SqlFunctions.FlatProductInputType[]{STRUCT}, true);
+
+    // arr = [ROW(1, 'x'), ROW(2, 'y')]
+    final List<Object> rows = ((Enumerable) fn.apply(rowArray())).toList();
+    assertThat(rows, hasSize(2));
+    assertArrayEquals(new Object[]{1, "x"}, (Object[]) rows.get(0));
+    // arr = []
+    assertThat(((Enumerable) fn.apply(Collections.emptyList())).toList(),
+        is(Collections.singletonList(null)));
+    // arr = NULL
+    assertThat(((Enumerable) fn.apply(null)).toList(),
+        is(Collections.singletonList(null)));
+  }
+
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  @Test void testFlatZipOuterWithOrdinality() {
+    // Models SELECT u.x, u.o
+    //     FROM t LEFT JOIN UNNEST(t.arr) WITH ORDINALITY AS u(x, o) ON TRUE
+    final Function1<Object, Enumerable<FlatLists.ComparableList<Comparable>>> fn =
+        SqlFunctions.flatZip(new int[]{-1}, true,
+            new SqlFunctions.FlatProductInputType[]{SCALAR}, true);
+
+    // arr = [7, 8]
+    final List<List<Object>> rows = new ArrayList<>();
+    for (FlatLists.ComparableList<Comparable> row
+        : fn.apply(Arrays.asList(7, 8))) {
+      rows.add(new ArrayList<>(row));
+    }
+    assertThat(rows,
+        is(Arrays.asList(Arrays.asList(7, 1), Arrays.asList(8, 2))));
+
+    // arr = []; the padded row has a NULL ordinal
+    rows.clear();
+    for (FlatLists.ComparableList<Comparable> row
+        : fn.apply(Collections.emptyList())) {
+      rows.add(new ArrayList<>(row));
+    }
+    assertThat(rows, is(Collections.singletonList(Arrays.asList(null, null))));
+
+    // arr = NULL
+    rows.clear();
+    for (FlatLists.ComparableList<Comparable> row : fn.apply(null)) {
+      rows.add(new ArrayList<>(row));
+    }
+    assertThat(rows, is(Collections.singletonList(Arrays.asList(null, null))));
+  }
+
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  @Test void testFlatZipOuterMultipleCollections() {
+    // Models SELECT u.x, u.y FROM t LEFT JOIN UNNEST(t.a, t.b) AS u(x, y) ON TRUE
+    final Function1<Object, Enumerable<FlatLists.ComparableList<Comparable>>> fn =
+        SqlFunctions.flatZip(new int[]{-1, -1}, false,
+            new SqlFunctions.FlatProductInputType[]{SCALAR, SCALAR}, true);
+
+    // (a, b) = ([], [7]): zip pads a
+    final List<List<Object>> rows = new ArrayList<>();
+    for (FlatLists.ComparableList<Comparable> row
+        : fn.apply(new Object[]{Collections.emptyList(), Arrays.asList(7)})) {
+      rows.add(new ArrayList<>(row));
+    }
+    assertThat(rows, is(Collections.singletonList(Arrays.asList(null, 7))));
+
+    // (a, b) = ([], NULL): one all-NULL row
+    rows.clear();
+    for (FlatLists.ComparableList<Comparable> row
+        : fn.apply(new Object[]{Collections.emptyList(), null})) {
+      rows.add(new ArrayList<>(row));
+    }
+    assertThat(rows, is(Collections.singletonList(Arrays.asList(null, null))));
+  }
+
+  @Test void testFlatListOuter() {
+    // Models SELECT u.x FROM t LEFT JOIN UNNEST(t.arr) AS u(x) ON TRUE
+    // for arr ROW(a INTEGER) ARRAY
+    final Function1<List<Object>, Enumerable<Object>> fn =
+        (Function1) SqlFunctions.flatListOuter();
+    // arr = [ROW(1), ROW(2)]
+    assertThat(fn.apply(Arrays.asList(FlatLists.of(1), FlatLists.of(2))).toList(),
+        is(Arrays.asList(1, 2)));
+    // arr = []
+    assertThat(fn.apply(Collections.emptyList()).toList(),
+        is(Collections.singletonList(null)));
+    // arr = NULL
+    assertThat(fn.apply(null).toList(),
+        is(Collections.singletonList(null)));
+  }
+
+  private static void checkArrayFunctionsWithRows(Object row, Object equalRow) {
+    // The Spark-validated SQL results are recorded in sql/row-equality.iq.
+    // This helper also exercises Java-specific inputs; its full set of inputs
+    // and assertions was not run against Spark.
+    final Object other = new Object[] {9, "Other"};
+    final List<Object> input = list(row, null, other, equalRow);
+    assertThat(SqlFunctions.arrayContains(input, equalRow), is(true));
+    assertThat(SqlFunctions.arrayContains(list(other), row), is(false));
+    assertThat(SqlFunctions.arrayPosition(input, equalRow), is(1L));
+    assertThat(SqlFunctions.arrayPosition(list(other), row), is(0L));
+    assertThat(SqlFunctions.arrayRemove(input, equalRow), is(list(null, other)));
+    assertThat(SqlFunctions.distinct(input), is(list(row, null, other)));
+    assertThat(SqlFunctions.arrayUnion(input, list(equalRow, other, null)),
+        is(list(row, null, other)));
+    assertThat(SqlFunctions.arrayIntersect(input, list(equalRow, null)),
+        is(list(row, null)));
+    assertThat(SqlFunctions.arrayIntersect(input, list(null, equalRow, null, equalRow)),
+        is(list(row, null)));
+    assertThat(SqlFunctions.arrayExcept(input, list(equalRow, null)), is(list(other)));
+    assertThat(arraysOverlap(input, list(equalRow)), is(true));
+    assertThat(arraysOverlap(list(row), list(other)), is(false));
+    assertThat(arraysOverlap(list(row, null), list(other)), is(nullValue()));
+    assertThat(arraysOverlap(list(), input), is(false));
+    assertThat(input, is(list(row, null, other, equalRow)));
   }
 }

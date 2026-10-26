@@ -43,12 +43,14 @@ import org.apache.calcite.runtime.variant.VariantValue;
 import org.apache.calcite.sql.SqlIntervalQualifier;
 import org.apache.calcite.sql.SqlUtil;
 import org.apache.calcite.sql.fun.SqlLibraryOperators;
+import org.apache.calcite.sql.parser.SqlParserUtil;
 import org.apache.calcite.util.NumberUtil;
 import org.apache.calcite.util.TimeWithTimeZoneString;
 import org.apache.calcite.util.TimestampWithTimeZoneString;
 import org.apache.calcite.util.TryThreadLocal;
 import org.apache.calcite.util.Unsafe;
 import org.apache.calcite.util.Util;
+import org.apache.calcite.util.UuidValue;
 import org.apache.calcite.util.format.FormatElement;
 import org.apache.calcite.util.format.FormatModel;
 import org.apache.calcite.util.format.FormatModels;
@@ -88,6 +90,7 @@ import java.math.RoundingMode;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
 import java.nio.charset.CharsetDecoder;
@@ -99,11 +102,13 @@ import java.text.DecimalFormat;
 import java.text.Normalizer;
 import java.text.ParsePosition;
 import java.text.SimpleDateFormat;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
+import java.time.Period;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
@@ -126,10 +131,10 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TimeZone;
@@ -138,6 +143,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BinaryOperator;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
@@ -205,20 +211,71 @@ public class SqlFunctions {
   private static final Function1<List<Object>, Enumerable<Object>> LIST_AS_ENUMERABLE =
       a0 -> a0 == null ? Linq4j.emptyEnumerable() : Linq4j.asEnumerable(a0);
 
+  /** Like {@link #LIST_AS_ENUMERABLE}, for a collection whose struct elements
+   * are kept whole: each element is converted to an Object[] struct value. */
+  private static final Function1<List<Object>, Enumerable<@Nullable Object>>
+      STRUCT_LIST_AS_ENUMERABLE =
+          a0 -> a0 == null ? Linq4j.emptyEnumerable()
+              : Linq4j.asEnumerable(a0).<@Nullable Object>select(SqlFunctions::structValue);
+
+  /** Single NULL element, the outer-mode result for an empty or NULL
+   * collection. */
+  private static final List<@Nullable Object> SINGLE_NULL =
+      Collections.singletonList(null);
+
+  /** Like {@link #LIST_AS_ENUMERABLE}, but for outer join mode: an empty or NULL
+   * collection yields one NULL element rather than no elements. */
+  private static final Function1<List<Object>, Enumerable<@Nullable Object>>
+      OUTER_LIST_AS_ENUMERABLE =
+          a0 -> a0 == null || a0.isEmpty() ? Linq4j.asEnumerable(SINGLE_NULL)
+              : Linq4j.asEnumerable(a0);
+
+  /** Like {@link #STRUCT_LIST_AS_ENUMERABLE}, but for outer join mode. */
+  private static final Function1<List<Object>, Enumerable<@Nullable Object>>
+      OUTER_STRUCT_LIST_AS_ENUMERABLE =
+          a0 -> a0 == null || a0.isEmpty() ? Linq4j.asEnumerable(SINGLE_NULL)
+              : Linq4j.asEnumerable(a0).<@Nullable Object>select(SqlFunctions::structValue);
+
+  /** Converts one element of a collection of structs to its Object[] struct
+   * value. Elements arrive as List or as Object[]; null elements stay null. */
+  @SuppressWarnings("rawtypes")
+  private static @Nullable Object structValue(@Nullable Object element) {
+    if (element == null || element instanceof Object[]) {
+      return element;
+    }
+    return ((List) element).toArray();
+  }
+
   @SuppressWarnings("unused")
   private static final Function1<Object[], Enumerable<@Nullable Object[]>> ARRAY_CARTESIAN_PRODUCT =
-      lists -> {
-        final List<Enumerator<@Nullable Object>> enumerators = new ArrayList<>();
-        for (Object list : lists) {
-          enumerators.add(Linq4j.enumerator((List) list));
-        }
-        final Enumerator<List<@Nullable Object>> product = Linq4j.product(enumerators);
-        return new AbstractEnumerable<@Nullable Object[]>() {
-          @Override public Enumerator<@Nullable Object[]> enumerator() {
-            return Linq4j.transform(product, List::toArray);
-          }
-        };
-      };
+      SqlFunctions::arrayCartesianProduct;
+
+  /**
+   * WARNING: keep this logic as a static method. JDK 8 and 11 produce invalid bytecode when
+   * checkerframework annotations are used on static lambdas. See CALCITE-6393.
+   */
+  private static Enumerable<@Nullable Object[]> arrayCartesianProduct(Object[] lists) {
+    final List<Enumerator<@Nullable Object>> enumerators = new ArrayList<>();
+    for (Object list : lists) {
+      enumerators.add(Linq4j.enumerator((List) list));
+    }
+    final Enumerator<List<@Nullable Object>> product = Linq4j.product(enumerators);
+    return new ArrayCartesianProductEnumerable(product);
+  }
+
+  /** Enumerable for {@link #arrayCartesianProduct(Object[])}. */
+  private static class ArrayCartesianProductEnumerable
+      extends AbstractEnumerable<@Nullable Object[]> {
+    private final Enumerator<List<@Nullable Object>> product;
+
+    ArrayCartesianProductEnumerable(Enumerator<List<@Nullable Object>> product) {
+      this.product = product;
+    }
+
+    @Override public Enumerator<@Nullable Object[]> enumerator() {
+      return Linq4j.transform(product, List::toArray);
+    }
+  }
 
   /** Holds, for each thread, a map from sequence name to sequence current
    * value.
@@ -228,6 +285,11 @@ public class SqlFunctions {
    * will want persistent values for sequences, shared among threads. */
   private static final TryThreadLocal<Map<String, AtomicLong>> THREAD_SEQUENCES =
       TryThreadLocal.withInitial(HashMap::new);
+
+  /** Resets the sequences in the current thread. */
+  public static void resetThreadSequences() {
+    THREAD_SEQUENCES.get().clear();
+  }
 
   /** A byte string consisting of a single byte that is the ASCII space
    * character (0x20). */
@@ -287,21 +349,82 @@ public class SqlFunctions {
     return condition;
   }
 
-  public static String uuidToString(UUID uuid) {
+  public static String uuidToString(UuidValue uuid) {
     return uuid.toString();
   }
 
-  public static UUID binaryToUuid(ByteString bytes) {
-    if (bytes.length() < 16) {
-      throw new IllegalArgumentException("Need at least 16 bytes for UUID");
+  /** Converts a string to a UUID: 32 hexadecimal digits. All of the following give
+   * the UUID {@code 123e4567-e89b-12d3-a456-426655440000}:
+   *
+   * <blockquote><pre>
+   * 123e4567-e89b-12d3-a456-426655440000
+   * 123E4567-E89B-12D3-A456-426655440000
+   * 123e4567e89b12d3a456426655440000
+   * {123e4567-e89b-12d3-a456-426655440000}
+   * {123e4567e89b12d3a456426655440000}
+   * 123e-4567-e89b-12d3-a456-4266-5544-0000
+   * 123e4567-e89b12d3-a4564266-55440000
+   * 123e-4567e89b-12d3a456426655440000
+   * </pre></blockquote>
+   *
+   * <p>and each of the following is an error:
+   *
+   * <blockquote><pre>
+   * 1-2-3-4-5                              a group is not four digits wide
+   * 123e456-7e89b-12d3-a456-426655440000   as above, though 36 characters long
+   * 123e4567--e89b-12d3-a456-426655440000  empty group
+   * -123e4567e89b12d3a456426655440000      leading hyphen
+   * 123e4567e89b12d3a456426655440000-      trailing hyphen
+   * {123e4567-e89b-12d3-a456-426655440000  unbalanced brace
+   * 123e4567-e89b-12d3-a456-42665544000    31 digits
+   * </pre></blockquote>
+   *
+   * <p>Blanks are never trimmed.
+   */
+  public static UUID stringToUuid(String s) {
+    String body = s;
+    if (body.length() > 1
+        && body.charAt(0) == '{'
+        && body.charAt(body.length() - 1) == '}') {
+      body = body.substring(1, body.length() - 1);
+    }
+    final StringBuilder digits = new StringBuilder(32);
+    for (int i = 0; i < body.length(); i++) {
+      final char c = body.charAt(i);
+      if (c == '-') {
+        // A hyphen separates groups, so it must follow a complete group of four
+        // digits and cannot be the last character
+        if (digits.length() == 0
+            || digits.length() % 4 != 0
+            || digits.length() == 32
+            || body.charAt(i - 1) == '-') {
+          throw new IllegalArgumentException("Invalid UUID string: " + s);
+        }
+      } else if (SqlParserUtil.isHexDigit(c) && digits.length() < 32) {
+        digits.append(c);
+      } else {
+        throw new IllegalArgumentException("Invalid UUID string: " + s);
+      }
+    }
+    if (digits.length() != 32) {
+      throw new IllegalArgumentException("Invalid UUID string: " + s);
+    }
+    return new UUID(
+        Long.parseUnsignedLong(digits.substring(0, 16), 16),
+        Long.parseUnsignedLong(digits.substring(16), 16));
+  }
+
+  public static UuidValue binaryToUuid(ByteString bytes) {
+    if (bytes.length() != 16) {
+      throw new IllegalArgumentException("Need exactly 16 bytes for UUID");
     }
     ByteBuffer byteBuffer = ByteBuffer.wrap(bytes.getBytes());
     long mostSignificantBits = byteBuffer.getLong();
     long leastSignificantBits = byteBuffer.getLong();
-    return new UUID(mostSignificantBits, leastSignificantBits);
+    return new UuidValue(new UUID(mostSignificantBits, leastSignificantBits));
   }
 
-  public static ByteString uuidToBinary(UUID uuid) {
+  public static ByteString uuidToBinary(UuidValue uuid) {
     byte[] dest = new byte[16];
     ByteBuffer byteBuffer = ByteBuffer.wrap(dest);
     byteBuffer.putLong(uuid.getMostSignificantBits());
@@ -996,11 +1119,18 @@ public class SqlFunctions {
 
   /** SQL {@code SPLIT_PART(string, string, int)} function. */
   public static String splitPart(String s, String delimiter, int n) {
-    if (Strings.isNullOrEmpty(s) || Strings.isNullOrEmpty(delimiter)) {
+    // Function is strict, so arguments cannot be null
+    if (s.isEmpty()) {
       return "";
     }
 
-    String[] parts = s.split(delimiter, -1);
+
+    String[] parts;
+    if (delimiter.isEmpty()) {
+      parts = new String[] { s };
+    } else {
+      parts = s.split(Pattern.quote(delimiter), -1);
+    }
     int partCount = parts.length;
 
     if (n < 0) {
@@ -1013,8 +1143,6 @@ public class SqlFunctions {
 
     return parts[n - 1];
   }
-
-
 
   /** SQL {@code SPLIT(string)} function. */
   public static List<String> split(String s) {
@@ -1075,7 +1203,7 @@ public class SqlFunctions {
     return nullFlag ? null : false;
   }
 
-  /** SQL <code>CONTAINS_SUBSTR(jsonString, substr, json_scope&#61;&#62;jsonScope)</code>
+  /** SQL <code>CONTAINS_SUBSTR(jsonString, substr, json_scope =&gt; jsonScope)</code>
   * operator. */
   public static boolean containsSubstr(String jsonString, String substr,
       String jsonScope) {
@@ -1262,6 +1390,66 @@ public class SqlFunctions {
   public static String formatNumber(BigDecimal value, int decimalVal) {
     DecimalFormat numberFormat = getNumberFormat(decimalVal);
     return numberFormat.format(value);
+  }
+
+  /** Implements casts from integer to binary values.
+   *
+   * @param value      Value converted; an integer or unsigned value.
+   * @param resultSize Size of result in bytes; negative if unspecified.
+   * @param fixed      True if the result type is BINARY; false for VARBINARY.
+   * @return           A ByteString containing the conversion result.
+   *
+   * <p>Most SQL dialects which support this feature seem to convert integers to big endian values,
+   * and then truncate or pad on the left when the size of the target BINARY does not exactly
+   * match the integer's size.
+   */
+  public static ByteString intToBinary(Object value, int resultSize, boolean fixed) {
+    ByteBuffer buffer;
+    if (value instanceof Byte) {
+      buffer = ByteBuffer.allocate(1)
+          .order(ByteOrder.BIG_ENDIAN)
+          .put((byte) value);
+    } else if (value instanceof Short) {
+      buffer = ByteBuffer.allocate(2)
+          .order(ByteOrder.BIG_ENDIAN)
+          .putShort((short) value);
+    } else if (value instanceof Integer) {
+      buffer = ByteBuffer.allocate(4)
+          .order(ByteOrder.BIG_ENDIAN)
+          .putInt((Integer) value);
+    } else if (value instanceof Long) {
+      buffer = ByteBuffer.allocate(8)
+          .order(ByteOrder.BIG_ENDIAN)
+          .putLong((Long) value);
+    } else if (value instanceof UByte) {
+      buffer = ByteBuffer.allocate(1)
+          .order(ByteOrder.BIG_ENDIAN)
+          .put(((UByte) value).byteValue());
+    } else if (value instanceof UShort) {
+      buffer = ByteBuffer.allocate(2)
+          .order(ByteOrder.BIG_ENDIAN)
+          .putShort(((UShort) value).shortValue());
+    } else if (value instanceof UInteger) {
+      buffer = ByteBuffer.allocate(4)
+          .order(ByteOrder.BIG_ENDIAN)
+          .putInt(((UInteger) value).intValue());
+    } else if (value instanceof ULong) {
+      buffer = ByteBuffer.allocate(8)
+          .order(ByteOrder.BIG_ENDIAN)
+          .putLong(((ULong) value).longValue());
+    } else {
+      throw new IllegalArgumentException("Unexpected argument type " + value);
+    }
+    ByteString result = new ByteString(buffer.array());
+    if (resultSize >= 0) {
+      if (resultSize < result.length()) {
+        result = SqlFunctions.right(result, resultSize);
+      } else if (fixed && resultSize > result.length()) {
+        // pad on left
+        result = new ByteString(new byte[resultSize - result.length()]).concat(result);
+      }
+    }
+    return result;
   }
 
   public static String formatNumber(long value, String format) {
@@ -1656,9 +1844,33 @@ public class SqlFunctions {
     return s0.concat(s1);
   }
 
+  /** Concatenates two binary strings.
+   * Returns null only when both b0 and b1 are null,
+   * otherwise null is treated as empty binary string. */
+  public static @Nullable ByteString concatWithNull(@Nullable ByteString b0,
+      @Nullable ByteString b1) {
+    if (b0 == null) {
+      return b1;
+    } else if (b1 == null) {
+      return b0;
+    } else {
+      return b0.concat(b1);
+    }
+  }
+
   /** SQL {@code CONCAT(arg0, arg1, arg2, ...)} function. */
   public static String concatMulti(String... args) {
     return String.join("", args);
+  }
+
+  /** SQL {@code CONCAT(arg0, arg1, arg2, ...)} function,
+   * applied to binary strings. */
+  public static ByteString concatMulti(ByteString... args) {
+    ByteString result = ByteString.EMPTY;
+    for (ByteString arg : args) {
+      result = result.concat(arg);
+    }
+    return result;
   }
 
   /** SQL {@code CONCAT(arg0, ...)} function which can accept null
@@ -1669,6 +1881,19 @@ public class SqlFunctions {
       sb.append(arg == null ? "" : arg);
     }
     return sb.toString();
+  }
+
+  /** SQL {@code CONCAT(arg0, ...)} function applied to binary strings.
+   * Accepts null arguments, treating each as an empty binary string,
+   * and never returns null. */
+  public static ByteString concatMultiWithNull(ByteString... args) {
+    ByteString result = ByteString.EMPTY;
+    for (ByteString arg : args) {
+      if (arg != null) {
+        result = result.concat(arg);
+      }
+    }
+    return result;
   }
 
   /** SQL {@code CONCAT_WS(sep, arg1, arg2, ...)} function;
@@ -1786,7 +2011,7 @@ public class SqlFunctions {
   @Deterministic
   public static class ParseUrlFunction {
     static Pattern keyToPattern(String keyToExtract) {
-      return Pattern.compile("(&|^)" + keyToExtract + "=([^&]*)");
+      return Pattern.compile("(&|^)" + Pattern.quote(keyToExtract) + "=([^&]*)");
     }
 
     private final LoadingCache<String, Pattern> cache =
@@ -2005,7 +2230,7 @@ public class SqlFunctions {
       }
     }
 
-    private final LoadingCache<Key, Pattern> cache =
+    private static final LoadingCache<Key, Pattern> CACHE =
         CacheBuilder.newBuilder()
             .maximumSize(FUNCTION_LEVEL_CACHE_MAX_SIZE.value())
             .build(CacheLoader.from(Key::toPattern));
@@ -2013,32 +2238,32 @@ public class SqlFunctions {
     /** SQL {@code LIKE} function. */
     public boolean like(String s, String pattern) {
       final Key key = new Key(pattern, null, 0);
-      return cache.getUnchecked(key).matcher(s).matches();
+      return CACHE.getUnchecked(key).matcher(s).matches();
     }
 
     /** SQL {@code LIKE} function with escape. */
     public boolean like(String s, String pattern, String escape) {
       final Key key = new Key(pattern, escape, 0);
-      return cache.getUnchecked(key).matcher(s).matches();
+      return CACHE.getUnchecked(key).matcher(s).matches();
     }
 
     /** SQL {@code ILIKE} function. */
     public boolean ilike(String s, String pattern) {
       final Key key = new Key(pattern, null, Pattern.CASE_INSENSITIVE);
-      return cache.getUnchecked(key).matcher(s).matches();
+      return CACHE.getUnchecked(key).matcher(s).matches();
     }
 
     /** SQL {@code ILIKE} function with escape. */
     public boolean ilike(String s, String pattern, String escape) {
       final Key key = new Key(pattern, escape, Pattern.CASE_INSENSITIVE);
-      return cache.getUnchecked(key).matcher(s).matches();
+      return CACHE.getUnchecked(key).matcher(s).matches();
     }
   }
 
   /** State for {@code SIMILAR} function. */
   @Deterministic
   public static class SimilarFunction {
-    private final LoadingCache<String, Pattern> cache =
+    private static final LoadingCache<String, Pattern> CACHE =
         CacheBuilder.newBuilder()
             .maximumSize(FUNCTION_LEVEL_CACHE_MAX_SIZE.value())
             .build(
@@ -2047,7 +2272,7 @@ public class SqlFunctions {
 
     /** SQL {@code SIMILAR} function. */
     public boolean similar(String s, String pattern) {
-      return cache.getUnchecked(pattern).matcher(s).matches();
+      return CACHE.getUnchecked(pattern).matcher(s).matches();
     }
   }
 
@@ -2064,14 +2289,14 @@ public class SqlFunctions {
       }
     }
 
-    private final LoadingCache<Key, Pattern> cache =
+    private static final LoadingCache<Key, Pattern> CACHE =
         CacheBuilder.newBuilder()
             .maximumSize(FUNCTION_LEVEL_CACHE_MAX_SIZE.value())
             .build(CacheLoader.from(Key::toPattern));
 
     /** SQL {@code SIMILAR} function with escape. */
     public boolean similar(String s, String pattern, String escape) {
-      return cache.getUnchecked(new Key(pattern, escape))
+      return CACHE.getUnchecked(new Key(pattern, escape))
           .matcher(s).matches();
     }
   }
@@ -2113,13 +2338,83 @@ public class SqlFunctions {
   /** SQL <code>=</code> operator applied to Object[] values (neither may be
    * null). */
   public static boolean eq(@Nullable Object @Nullable [] b0, @Nullable Object @Nullable [] b1) {
-    return Arrays.deepEquals(b0, b1);
+    return Functions.compareObjectArrays(b0, b1) == 0;
   }
 
   /** SQL <code>=</code> operator applied to Object values (including String;
    * neither side may be null). */
   public static boolean eq(Object b0, Object b1) {
     return b0.equals(b1);
+  }
+
+  /** SQL <code>=</code> operator applied to ROW values, with the standard's
+   * three-valued row comparison: FALSE as soon as one field pair is unequal,
+   * UNKNOWN (null) when a field pair involves a NULL and no pair is unequal,
+   * TRUE otherwise.
+   *
+   * <p>A nested ROW, represented as {@code Object[]}, follows the same rule.
+   * A collection-valued field is compared as a whole, because e.g., ARRAY equality
+   * uses IS NOT DISTINCT FROM semantics and never yields UNKNOWN. */
+  public static @Nullable Boolean rowEq(@Nullable Object b0, @Nullable Object b1) {
+    if (b0 == null || b1 == null) {
+      return null;
+    }
+    final List<?> l0 = rowAsList(b0);
+    final List<?> l1 = rowAsList(b1);
+    if (l0 == null || l1 == null) {
+      // Not a representation we can take apart; fall back to total equality.
+      return Functions.compareListItems(b0, b1) == 0;
+    }
+    if (l0.size() != l1.size()) {
+      return false;
+    }
+    boolean sawNull = false;
+    for (int i = 0; i < l0.size(); i++) {
+      final Object f0 = l0.get(i);
+      final Object f1 = l1.get(i);
+      if (f0 == null || f1 == null) {
+        sawNull = true;
+      } else if (f0 instanceof Object[] && f1 instanceof Object[]) {
+        final Boolean nested = rowEq(f0, f1);
+        if (nested == null) {
+          sawNull = true;
+        } else if (!nested) {
+          return false;
+        }
+      } else if (Functions.compareListItems(f0, f1) != 0) {
+        return false;
+      }
+    }
+    return sawNull ? null : true;
+  }
+
+  /** SQL <code>&lt;&gt;</code> operator applied to ROW values; the
+   * three-valued negation of {@link #rowEq}. */
+  public static @Nullable Boolean rowNe(@Nullable Object b0, @Nullable Object b1) {
+    final Boolean eq = rowEq(b0, b1);
+    return eq == null ? null : !eq;
+  }
+
+  /** Views a ROW value as the list of its fields; returns null if the value is
+   * not one of the representations a ROW may have. */
+  private static @Nullable List<?> rowAsList(Object o) {
+    if (o instanceof Object[]) {
+      return Arrays.asList((Object[]) o);
+    }
+    if (o instanceof List) {
+      return (List<?>) o;
+    }
+    return null;
+  }
+
+  /** SQL <code>=</code> operator applied to List values. */
+  public static boolean eq(List<?> b0, List<?> b1) {
+    return eqNullable(b0, b1);
+  }
+
+  /** SQL <code>=</code> operator applied to Map values. */
+  public static boolean eq(Map<?, ?> b0, Map<?, ?> b1) {
+    return eqNullable(b0, b1);
   }
 
   /** SQL <code>=</code> operator applied to String values with a certain Comparator. */
@@ -2130,22 +2425,7 @@ public class SqlFunctions {
   /** SQL <code>=</code> operator applied to Object values (at least one operand
    * has ANY type; neither may be null). */
   public static boolean eqAny(Object b0, Object b1) {
-    if (b0.getClass().equals(b1.getClass())) {
-      // The result of SqlFunctions.eq(BigDecimal, BigDecimal) makes more sense
-      // than BigDecimal.equals(BigDecimal). So if both of types are BigDecimal,
-      // we just use SqlFunctions.eq(BigDecimal, BigDecimal).
-      if (BigDecimal.class.isInstance(b0)) {
-        return eq((BigDecimal) b0, (BigDecimal) b1);
-      } else {
-        return b0.equals(b1);
-      }
-    } else if (allAssignable(Number.class, b0, b1)) {
-      return eq(toBigDecimal((Number) b0), toBigDecimal((Number) b1));
-    }
-    // We shouldn't rely on implementation even though overridden equals can
-    // handle other types which may create worse result: for example,
-    // a.equals(b) != b.equals(a)
-    return false;
+    return eqNullable(b0, b1);
   }
 
   /** Returns whether two objects can both be assigned to a given class. */
@@ -2166,6 +2446,21 @@ public class SqlFunctions {
     return !eq(b0, b1);
   }
 
+  /** SQL <code>&lt;gt;</code> operator applied to List values. */
+  public static boolean ne(List<?> b0, List<?> b1) {
+    return !eqNullable(b0, b1);
+  }
+
+  /** SQL <code>&lt;gt;</code> operator applied to Map values. */
+  public static boolean ne(Map<?, ?> b0, Map<?, ?> b1) {
+    return !eqNullable(b0, b1);
+  }
+
+  /** SQL <code>&lt;gt;</code> operator applied to Object[] values. */
+  public static boolean ne(@Nullable Object @Nullable [] b0, @Nullable Object @Nullable [] b1) {
+    return !eqNullable(b0, b1);
+  }
+
   /** SQL <code>&lt;gt;</code> operator applied to OString values with a certain Comparator. */
   public static boolean ne(String s0, String s1, Comparator<String> comparator) {
     return !eq(s0, s1, comparator);
@@ -2175,6 +2470,66 @@ public class SqlFunctions {
    * operand has ANY type, including String; neither may be null). */
   public static boolean neAny(Object b0, Object b1) {
     return !eqAny(b0, b1);
+  }
+
+  private static boolean eqNullable(@Nullable Object b0, @Nullable Object b1) {
+    if (b0 == b1) {
+      return true;
+    }
+    if (b0 == null || b1 == null) {
+      return false;
+    }
+    if (b0 instanceof List && b1 instanceof List) {
+      return Functions.compareLists((List<?>) b0, (List<?>) b1) == 0;
+    }
+    if (b0 instanceof Map && b1 instanceof Map) {
+      return Functions.compareMaps((Map<?, ?>) b0, (Map<?, ?>) b1) == 0;
+    }
+    if (b0 instanceof Object[] && b1 instanceof Object[]) {
+      return Functions.compareObjectArrays((Object[]) b0, (Object[]) b1) == 0;
+    }
+    if (b0.getClass().equals(b1.getClass())) {
+      if (b0 instanceof BigDecimal) {
+        return eq((BigDecimal) b0, (BigDecimal) b1);
+      }
+      return b0.equals(b1);
+    }
+    if (b0 instanceof Number && b1 instanceof Number) {
+      return eq(toBigDecimal((Number) b0), toBigDecimal((Number) b1));
+    }
+    return false;
+  }
+
+  /** Compares two nullable objects recursively if they are collections.
+   * Nulls are treated as larger than non-null values. The op is used to record
+   * the type of comparison operation for user-friendly display in error messages. */
+  private static int compareNullable(@Nullable Object b0, @Nullable Object b1, String op) {
+    if (b0 == b1) {
+      return 0;
+    }
+    if (b0 == null) {
+      return 1;
+    }
+    if (b1 == null) {
+      return -1;
+    }
+    if (b0 instanceof List && b1 instanceof List) {
+      return Functions.compareLists((List<?>) b0, (List<?>) b1);
+    }
+    if (b0 instanceof Map && b1 instanceof Map) {
+      return Functions.compareMaps((Map<?, ?>) b0, (Map<?, ?>) b1);
+    }
+    if (b0 instanceof Object[] && b1 instanceof Object[]) {
+      return Functions.compareObjectArrays((Object[]) b0, (Object[]) b1);
+    }
+    if (b0.getClass().equals(b1.getClass()) && b0 instanceof Comparable) {
+      //noinspection unchecked
+      return ((Comparable) b0).compareTo(b1);
+    }
+    if (b0 instanceof Number && b1 instanceof Number) {
+      return toBigDecimal((Number) b0).compareTo(toBigDecimal((Number) b1));
+    }
+    throw notComparable(op, b0, b1);
   }
 
   // <
@@ -2199,6 +2554,11 @@ public class SqlFunctions {
     return b0.compareTo(b1) < 0;
   }
 
+  /** SQL <code>&lt;</code> operator applied to UUID values. */
+  public static boolean lt(UuidValue b0, UuidValue b1) {
+    return b0.compareTo(b1) < 0;
+  }
+
   /** SQL <code>&lt;</code> operator applied to BigDecimal values. */
   public static boolean lt(BigDecimal b0, BigDecimal b1) {
     return b0.compareTo(b1) < 0;
@@ -2208,6 +2568,27 @@ public class SqlFunctions {
    * (or {@code b1} is null). Helper for {@code ARG_MIN}. */
   public static <T extends Comparable<T>> boolean ltNullable(T b0, T b1) {
     return b1 == null || b0 != null && b0.compareTo(b1) < 0;
+  }
+
+  /** Returns whether {@code b0} is less than {@code b1}
+   * (or {@code b1} is null). Helper for {@code ARG_MIN} on ARRAY keys. */
+  public static boolean ltNullable(@Nullable List<?> b0,
+      @Nullable List<?> b1) {
+    return b1 == null || b0 != null && lt(b0, b1);
+  }
+
+  /** Returns whether {@code b0} is less than {@code b1}
+   * (or {@code b1} is null). Helper for {@code ARG_MIN} on MAP keys. */
+  public static boolean ltNullable(@Nullable Map<?, ?> b0,
+      @Nullable Map<?, ?> b1) {
+    return b1 == null || b0 != null && lt(b0, b1);
+  }
+
+  /** Returns whether {@code b0} is less than {@code b1}
+   * (or {@code b1} is null). Helper for {@code ARG_MIN} on ROW keys. */
+  public static boolean ltNullable(@Nullable Object @Nullable [] b0,
+      @Nullable Object @Nullable [] b1) {
+    return b1 == null || b0 != null && lt(b0, b1);
   }
 
   public static boolean lt(byte b0, byte b1) {
@@ -2239,24 +2620,20 @@ public class SqlFunctions {
   }
 
   public static boolean lt(List<?> b0, List<?> b1) {
-    return Functions.compareLists(b0, b1) < 0;
+    return compareNullable(b0, b1, "<") < 0;
   }
 
-  public static boolean lt(Object[] b0, Object[] b1) {
-    return Functions.compareObjectArrays(b0, b1) < 0;
+  public static boolean lt(Map<?, ?> b0, Map<?, ?> b1) {
+    return compareNullable(b0, b1, "<") < 0;
+  }
+
+  public static boolean lt(@Nullable Object @Nullable [] b0, @Nullable Object @Nullable [] b1) {
+    return compareNullable(b0, b1, "<") < 0;
   }
 
   /** SQL <code>&lt;</code> operator applied to Object values. */
   public static boolean ltAny(Object b0, Object b1) {
-    if (b0.getClass().equals(b1.getClass())
-        && b0 instanceof Comparable) {
-      //noinspection unchecked
-      return ((Comparable) b0).compareTo(b1) < 0;
-    } else if (allAssignable(Number.class, b0, b1)) {
-      return lt(toBigDecimal((Number) b0), toBigDecimal((Number) b1));
-    }
-
-    throw notComparable("<", b0, b1);
+    return compareNullable(b0, b1, "<") < 0;
   }
 
   // <=
@@ -2281,6 +2658,11 @@ public class SqlFunctions {
     return b0.compareTo(b1) <= 0;
   }
 
+  /** SQL <code>&le;</code> operator applied to UUID values. */
+  public static boolean le(UuidValue b0, UuidValue b1) {
+    return b0.compareTo(b1) <= 0;
+  }
+
   /** SQL <code>&le;</code> operator applied to BigDecimal values. */
   public static boolean le(BigDecimal b0, BigDecimal b1) {
     return b0.compareTo(b1) <= 0;
@@ -2288,26 +2670,23 @@ public class SqlFunctions {
 
   /** SQL <code>&le;</code> operator applied to List values. */
   public static boolean le(List<?> b0, List<?> b1) {
-    return Functions.compareLists(b0, b1) <= 0;
+    return compareNullable(b0, b1, "<=") <= 0;
+  }
+
+  /** SQL <code>&le;</code> operator applied to Map values. */
+  public static boolean le(Map<?, ?> b0, Map<?, ?> b1) {
+    return compareNullable(b0, b1, "<=") <= 0;
   }
 
   /** SQL <code>&le;</code> operator applied to Object[] values. */
-  public static boolean le(Object[] b0, Object[] b1) {
-    return Functions.compareObjectArrays(b0, b1) <= 0;
+  public static boolean le(@Nullable Object @Nullable [] b0, @Nullable Object @Nullable [] b1) {
+    return compareNullable(b0, b1, "<=") <= 0;
   }
 
   /** SQL <code>&le;</code> operator applied to Object values (at least one
    * operand has ANY type; neither may be null). */
   public static boolean leAny(Object b0, Object b1) {
-    if (b0.getClass().equals(b1.getClass())
-        && b0 instanceof Comparable) {
-      //noinspection unchecked
-      return ((Comparable) b0).compareTo(b1) <= 0;
-    } else if (allAssignable(Number.class, b0, b1)) {
-      return le(toBigDecimal((Number) b0), toBigDecimal((Number) b1));
-    }
-
-    throw notComparable("<=", b0, b1);
+    return compareNullable(b0, b1, "<=") <= 0;
   }
 
   // >
@@ -2332,6 +2711,11 @@ public class SqlFunctions {
     return b0.compareTo(b1) > 0;
   }
 
+  /** SQL <code>&gt;</code> operator applied to UUID values. */
+  public static boolean gt(UuidValue b0, UuidValue b1) {
+    return b0.compareTo(b1) > 0;
+  }
+
   /** SQL <code>&gt;</code> operator applied to BigDecimal values. */
   public static boolean gt(BigDecimal b0, BigDecimal b1) {
     return b0.compareTo(b1) > 0;
@@ -2341,6 +2725,27 @@ public class SqlFunctions {
    * (or {@code b1} is null). Helper for {@code ARG_MAX}. */
   public static <T extends Comparable<T>> boolean gtNullable(T b0, T b1) {
     return b1 == null || b0 != null && b0.compareTo(b1) > 0;
+  }
+
+  /** Returns whether {@code b0} is greater than {@code b1}
+   * (or {@code b1} is null). Helper for {@code ARG_MAX} on ARRAY keys. */
+  public static boolean gtNullable(@Nullable List<?> b0,
+      @Nullable List<?> b1) {
+    return b1 == null || b0 != null && gt(b0, b1);
+  }
+
+  /** Returns whether {@code b0} is greater than {@code b1}
+   * (or {@code b1} is null). Helper for {@code ARG_MAX} on MAP keys. */
+  public static boolean gtNullable(@Nullable Map<?, ?> b0,
+      @Nullable Map<?, ?> b1) {
+    return b1 == null || b0 != null && gt(b0, b1);
+  }
+
+  /** Returns whether {@code b0} is greater than {@code b1}
+   * (or {@code b1} is null). Helper for {@code ARG_MAX} on ROW keys. */
+  public static boolean gtNullable(@Nullable Object @Nullable [] b0,
+      @Nullable Object @Nullable [] b1) {
+    return b1 == null || b0 != null && gt(b0, b1);
   }
 
   public static boolean gt(byte b0, byte b1) {
@@ -2372,25 +2777,21 @@ public class SqlFunctions {
   }
 
   public static boolean gt(List<?> b0, List<?> b1) {
-    return Functions.compareLists(b0, b1) > 0;
+    return compareNullable(b0, b1, ">") > 0;
   }
 
-  public static boolean gt(Object[] b0, Object[] b1) {
-    return Functions.compareObjectArrays(b0, b1) > 0;
+  public static boolean gt(Map<?, ?> b0, Map<?, ?> b1) {
+    return compareNullable(b0, b1, ">") > 0;
+  }
+
+  public static boolean gt(@Nullable Object @Nullable [] b0, @Nullable Object @Nullable [] b1) {
+    return compareNullable(b0, b1, ">") > 0;
   }
 
   /** SQL <code>&gt;</code> operator applied to Object values (at least one
    * operand has ANY type; neither may be null). */
   public static boolean gtAny(Object b0, Object b1) {
-    if (b0.getClass().equals(b1.getClass())
-        && b0 instanceof Comparable) {
-      //noinspection unchecked
-      return ((Comparable) b0).compareTo(b1) > 0;
-    } else if (allAssignable(Number.class, b0, b1)) {
-      return gt(toBigDecimal((Number) b0), toBigDecimal((Number) b1));
-    }
-
-    throw notComparable(">", b0, b1);
+    return compareNullable(b0, b1, ">") > 0;
   }
 
   // >=
@@ -2415,6 +2816,11 @@ public class SqlFunctions {
     return b0.compareTo(b1) >= 0;
   }
 
+  /** SQL <code>&ge;</code> operator applied to UUID values. */
+  public static boolean ge(UuidValue b0, UuidValue b1) {
+    return b0.compareTo(b1) >= 0;
+  }
+
   /** SQL <code>&ge;</code> operator applied to BigDecimal values. */
   public static boolean ge(BigDecimal b0, BigDecimal b1) {
     return b0.compareTo(b1) >= 0;
@@ -2422,26 +2828,23 @@ public class SqlFunctions {
 
   /** SQL <code>&ge;</code> operator applied to List values. */
   public static boolean ge(List<?> b0, List<?> b1) {
-    return Functions.compareLists(b0, b1) >= 0;
+    return compareNullable(b0, b1, ">=") >= 0;
+  }
+
+  /** SQL <code>&ge;</code> operator applied to Map values. */
+  public static boolean ge(Map<?, ?> b0, Map<?, ?> b1) {
+    return compareNullable(b0, b1, ">=") >= 0;
   }
 
   /** SQL <code>&ge;</code> operator applied to Object[] values. */
-  public static boolean ge(Object[] b0, Object[] b1) {
-    return Functions.compareObjectArrays(b0, b1) >= 0;
+  public static boolean ge(@Nullable Object @Nullable [] b0, @Nullable Object @Nullable [] b1) {
+    return compareNullable(b0, b1, ">=") >= 0;
   }
 
   /** SQL <code>&ge;</code> operator applied to Object values (at least one
    * operand has ANY type; neither may be null). */
   public static boolean geAny(Object b0, Object b1) {
-    if (b0.getClass().equals(b1.getClass())
-        && b0 instanceof Comparable) {
-      //noinspection unchecked
-      return ((Comparable) b0).compareTo(b1) >= 0;
-    } else if (allAssignable(Number.class, b0, b1)) {
-      return ge(toBigDecimal((Number) b0), toBigDecimal((Number) b1));
-    }
-
-    throw notComparable(">=", b0, b1);
+    return compareNullable(b0, b1, ">=") >= 0;
   }
 
   // +
@@ -2847,8 +3250,12 @@ public class SqlFunctions {
     if ((b0 & b1 & q) >= 0) {
       return q;
     } else {
-      throw new ArithmeticException("integer overflow");
+      throw new ArithmeticException("long overflow");
     }
+  }
+
+  public static double checkedDivide(int b0, double b1) {
+    return b0 / b1;
   }
 
   public static UByte checkedDivide(UByte b0, UByte b1) {
@@ -2865,6 +3272,16 @@ public class SqlFunctions {
 
   public static ULong checkedDivide(ULong b0, ULong b1) {
     return ULong.valueOf(UnsignedType.toBigInteger(b0).divide(UnsignedType.toBigInteger(b1)));
+  }
+
+  // The definition of this function must match the divide function with the same signature
+  public static int checkedDivide(int b0, BigDecimal b1) {
+    return BigDecimal.valueOf(b0)
+        .divide(b1, RoundingMode.HALF_DOWN).intValueExact();
+  }
+
+  public static BigDecimal checkedDivide(BigDecimal b0, BigDecimal b1) {
+    return b0.divide(b1, RoundingMode.HALF_DOWN);
   }
 
   // *
@@ -2987,6 +3404,10 @@ public class SqlFunctions {
 
   public static ULong checkedMultiply(ULong b0, ULong b1) {
     return ULong.valueOf(UnsignedType.toBigInteger(b0).multiply(UnsignedType.toBigInteger(b1)));
+  }
+
+  public static BigDecimal checkedMultiply(BigDecimal b0, long b1) {
+    return b0.multiply(BigDecimal.valueOf(b1));
   }
 
   /** SQL <code>SAFE_ADD</code> function applied to long values. */
@@ -3626,14 +4047,29 @@ public class SqlFunctions {
   }
 
   /**
+   * Returns {@code x} modulo {@code m}, normalized to the range {@code [0, m)}
+   * (unlike {@code %}, the result is never negative). Used to normalize a shift
+   * amount to the bit width of the value being shifted.
+   *
+   * @param x the value (typically a shift amount, which may be negative)
+   * @param m the modulus, which must be positive (typically a bit width)
+   * @return {@code x} modulo {@code m}, in the range {@code [0, m)}
+   */
+  private static int positiveModulo(long x, int m) {
+    // Math.floorMod(long, int) is only available since JDK 9, so widen to
+    // Math.floorMod(long, long) and narrow the result (always in [0, m)) to int.
+    return (int) Math.floorMod(x, (long) m);
+  }
+
+  /**
    * Performs PostgresSQL-style bitwise shift on a 32-bit integer.
    *
    * @param x the integer value to shift
    * @param y the shift amount (positive: left shift, negative: right shift)
    * @return the shifted integer
    */
-  public static int leftShift(int x, int y) {
-    int shift = ((y % 32) + 32) % 32; // normalize to 0~31
+  public static int leftShift(int x, long y) {
+    int shift = positiveModulo(y, 32); // normalize to 0~31
     return y >= 0 ? x << shift : x >> shift; // arithmetic right shift
   }
 
@@ -3646,21 +4082,9 @@ public class SqlFunctions {
    * @param y the shift amount
    * @return the shifted long value
    */
-  public static long leftShift(long x, int y) {
-    int shift = ((y % 64) + 64) % 64; // normalize to 0~63
+  public static long leftShift(long x, long y) {
+    int shift = positiveModulo(y, 64); // normalize to 0~63
     return y >= 0 ? x << shift : x >> shift;
-  }
-
-  /**
-   * Performs PostgresSQL-style bitwise shift on an int value with a long shift amount.
-   *
-   * @param x the int value to shift
-   * @param y the long shift amount
-   * @return the shifted value as long
-   */
-  public static long leftShift(int x, long y) {
-    int shift = (int) (((y % 32) + 32) % 32); // normalize to 0~31
-    return y >= 0 ? (long) x << shift : (long) x >> shift;
   }
 
   /**
@@ -3672,7 +4096,7 @@ public class SqlFunctions {
    * @param y the shift amount in bits
    * @return the shifted byte array
    */
-  public static byte[] leftShift(byte[] bytes, int y) {
+  public static byte[] leftShift(byte[] bytes, long y) {
     if (bytes.length == 0) {
       return new byte[0];
     }
@@ -3681,7 +4105,7 @@ public class SqlFunctions {
 
     // PostgreSQL behavior: always treat as left shift with modulo arithmetic
     // Negative y becomes equivalent positive shift
-    int shift = ((y % bitLen) + bitLen) % bitLen;
+    int shift = positiveModulo(y, bitLen);
 
     if (shift == 0) {
       return bytes.clone();
@@ -3719,7 +4143,7 @@ public class SqlFunctions {
    * @param y the shift amount in bits
    * @return shifted ByteString
    */
-  public static ByteString leftShift(ByteString bytes, int y) {
+  public static ByteString leftShift(ByteString bytes, long y) {
     return new ByteString(leftShift(bytes.getBytes(), y));
   }
 
@@ -3727,8 +4151,8 @@ public class SqlFunctions {
    * Performs PostgresSQL-style bitwise shift on UByte.
    * Overflow bits are masked to 8 bits.
    */
-  public static UByte leftShift(UByte x, int y) {
-    int shift = ((y % 8) + 8) % 8;
+  public static UByte leftShift(UByte x, long y) {
+    int shift = positiveModulo(y, 8);
     int val = x.byteValue() & 0xFF;
     val = (y >= 0) ? (val << shift) & 0xFF : (val >> shift) & 0xFF;
     return UByte.valueOf((byte) val);
@@ -3738,8 +4162,8 @@ public class SqlFunctions {
    * Performs PostgresSQL-style bitwise shift on UShort.
    * Overflow bits are masked to 16 bits.
    */
-  public static UShort leftShift(UShort x, int y) {
-    int shift = ((y % 16) + 16) % 16;
+  public static UShort leftShift(UShort x, long y) {
+    int shift = positiveModulo(y, 16);
     int val = x.shortValue() & 0xFFFF;
     val = (y >= 0) ? (val << shift) & 0xFFFF : (val >> shift) & 0xFFFF;
     return UShort.valueOf((short) val);
@@ -3749,8 +4173,8 @@ public class SqlFunctions {
    * Performs PostgresSQL-style bitwise shift on UInteger.
    * Overflow bits are masked to 32 bits.
    */
-  public static UInteger leftShift(UInteger x, int y) {
-    int shift = ((y % 32) + 32) % 32;
+  public static UInteger leftShift(UInteger x, long y) {
+    int shift = positiveModulo(y, 32);
     long val = x.longValue() & 0xFFFFFFFFL;
     val = (y >= 0) ? (val << shift) & 0xFFFFFFFFL : (val >> shift) & 0xFFFFFFFFL;
     return UInteger.valueOf(val);
@@ -3760,10 +4184,86 @@ public class SqlFunctions {
    * Performs PostgresSQL-style bitwise shift on ULong.
    * Overflow bits are masked to 64 bits (long shifts naturally truncate).
    */
-  public static ULong leftShift(ULong x, int y) {
-    int shift = ((y % 64) + 64) % 64;
+  public static ULong leftShift(ULong x, long y) {
+    int shift = positiveModulo(y, 64);
     long val = x.longValue();
-    val = (y >= 0) ? val << shift : val >> shift;
+    // A negative shift amount shifts right; use a logical (unsigned) shift so
+    // the full-width ULong value is not sign-extended.
+    val = (y >= 0) ? val << shift : val >>> shift;
+    return ULong.valueOf(val);
+  }
+
+  /**
+   * Performs PostgresSQL-style bitwise shift on a 32-bit integer.
+   *
+   * @param x the integer value to shift
+   * @param y the shift amount (positive: right shift, negative: left shift)
+   * @return the shifted integer
+   */
+  public static int rightShift(int x, long y) {
+    int shift = positiveModulo(y, 32); // normalize to 0~31
+    return y >= 0 ? x >> shift : x << shift; // arithmetic right shift
+  }
+
+  /**
+   * Performs PostgresSQL-style bitwise shift on a 64-bit long value.
+   *
+   * @param x the long value to shift
+   * @param y the shift amount
+   * @return the shifted long value
+   */
+  public static long rightShift(long x, long y) {
+    int shift = positiveModulo(y, 64); // normalize to 0~63
+    return y >= 0 ? x >> shift : x << shift;
+  }
+
+  // Right shift on binary (byte[]/ByteString) is intentionally not implemented:
+  // BINARY/VARBINARY operands are rejected for >> and RIGHTSHIFT until the
+  // endianness of bitwise shifts on binary is settled. See [CALCITE-7651].
+
+  /**
+   * Performs PostgresSQL-style bitwise shift on UByte.
+   * Overflow bits are masked to 8 bits.
+   */
+  public static UByte rightShift(UByte x, long y) {
+    int shift = positiveModulo(y, 8);
+    int val = x.byteValue() & 0xFF;
+    val = (y >= 0) ? (val >> shift) & 0xFF : (val << shift) & 0xFF;
+    return UByte.valueOf((byte) val);
+  }
+
+  /**
+   * Performs PostgresSQL-style bitwise shift on UShort.
+   * Overflow bits are masked to 16 bits.
+   */
+  public static UShort rightShift(UShort x, long y) {
+    int shift = positiveModulo(y, 16);
+    int val = x.shortValue() & 0xFFFF;
+    val = (y >= 0) ? (val >> shift) & 0xFFFF : (val << shift) & 0xFFFF;
+    return UShort.valueOf((short) val);
+  }
+
+  /**
+   * Performs PostgresSQL-style bitwise shift on UInteger.
+   * Overflow bits are masked to 32 bits.
+   */
+  public static UInteger rightShift(UInteger x, long y) {
+    int shift = positiveModulo(y, 32);
+    long val = x.longValue() & 0xFFFFFFFFL;
+    val = (y >= 0) ? (val >> shift) & 0xFFFFFFFFL : (val << shift) & 0xFFFFFFFFL;
+    return UInteger.valueOf(val);
+  }
+
+  /**
+   * Performs PostgresSQL-style bitwise shift on ULong.
+   * Overflow bits are masked to 64 bits (long shifts naturally truncate).
+   */
+  public static ULong rightShift(ULong x, long y) {
+    int shift = positiveModulo(y, 64);
+    long val = x.longValue();
+    // Use a logical (unsigned) right shift: ULong holds the full 64 bits, so
+    // the raw long may be negative and an arithmetic '>>' would sign-extend.
+    val = (y >= 0) ? val >>> shift : val << shift;
     return ULong.valueOf(val);
   }
 
@@ -3904,6 +4404,55 @@ public class SqlFunctions {
   public static BigDecimal mod(BigDecimal b0, BigDecimal b1) {
     final BigDecimal[] bigDecimals = b0.divideAndRemainder(b1);
     return bigDecimals[1];
+  }
+
+  // PERCENTILE_CONT / PERCENTILE_DISC
+
+  /** Support the PERCENTILE_CONT aggregate function.
+   *
+   * <p>The {@code values} list must already be sorted according to the
+   * {@code WITHIN GROUP (ORDER BY ...)} clause. The fraction must be in the
+   * range 0 to 1 inclusive. The result is a linear interpolation between the
+   * two values that surround the desired position. */
+  public static BigDecimal percentileCont(List<? extends Number> values,
+      double fraction) {
+    final int n = values.size();
+    if (n == 0) {
+      throw new NoSuchElementException(
+          "PERCENTILE_CONT is not defined on an empty group");
+    }
+    final double rank = fraction * (n - 1);
+    final int lo = (int) Math.floor(rank);
+    final int hi = (int) Math.ceil(rank);
+    final BigDecimal loValue = toBigDecimal(values.get(lo));
+    if (lo == hi) {
+      return loValue;
+    }
+    final BigDecimal hiValue = toBigDecimal(values.get(hi));
+    final BigDecimal frac = BigDecimal.valueOf(rank - lo);
+    return loValue.add(hiValue.subtract(loValue).multiply(frac));
+  }
+
+  /** Support the PERCENTILE_DISC aggregate function.
+   *
+   * <p>The {@code values} list must already be sorted according to the
+   * {@code WITHIN GROUP (ORDER BY ...)} clause. The fraction must be in the
+   * range 0 to 1 inclusive. The result is an actual value from the group: the
+   * first whose cumulative distribution is greater than or equal to the
+   * fraction. */
+  public static Object percentileDisc(List<?> values, double fraction) {
+    final int n = values.size();
+    if (n == 0) {
+      throw new NoSuchElementException(
+          "PERCENTILE_DISC is not defined on an empty group");
+    }
+    int index = (int) Math.ceil(fraction * n) - 1;
+    if (index < 0) {
+      index = 0;
+    } else if (index >= n) {
+      index = n - 1;
+    }
+    return requireNonNull(values.get(index));
   }
 
   // FLOOR
@@ -4311,6 +4860,18 @@ public class SqlFunctions {
     return CombinatoricsUtils.factorial(b0);
   }
 
+  /** SQL <code>HYPOT</code> operator applied to double values. */
+  public static double hypot(double a, double b) {
+    return Math.hypot(a, b);
+  }
+
+  /** SQL <code>HYPOT</code> operator applied to general numeric values. */
+  public static double hypot(Object a, Object b) {
+    final Number left = (Number) a;
+    final Number right = (Number) b;
+    return hypot(left.doubleValue(), right.doubleValue());
+  }
+
   /** SQL <code>IS_INF</code> operator applied to BigDecimal values. */
   public static boolean isInf(BigDecimal b0) {
     return Double.isInfinite(b0.doubleValue());
@@ -4641,8 +5202,7 @@ public class SqlFunctions {
     return b0 > b1 ? b1 : b0;
   }
 
-  public static @Nullable <T extends Comparable<T>> List<T> lesser(
-      @Nullable List<T> b0, @Nullable List<T> b1) {
+  public static @Nullable List lesser(@Nullable List b0, @Nullable List b1) {
     if (b0 == null) {
       return b1;
     }
@@ -4652,8 +5212,47 @@ public class SqlFunctions {
     return lt(b0, b1) ? b0 : b1;
   }
 
-  public static @Nullable <T extends Comparable<T>> List<T> greater(
-      @Nullable List<T> b0, @Nullable List<T> b1) {
+  public static @Nullable Map lesser(@Nullable Map b0, @Nullable Map b1) {
+    if (b0 == null) {
+      return b1;
+    }
+    if (b1 == null) {
+      return b0;
+    }
+    return lt(b0, b1) ? b0 : b1;
+  }
+
+  public static @Nullable Object[] lesser(@Nullable Object[] b0, @Nullable Object[] b1) {
+    if (b0 == null) {
+      return b1;
+    }
+    if (b1 == null) {
+      return b0;
+    }
+    return lt(b0, b1) ? b0 : b1;
+  }
+
+  public static @Nullable List greater(@Nullable List b0, @Nullable List b1) {
+    if (b0 == null) {
+      return b1;
+    }
+    if (b1 == null) {
+      return b0;
+    }
+    return gt(b0, b1) ? b0 : b1;
+  }
+
+  public static @Nullable Map greater(@Nullable Map b0, @Nullable Map b1) {
+    if (b0 == null) {
+      return b1;
+    }
+    if (b1 == null) {
+      return b0;
+    }
+    return gt(b0, b1) ? b0 : b1;
+  }
+
+  public static @Nullable Object[] greater(@Nullable Object[] b0, @Nullable Object[] b1) {
     if (b0 == null) {
       return b1;
     }
@@ -4682,7 +5281,9 @@ public class SqlFunctions {
   /** CAST(FLOAT AS VARCHAR). */
   public static String toString(float x) {
     if (x == 0) {
-      return "0E0";
+      // The comparison 'x == 0' does not distinguish -0.0 from 0.0,
+      // but the bit pattern does
+      return Float.floatToRawIntBits(x) != 0 ? "-0E0" : "0E0";
     }
     return Float.toString(x);
   }
@@ -4690,7 +5291,9 @@ public class SqlFunctions {
   /** CAST(DOUBLE AS VARCHAR). */
   public static String toString(double x) {
     if (x == 0) {
-      return "0E0";
+      // The comparison 'x == 0' does not distinguish -0.0 from 0.0,
+      // but the bit pattern does
+      return Double.doubleToRawLongBits(x) != 0L ? "-0E0" : "0E0";
     }
     return Double.toString(x);
   }
@@ -4724,18 +5327,54 @@ public class SqlFunctions {
 
   /** CAST(VARCHAR AS BOOLEAN). */
   public static boolean toBoolean(String s) {
-    s = trim(true, true, " ", s);
-    if (s.equalsIgnoreCase("TRUE")) {
+    s = s.trim();
+    if (equalsIgnoreAsciiCase(s, "TRUE")) {
       return true;
-    } else if (s.equalsIgnoreCase("FALSE")) {
+    } else if (equalsIgnoreAsciiCase(s, "FALSE")) {
       return false;
     } else {
       throw RESOURCE.invalidCharacterForCast(s).ex();
     }
   }
 
+  /** Returns 'true' is s equals and upper-case word 'upper', ignoring
+   * only the case of ASCII characters. */
+  private static boolean equalsIgnoreAsciiCase(String s, String upper) {
+    if (s.length() != upper.length()) {
+      return false;
+    }
+    // We restrict the comparison to ASCII characters: for
+    // example, U+017F (long s) upper-cased is 'S', but we do
+    // not want to match it.
+    for (int i = 0; i < s.length(); i++) {
+      char c = s.charAt(i);
+      if (c >= 'a' && c <= 'z') {
+        c = (char) (c - 'a' + 'A');
+      }
+      if (c != upper.charAt(i)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   public static boolean toBoolean(Number number) {
-    return !number.equals(0);
+    if (number instanceof BigDecimal) {
+      BigDecimal decimal = (BigDecimal) number;
+      return decimal.compareTo(BigDecimal.ZERO) != 0;
+    }
+    if (number instanceof Double) {
+      // Compare primitives: IEEE 754 treats -0.0 as equal to 0.0,
+      // whereas Double.equals does not
+      return ((Double) number).doubleValue() != 0d;
+    }
+    if (number instanceof Float) {
+      return ((Float) number).floatValue() != 0f;
+    }
+    if (number instanceof BigInteger) {
+      return ((BigInteger) number).signum() != 0;
+    }
+    return number.longValue() != 0;
   }
 
   public static boolean toBoolean(Object o) {
@@ -4745,12 +5384,14 @@ public class SqlFunctions {
         : (Boolean) cannotConvert(o, boolean.class);
   }
 
-  // Don't need parseByte etc. - Byte.parseByte is sufficient.
+  public static byte toByte(String s) {
+    return parseByte(Primitive.checkNumericString(s.trim()));
+  }
 
   public static byte toByte(Object o) {
     return o instanceof Byte ? (Byte) o
         : o instanceof Number ? toByte((Number) o)
-        : parseByte(o.toString());
+        : toByte(o.toString());
   }
 
   public static byte toByte(Number number) {
@@ -4766,7 +5407,7 @@ public class SqlFunctions {
   }
 
   public static short toShort(String s) {
-    return parseShort(s.trim());
+    return parseShort(Primitive.checkNumericString(s.trim()));
   }
 
   public static short toShort(Number number) {
@@ -4874,12 +5515,8 @@ public class SqlFunctions {
     return v == null ? castNonNull(null) : toInt(v);
   }
 
-  // Method tagged as non-deterministic because it can throw.
-  // The DeterministicCodeOptimizer may otherwise try to lift it out of try-catch blocks.
-  // See https://issues.apache.org/jira/browse/CALCITE-6753
-  @NonDeterministic
   public static int toInt(String s) {
-    return parseInt(s.trim());
+    return parseInt(Primitive.checkNumericString(s.trim()));
   }
 
   public static int toInt(Number number) {
@@ -4983,7 +5620,7 @@ public class SqlFunctions {
     if (s.startsWith("199") && s.contains(":")) {
       return Timestamp.valueOf(s).getTime();
     }
-    return parseLong(s.trim());
+    return parseLong(Primitive.checkNumericString(s.trim()));
   }
 
   public static long toLong(Number number) {
@@ -5006,7 +5643,7 @@ public class SqlFunctions {
   }
 
   public static float toFloat(String s) {
-    return parseFloat(s.trim());
+    return parseFloat(Primitive.checkApproxNumericString(s.trim()));
   }
 
   public static float toFloat(Number number) {
@@ -5021,7 +5658,7 @@ public class SqlFunctions {
   }
 
   public static double toDouble(String s) {
-    return parseDouble(s.trim());
+    return parseDouble(Primitive.checkApproxNumericString(s.trim()));
   }
 
   public static double toDouble(Number number) {
@@ -5036,7 +5673,18 @@ public class SqlFunctions {
   }
 
   public static BigDecimal toBigDecimal(String s) {
-    return new BigDecimal(s.trim());
+    if (s == null) {
+      throw new NumberFormatException(
+          "Cannot convert null string to BigDecimal");
+    }
+    try {
+      return new BigDecimal(Primitive.checkNumericString(s.trim()));
+    } catch (NumberFormatException e) {
+      NumberFormatException ex =
+          new NumberFormatException("Invalid value for BigDecimal: \"" + s + "\"");
+      ex.initCause(e);
+      throw ex;
+    }
   }
 
   public static BigDecimal toBigDecimal(Number number) {
@@ -5049,6 +5697,9 @@ public class SqlFunctions {
   }
 
   public static BigDecimal toBigDecimal(Object o) {
+    if (o == null) {
+      throw new NumberFormatException("Cannot convert null to BigDecimal");
+    }
     return o instanceof Number ? toBigDecimal((Number) o)
         : toBigDecimal(o.toString());
   }
@@ -5112,11 +5763,17 @@ public class SqlFunctions {
     return v == null ? castNonNull(null) : internalToTime(v.intValue());
   }
 
+  /** CAST(VARCHAR AS DATE). */
+  public static int stringToDate(String s) {
+    // Trim here, because Avatica rejects some characters below U+0020
+    return DateTimeUtils.dateStringToUnixDate(s.trim());
+  }
+
   public static @PolyNull Integer toTimeWithLocalTimeZone(@PolyNull String v) {
     if (v == null) {
       return castNonNull(null);
     }
-    return new TimeWithTimeZoneString(v)
+    return new TimeWithTimeZoneString(v.trim())
         .withTimeZone(DateTimeUtils.UTC_ZONE)
         .getLocalTimeString()
         .getMillisOfDay();
@@ -5395,7 +6052,9 @@ public class SqlFunctions {
 
     public long parseTimestamp(String fmtString, String timestamp,
         String timeZone) {
-      TimeZone tz = TimeZone.getTimeZone(timeZone);
+      // Validate the zone id (rejecting unknown ids) rather than letting
+      // TimeZone.getTimeZone silently fall back to GMT.
+      TimeZone tz = TimeZone.getTimeZone(ZoneId.of(timeZone));
       final long millisSinceEpoch =
           internalParseDatetime(fmtString, timestamp, timeZone);
       return toLong(new java.sql.Timestamp(millisSinceEpoch), tz);
@@ -5772,7 +6431,7 @@ public class SqlFunctions {
     if (v == null) {
       return castNonNull(null);
     }
-    return new TimestampWithTimeZoneString(v)
+    return new TimestampWithTimeZoneString(v.trim())
         .withTimeZone(DateTimeUtils.UTC_ZONE)
         .getLocalTimestampString()
         .getMillisSinceEpoch();
@@ -5821,6 +6480,22 @@ public class SqlFunctions {
       return null;
     } else {
       return new ByteString(s.getBytes(charset));
+    }
+  }
+
+  public static @PolyNull ByteString byteArrayToByteString(byte @PolyNull [] bytes) {
+    if (bytes == null) {
+      return null;
+    } else {
+      return new ByteString(bytes);
+    }
+  }
+
+  public static byte @PolyNull [] byteStringToByteArray(@PolyNull ByteString s) {
+    if (s == null) {
+      return null;
+    } else {
+      return s.getBytes();
     }
   }
 
@@ -6334,7 +7009,7 @@ public class SqlFunctions {
   /** SQL {@code TRANSLATE(string, search_chars, replacement_chars)}
    * function. */
   public static String translate3(String s, String search, String replacement) {
-    return org.apache.commons.lang3.StringUtils.replaceChars(s, search, replacement);
+    return Util.replaceChars(s, search, replacement);
   }
 
   /** SQL {@code REPLACE(string, search, replacement)} function. */
@@ -6347,7 +7022,7 @@ public class SqlFunctions {
       return s.replace(search, replacement);
     }
     // for MSSQL's REPLACE function, search pattern is case-insensitive during matching
-    return org.apache.commons.lang3.Strings.CI.replace(s, search, replacement);
+    return Util.replaceIgnoreCase(s, search, replacement);
   }
 
   /** Helper for "array element reference". Caller has already ensured that
@@ -6492,12 +7167,12 @@ public class SqlFunctions {
     final List bigger = list2;
     boolean hasNull = false;
     if (!smaller.isEmpty() && !bigger.isEmpty()) {
-      final Set smallestSet = new HashSet(smaller);
+      final Set<@Nullable Object> smallestSet = toDeepEqualityHashSet(smaller);
       hasNull = smallestSet.remove(null);
       for (Object element : bigger) {
         if (element == null) {
           hasNull = true;
-        } else if (smallestSet.contains(element)) {
+        } else if (smallestSet.contains(wrapForDeepEquality(element))) {
           return true;
         }
       }
@@ -6544,6 +7219,18 @@ public class SqlFunctions {
     return result;
   }
 
+  /** Tests whether a recursive CTE path contains a key tuple.
+   * Implements the condition of {@code CASE WHEN key IN (path) THEN ...}:
+   * only TRUE comparisons close a cycle; UNKNOWN does not. */
+  public static boolean cyclePathContains(List<?> path, Object key) {
+    for (Object previous : path) {
+      if (Boolean.TRUE.equals(rowEq(previous, key))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** Support the ARRAY_APPEND function. */
   public static List arrayAppend(List list, Object element) {
     final List result = new ArrayList(list.size() + 1);
@@ -6552,23 +7239,17 @@ public class SqlFunctions {
     return result;
   }
 
-  /** Support the ARRAY_DISTINCT function.
-   *
-   * <p>Note: If the list does not contain null,
-   * {@link Util#distinctList(List)} is probably faster. */
+  /** Support the ARRAY_DISTINCT function. */
   public static List distinct(List list) {
-    Set result = new LinkedHashSet<>(list);
-    return new ArrayList<>(result);
+    return unwrapDeepEqualitySet(toDeepEqualityLinkedHashSet(list));
   }
 
   /** Support the ARRAY_MAX function. */
-  public static @Nullable <T extends Object & Comparable<? super T>> T arrayMax(
-      List<? extends T> list) {
-
+  public static @Nullable <T> T arrayMax(List<? extends T> list) {
     T max = null;
     for (int i = 0; i < list.size(); i++) {
       T item = list.get(i);
-      if (item != null && (max == null || item.compareTo(max) > 0)) {
+      if (item != null && (max == null || compareNullable(item, max, "ARRAY_MAX") > 0)) {
         max = item;
       }
     }
@@ -6576,13 +7257,11 @@ public class SqlFunctions {
   }
 
   /** Support the ARRAY_MIN function. */
-  public static @Nullable <T extends Object & Comparable<? super T>> T arrayMin(
-      List<? extends T> list) {
-
+  public static @Nullable <T> T arrayMin(List<? extends T> list) {
     T min = null;
     for (int i = 0; i < list.size(); i++) {
       T item = list.get(i);
-      if (item != null && (min == null || item.compareTo(min) < 0)) {
+      if (item != null && (min == null || compareNullable(item, min, "ARRAY_MIN") < 0)) {
         min = item;
       }
     }
@@ -6597,11 +7276,24 @@ public class SqlFunctions {
     return result;
   }
 
+  /** Support the ARRAY_CONTAINS function. */
+  public static boolean arrayContains(List list, Object element) {
+    for (Object value : list) {
+      if (Functions.deepEquals(value, element)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** Support the ARRAY_POSITION function. */
   public static Long arrayPosition(List list, Object element) {
-    final int index = list.indexOf(element);
-    if (index != -1) {
-      return index + 1L;
+    long position = 1;
+    for (Object value : list) {
+      if (Functions.deepEquals(value, element)) {
+        return position;
+      }
+      position++;
     }
     return 0L;
   }
@@ -6610,7 +7302,7 @@ public class SqlFunctions {
   public static List arrayRemove(List list, Object element) {
     final List result = new ArrayList();
     for (Object obj : list) {
-      if (obj == null || !obj.equals(element)) {
+      if (obj == null || !Functions.deepEquals(obj, element)) {
         result.add(obj);
       }
     }
@@ -6631,9 +7323,11 @@ public class SqlFunctions {
 
   /** Support the ARRAY_EXCEPT function. */
   public static List arrayExcept(List list1, List list2) {
-    final Set result = new LinkedHashSet<>(list1);
-    result.removeAll(list2);
-    return new ArrayList<>(result);
+    final Set<@Nullable Object> result = toDeepEqualityLinkedHashSet(list1);
+    for (Object element : list2) {
+      result.remove(wrapForDeepEquality(element));
+    }
+    return unwrapDeepEqualitySet(result);
   }
 
   /** Support the ARRAY_INSERT function. */
@@ -6733,17 +7427,106 @@ public class SqlFunctions {
 
   /** Support the ARRAY_INTERSECT function. */
   public static List arrayIntersect(List list1, List list2) {
-    final Set result = new LinkedHashSet<>(list1);
-    result.retainAll(list2);
-    return new ArrayList<>(result);
+    final Set<@Nullable Object> remaining = toDeepEqualityHashSet(list2);
+    final List<@Nullable Object> result = new ArrayList<>();
+    for (Object element : list1) {
+      if (remaining.remove(wrapForDeepEquality(element))) {
+        result.add(element);
+      }
+    }
+    return result;
   }
 
   /** Support the ARRAY_UNION function. */
   public static List arrayUnion(List list1, List list2) {
-    final Set result = new LinkedHashSet<>();
-    result.addAll(list1);
-    result.addAll(list2);
-    return new ArrayList<>(result);
+    final Set<@Nullable Object> result = toDeepEqualityLinkedHashSet(list1);
+    for (Object element : list2) {
+      result.add(wrapForDeepEquality(element));
+    }
+    return unwrapDeepEqualitySet(result);
+  }
+
+  /** Creates a set using deep equality, preserving element encounter order. */
+  private static Set<@Nullable Object> toDeepEqualityLinkedHashSet(List<?> list) {
+    return toDeepEqualitySet(list, LinkedHashSet::new);
+  }
+
+  /** Creates a hash set using deep equality. */
+  private static Set<@Nullable Object> toDeepEqualityHashSet(List<?> list) {
+    return toDeepEqualitySet(list, HashSet::new);
+  }
+
+  /** Creates a set using deep equality and the supplied factory. */
+  private static Set<@Nullable Object> toDeepEqualitySet(List<?> list,
+      Supplier<? extends Set<@Nullable Object>> setSupplier) {
+    final Set<@Nullable Object> set = setSupplier.get();
+    for (Object value : list) {
+      set.add(wrapForDeepEquality(value));
+    }
+    return set;
+  }
+
+  /** Counts element occurrences using deep equality. */
+  private static Map<@Nullable Object, Integer> toDeepEqualityCounts(List<?> list) {
+    final Map<@Nullable Object, Integer> counts = new HashMap<>();
+    for (Object value : list) {
+      counts.merge(wrapForDeepEquality(value), 1, Integer::sum);
+    }
+    return counts;
+  }
+
+  /** Wraps composite values, which may contain ROW values, but leaves scalar
+   * values and null unchanged. */
+  private static @Nullable Object wrapForDeepEquality(@Nullable Object value) {
+    if (value == null) {
+      return null;
+    } else if (value instanceof List || value instanceof Map || value.getClass().isArray()) {
+      return new DeepEqualityWrapper(value);
+    }
+    return value;
+  }
+
+  /** Creates a list of the set's elements in iteration order, replacing
+   * deep-equality wrappers with their original values. */
+  private static List<@Nullable Object> unwrapDeepEqualitySet(Set<@Nullable Object> set) {
+    final List<@Nullable Object> values = new ArrayList<>(set.size());
+    for (Object element : set) {
+      values.add(element instanceof DeepEqualityWrapper
+          ? ((DeepEqualityWrapper) element).value : element);
+    }
+    return values;
+  }
+
+  /** A wrapper providing deep equality and hashing for composite values.
+   * Assumes values are immutable. */
+  private static final class DeepEqualityWrapper {
+    private final Object value;
+    // Benign races may compute the same hash more than once.
+    private int hashCode;
+
+    private DeepEqualityWrapper(Object value) {
+      this.value = value;
+    }
+
+    @Override public boolean equals(@Nullable Object obj) {
+      return this == obj
+          || obj instanceof DeepEqualityWrapper
+          && Functions.deepEquals(value, ((DeepEqualityWrapper) obj).value);
+    }
+
+    @Override public int hashCode() {
+      int hash = hashCode;
+      if (hash == 0) {
+        hash = Functions.deepHashCode(value);
+        // Zero means not yet computed; cache a computed zero as 1 to avoid
+        // recomputing it on every call.
+        if (hash == 0) {
+          hash = 1;
+        }
+        hashCode = hash;
+      }
+      return hash;
+    }
   }
 
   /** Transforms a list, applying a function to each element. */
@@ -6782,9 +7565,11 @@ public class SqlFunctions {
 
   /** Support the SORT_ARRAY function. */
   public static List sortArray(List list, boolean ascending) {
-    Comparator comparator = ascending
-        ? Comparator.nullsFirst(Comparator.naturalOrder())
-        : Comparator.nullsLast(Comparator.reverseOrder());
+    final Comparator<@Nullable Object> naturalComparator =
+        (a, b) -> compareNullable(a, b, "SORT_ARRAY");
+    final Comparator<@Nullable Object> comparator = ascending
+        ? Comparator.nullsFirst(naturalComparator)
+        : Comparator.nullsLast(naturalComparator.reversed());
     list.sort(comparator);
     return list;
   }
@@ -6884,6 +7669,43 @@ public class SqlFunctions {
     return map;
   }
 
+  /** Combines multiple query result lists into rows for the Combine operator.
+   *
+   * <p>Each input list contains maps representing rows from a query.
+   * The output is a list of Object arrays, where each array is a row
+   * with one element per query. The number of output rows equals the
+   * maximum size across all input lists. Shorter lists are padded with nulls.
+   *
+   * @param queryLists array of lists, one per query
+   * @return list of Object arrays representing combined rows
+   */
+  public static List<@Nullable Object[]> combineQueryResults(List[] queryLists) {
+    // Find the maximum row count across all queries
+    int maxRows = 0;
+    for (List list : queryLists) {
+      if (list.size() > maxRows) {
+        maxRows = list.size();
+      }
+    }
+
+    // Build the result rows
+    List<@Nullable Object[]> result = new ArrayList<>(maxRows);
+    for (int rowIdx = 0; rowIdx < maxRows; rowIdx++) {
+      @Nullable Object[] row = new Object[queryLists.length];
+      for (int queryIdx = 0; queryIdx < queryLists.length; queryIdx++) {
+        List queryList = queryLists[queryIdx];
+        if (rowIdx < queryList.size()) {
+          row[queryIdx] = queryList.get(rowIdx);
+        } else {
+          row[queryIdx] = null;
+        }
+      }
+      result.add(row);
+    }
+
+    return result;
+  }
+
   /** Support the STR_TO_MAP function. */
   public static Map strToMap(String string, String stringDelimiter, String keyValueDelimiter) {
     final Map map = new LinkedHashMap();
@@ -6970,61 +7792,66 @@ public class SqlFunctions {
   }
 
   /** Support the MEMBER OF function. */
-  public static boolean memberOf(@Nullable Object object, Collection collection) {
-    return collection.contains(object);
+  public static boolean memberOf(@Nullable Object object, List<?> list) {
+    for (Object value : list) {
+      if (Functions.deepEquals(value, object)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** Support the MULTISET INTERSECT DISTINCT function. */
-  public static <E> Collection<E> multisetIntersectDistinct(Collection<E> c1,
-      Collection<E> c2) {
-    final Set<E> result = new HashSet<>(c1);
-    result.retainAll(c2);
-    return new ArrayList<>(result);
+  public static List multisetIntersectDistinct(List c1, List c2) {
+    return arrayIntersect(c1, c2);
   }
 
   /** Support the MULTISET INTERSECT ALL function. */
-  public static <E> Collection<E> multisetIntersectAll(Collection<E> c1,
-      Collection<E> c2) {
-    final List<E> result = new ArrayList<>(c1.size());
-    final List<E> c2Copy = new ArrayList<>(c2);
-    for (E e : c1) {
-      if (c2Copy.remove(e)) {
+  public static List multisetIntersectAll(List c1, List c2) {
+    final Map<@Nullable Object, Integer> counts = toDeepEqualityCounts(c2);
+    final List result = new ArrayList();
+    for (Object e : c1) {
+      counts.computeIfPresent(wrapForDeepEquality(e), (key, count) -> {
         result.add(e);
-      }
+        return count == 1 ? null : count - 1;
+      });
     }
+
     return result;
   }
 
   /** Support the MULTISET EXCEPT ALL function. */
-  @SuppressWarnings("JdkObsolete")
-  public static <E> Collection<E> multisetExceptAll(Collection<E> c1,
-      Collection<E> c2) {
-    // TOOD: use Multisets?
-    final List<E> result = new LinkedList<>(c1);
-    for (E e : c2) {
-      result.remove(e);
+  public static List multisetExceptAll(List c1, List c2) {
+    final Map<@Nullable Object, Integer> counts = toDeepEqualityCounts(c2);
+    final List result = new ArrayList();
+    for (Object e : c1) {
+      counts.compute(wrapForDeepEquality(e), (key, count) -> {
+        if (count == null) {
+          result.add(e);
+          return null;
+        }
+        return count == 1 ? null : count - 1;
+      });
     }
     return result;
   }
 
   /** Support the MULTISET EXCEPT DISTINCT function. */
-  public static <E> Collection<E> multisetExceptDistinct(Collection<E> c1,
-      Collection<E> c2) {
-    final Set<E> result = new HashSet<>(c1);
-    result.removeAll(c2);
-    return new ArrayList<>(result);
+  public static List multisetExceptDistinct(List c1, List c2) {
+    final Set<@Nullable Object> result = toDeepEqualityHashSet(c1);
+    for (Object e : c2) {
+      result.remove(wrapForDeepEquality(e));
+    }
+    return unwrapDeepEqualitySet(result);
   }
 
   /** Support the IS A SET function. */
-  public static boolean isASet(Collection collection) {
-    if (collection instanceof Set) {
-      return true;
-    }
+  public static boolean isASet(List<?> list) {
     // capacity calculation is in the same way like for new HashSet(Collection)
     // however return immediately in case of duplicates
-    Set set = new HashSet(Math.max((int) (collection.size() / .75f) + 1, 16));
-    for (Object e : collection) {
-      if (!set.add(e)) {
+    final Set<@Nullable Object> set = new HashSet<>(Math.max((int) (list.size() / .75f) + 1, 16));
+    for (Object e : list) {
+      if (!set.add(wrapForDeepEquality(e))) {
         return false;
       }
     }
@@ -7032,16 +7859,15 @@ public class SqlFunctions {
   }
 
   /** Support the SUBMULTISET OF function. */
-  @SuppressWarnings("JdkObsolete")
-  public static boolean submultisetOf(Collection possibleSubMultiset,
-      Collection multiset) {
+  public static boolean submultisetOf(List<?> possibleSubMultiset, List<?> multiset) {
     if (possibleSubMultiset.size() > multiset.size()) {
       return false;
     }
-    // TODO: use Multisets?
-    Collection multisetLocal = new LinkedList(multiset);
+    final Map<@Nullable Object, Integer> counts = toDeepEqualityCounts(multiset);
     for (Object e : possibleSubMultiset) {
-      if (!multisetLocal.remove(e)) {
+      final Integer remaining =
+          counts.computeIfPresent(wrapForDeepEquality(e), (key, count) -> count - 1);
+      if (remaining == null || remaining < 0) {
         return false;
       }
     }
@@ -7049,23 +7875,20 @@ public class SqlFunctions {
   }
 
   /** Support the MULTISET UNION function. */
-  public static Collection multisetUnionDistinct(Collection collection1,
-      Collection collection2) {
-    // capacity calculation is in the same way like for new HashSet(Collection)
-    Set resultCollection =
-        new HashSet(Math.max((int) ((collection1.size() + collection2.size()) / .75f) + 1, 16));
-    resultCollection.addAll(collection1);
-    resultCollection.addAll(collection2);
-    return new ArrayList(resultCollection);
+  public static List multisetUnionDistinct(List list1, List list2) {
+    final Set<@Nullable Object> result = toDeepEqualityHashSet(list1);
+    for (Object element : list2) {
+      result.add(wrapForDeepEquality(element));
+    }
+    return unwrapDeepEqualitySet(result);
   }
 
   /** Support the MULTISET UNION ALL function. */
-  public static Collection multisetUnionAll(Collection collection1,
-      Collection collection2) {
-    List resultCollection = new ArrayList(collection1.size() + collection2.size());
-    resultCollection.addAll(collection1);
-    resultCollection.addAll(collection2);
-    return resultCollection;
+  public static List multisetUnionAll(List list1, List list2) {
+    final List result = new ArrayList(list1.size() + list2.size());
+    result.addAll(list1);
+    result.addAll(list2);
+    return result;
   }
 
   /** Support the ARRAY_REVERSE function. */
@@ -7160,72 +7983,205 @@ public class SqlFunctions {
    * Function that, given a certain List containing single-item structs (i.e. arrays / lists with
    * a single item), builds an Enumerable that returns those single items inside the structs.
    */
-  public static Function1<List<Object>, Enumerable<Object>> flatList() {
-    return inputList -> Linq4j.asEnumerable(inputList).select(v -> structAccess(v, 0, null));
+  public static Function1<List<Object>, Enumerable<@Nullable Object>> flatList() {
+    // A NULL collection unnests to no rows, like an empty one.
+    return inputList -> inputList == null ? Linq4j.emptyEnumerable()
+        : Linq4j.asEnumerable(inputList)
+            .<@Nullable Object>select(v -> structAccess(v, 0, null));
   }
 
-  public static Function1<Object, Enumerable<ComparableList<Comparable>>> flatProduct(
+  /**
+   * Variant of {@link #flatList} for outer mode: an empty or {@code NULL}
+   * collection yields one {@code NULL} element rather than no elements.
+   */
+  public static Function1<List<Object>, Enumerable<@Nullable Object>> flatListOuter() {
+    return inputList -> inputList == null || inputList.isEmpty()
+        ? Linq4j.asEnumerable(SINGLE_NULL)
+        : Linq4j.asEnumerable(inputList)
+            .<@Nullable Object>select(v -> structAccess(v, 0, null));
+  }
+
+  /**
+   * Returns a function that, given a row containing one or more collection
+   * fields, produces an {@link Enumerable} of combined element rows using
+   * <em>zip</em> (positional pairing) semantics.
+   *
+   * <p>This is the standard semantics for SQL {@code UNNEST(a, b, ...)}: the
+   * i-th output row pairs element {@code a[i]} with element {@code b[i]}.
+   * Shorter collections are padded with {@code NULL}.
+   *
+   * <p>When {@code outer}, a row whose collections are all empty or
+   * {@code NULL} still produces one output row, with every element column set
+   * to {@code NULL}. This is the LEFT JOIN semantics of {@code Uncollect}.
+   */
+  public static Function1<Object, Enumerable<ComparableList<Comparable>>> flatZip(
       final int[] fieldCounts, final boolean withOrdinality,
-      final FlatProductInputType[] inputTypes) {
+      final FlatProductInputType[] inputTypes, final boolean outer) {
     if (fieldCounts.length == 1) {
       if (!withOrdinality && inputTypes[0] == FlatProductInputType.SCALAR) {
+        // Simple unnest without ordinality
         //noinspection unchecked
-        return (Function1) LIST_AS_ENUMERABLE;
+        return outer ? (Function1) OUTER_LIST_AS_ENUMERABLE
+            : (Function1) LIST_AS_ENUMERABLE;
+      } else if (!withOrdinality && inputTypes[0] == FlatProductInputType.STRUCT) {
+        // A single collection of structs kept whole, without ordinality: the
+        // output row type has a single (ROW-typed) column, so PhysTypeImpl
+        // optimizes the row format down to SCALAR, under which rows are bare
+        // struct values rather than singleton lists.
+        //noinspection unchecked
+        return (Function1) (outer ? OUTER_STRUCT_LIST_AS_ENUMERABLE
+            : STRUCT_LIST_AS_ENUMERABLE);
       } else {
-        return row -> p2(new Object[] { row }, fieldCounts, withOrdinality,
-            inputTypes);
+        // unnest with ordinality for a single column
+        return row -> z2(new Object[] { row }, fieldCounts, withOrdinality, inputTypes, outer);
       }
     }
-    return lists -> p2((Object[]) lists, fieldCounts, withOrdinality,
-        inputTypes);
+    return lists -> z2((Object[]) lists, fieldCounts, withOrdinality, inputTypes, outer);
   }
 
-  private static Enumerable<FlatLists.ComparableList<Comparable>> p2(
+  /**
+   * Helper for {@link #flatZip}: unpacks each collection in {@code lists}
+   * into an enumerator and combines them using zip (positional) semantics,
+   * padding shorter collections with {@code NULL}.
+   *
+   * @param lists        one element per collection (scalar list, struct list, or map)
+   * @param fieldCounts  output column count for each collection (-1 for a collection
+   *                     of scalars or of structs kept whole)
+   * @param withOrdinality whether to append a 1-based ordinality column
+   * @param inputTypes   type of elements in each collection (SCALAR, LIST, STRUCT, or MAP)
+   * @param outer        whether to emit one all-NULL row when every collection is
+   *                     empty or NULL, rather than no rows
+   */
+  @SuppressWarnings("rawtypes")
+  private static Enumerable<FlatLists.ComparableList<Comparable>> z2(
       Object[] lists, int[] fieldCounts, boolean withOrdinality,
-      FlatProductInputType[] inputTypes) {
+      FlatProductInputType[] inputTypes, boolean outer) {
     final List<Enumerator<List<Comparable>>> enumerators = new ArrayList<>();
+    final int[] widths = new int[lists.length];
     int totalFieldCount = 0;
     for (int i = 0; i < lists.length; i++) {
-      int fieldCount = fieldCounts[i];
-      FlatProductInputType inputType = inputTypes[i];
-      Object inputObject = lists[i];
+      final int fieldCount = fieldCounts[i];
+      final FlatProductInputType inputType = inputTypes[i];
+      final Object inputObject = lists[i];
+      if (inputObject == null) {
+        // A NULL collection contributes no elements, like an empty one. Under
+        // outer mode the wrapper below turns "no elements at all" into the
+        // single NULL-padded row.
+        enumerators.add(Linq4j.emptyEnumerator());
+        widths[i] = fieldCount < 0 ? 1 : fieldCount;
+        totalFieldCount += widths[i];
+        continue;
+      }
       switch (inputType) {
       case SCALAR:
         @SuppressWarnings("unchecked") List<Comparable> list =
             (List<Comparable>) inputObject;
-        enumerators.add(
-            Linq4j.transform(
-                Linq4j.enumerator(list), FlatLists::of));
+        enumerators.add(Linq4j.transform(Linq4j.enumerator(list), FlatLists::of));
+        widths[i] = 1;
+        break;
+      case STRUCT:
+        // A struct element kept whole occupies a single output column, like a
+        // scalar element, but its value must be converted to Object[].
+        @SuppressWarnings("unchecked") List<Object> structList =
+            (List<Object>) inputObject;
+        @SuppressWarnings("unchecked") Enumerator<List<Comparable>> structEnumerator =
+            (Enumerator) Linq4j.transform(Linq4j.enumerator(structList),
+                (Object e) -> FlatLists.ofSingle(structValue(e)));
+        enumerators.add(structEnumerator);
+        widths[i] = 1;
         break;
       case LIST:
         @SuppressWarnings("unchecked") List<List<Comparable>> listList =
             (List<List<Comparable>>) inputObject;
         enumerators.add(Linq4j.enumerator(listList));
+        widths[i] = fieldCount;
         break;
       case MAP:
         @SuppressWarnings("unchecked") Map<Comparable, Comparable> map =
             (Map<Comparable, Comparable>) inputObject;
         Enumerator<Map.Entry<Comparable, Comparable>> enumerator =
             Linq4j.enumerator(map.entrySet());
-
-        Enumerator<List<Comparable>> transformed =
-            Linq4j.transform(enumerator,
-                e -> FlatLists.of(e.getKey(), e.getValue()));
-        enumerators.add(transformed);
+        enumerators.add(Linq4j.transform(enumerator, e -> FlatLists.of(e.getKey(), e.getValue())));
+        widths[i] = 2;
         break;
       default:
-        break;
+        throw new IllegalArgumentException("Unknown input type: " + inputType);
       }
-      if (fieldCount < 0) {
-        ++totalFieldCount;
-      } else {
-        totalFieldCount += fieldCount;
-      }
+      totalFieldCount += (fieldCount < 0) ? 1 : fieldCount;
     }
     if (withOrdinality) {
       ++totalFieldCount;
     }
-    return product(enumerators, totalFieldCount, withOrdinality);
+    final int fieldCount = totalFieldCount;
+    if (!outer) {
+      return new AbstractEnumerable<FlatLists.ComparableList<Comparable>>() {
+        @Override public Enumerator<FlatLists.ComparableList<Comparable>> enumerator() {
+          return new ZipPaddedEnumerator(enumerators, widths, fieldCount, withOrdinality);
+        }
+      };
+    }
+    @SuppressWarnings("unchecked") final FlatLists.ComparableList<Comparable> nullRow =
+        (FlatLists.ComparableList) FlatLists.of(Collections.nCopies(fieldCount, null));
+    return new AbstractEnumerable<FlatLists.ComparableList<Comparable>>() {
+      @Override public Enumerator<FlatLists.ComparableList<Comparable>> enumerator() {
+        return new DefaultIfEmptyEnumerator(
+            new ZipPaddedEnumerator(enumerators, widths, fieldCount, withOrdinality),
+            nullRow);
+      }
+    };
+  }
+
+  /** Enumerator that yields the rows of another enumerator, or a single
+   * default row if that enumerator yields none.
+   *
+   * <p>This is the {@code defaultIfEmpty} operation of LINQ. It implements
+   * the outer (LEFT JOIN) semantics of {@code Uncollect}, where the default
+   * row is all NULL. */
+  @SuppressWarnings("rawtypes")
+  private static class DefaultIfEmptyEnumerator
+      implements Enumerator<FlatLists.ComparableList<Comparable>> {
+    private final Enumerator<FlatLists.ComparableList<Comparable>> inner;
+    private final FlatLists.ComparableList<Comparable> defaultRow;
+    /** Whether {@link #inner} has yielded at least one row. */
+    private boolean innerMoved;
+    /** Whether {@link #defaultRow} is the row currently being returned. */
+    private boolean onDefaultRow;
+
+    DefaultIfEmptyEnumerator(
+        Enumerator<FlatLists.ComparableList<Comparable>> inner,
+        FlatLists.ComparableList<Comparable> defaultRow) {
+      this.inner = inner;
+      this.defaultRow = defaultRow;
+    }
+
+    @Override public boolean moveNext() {
+      if (onDefaultRow) {
+        return false;
+      }
+      if (inner.moveNext()) {
+        innerMoved = true;
+        return true;
+      }
+      if (innerMoved) {
+        return false;
+      }
+      onDefaultRow = true;
+      return true;
+    }
+
+    @Override public FlatLists.ComparableList<Comparable> current() {
+      return onDefaultRow ? defaultRow : inner.current();
+    }
+
+    @Override public void reset() {
+      inner.reset();
+      innerMoved = false;
+      onDefaultRow = false;
+    }
+
+    @Override public void close() {
+      inner.close();
+    }
   }
 
   public static Object[] array(Object... args) {
@@ -7283,6 +8239,99 @@ public class SqlFunctions {
             withOrdinality);
       }
     };
+  }
+
+  /**
+   * Enumerates over the positional zip of the given collection enumerators,
+   * padding shorter collections with {@code NULL}.
+   */
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  private static class ZipPaddedEnumerator
+      implements Enumerator<FlatLists.ComparableList<Comparable>> {
+    /** One enumerator per input collection; each yields one element row per step.
+     * For a scalar collection the inner list has exactly one element. */
+    private final List<Enumerator<List<Comparable>>> enumerators;
+    /** Output column count contributed by each collection (parallel to {@link #enumerators}). */
+    private final int[] widths;
+    /** {@code end_of_collection[i]} is {@code true} once collection {@code i} is exhausted. */
+    private final boolean[] endOfCollection;
+    /** Preallocated output buffer where each result row is constructed. */
+    final @Nullable Object[] flatElements;
+    /** Reused {@link List} view over {@link #flatElements}, passed to {@link FlatLists#of}
+     * to produce the final result for each output row. */
+    final List<@Nullable Object> list;
+    private final boolean withOrdinality;
+    /** 1-based counter incremented on each successful {@link #moveNext()}. */
+    private int currentOrdinality;
+
+    ZipPaddedEnumerator(List<Enumerator<List<Comparable>>> enumerators,
+        int[] widths, int fieldCount, boolean withOrdinality) {
+      this.enumerators = enumerators;
+      this.widths = widths;
+      this.withOrdinality = withOrdinality;
+      this.endOfCollection = new boolean[enumerators.size()];
+      flatElements = new Object[fieldCount];
+      list = Arrays.asList(flatElements);
+    }
+
+    @Override public boolean moveNext() {
+      boolean allCompleted = true;
+      for (int i = 0; i < enumerators.size(); i++) {
+        if (!endOfCollection[i]) {
+          endOfCollection[i] = !enumerators.get(i).moveNext();
+        }
+        allCompleted &= endOfCollection[i];
+      }
+      if (!allCompleted && withOrdinality) {
+        currentOrdinality++;
+      }
+      return !allCompleted;
+    }
+
+    @Override public FlatLists.ComparableList<Comparable> current() {
+      int column = 0;
+      for (int i = 0; i < enumerators.size(); i++) {
+        int width = widths[i];
+        if (!endOfCollection[i]) {
+          final Object elemRow = enumerators.get(i).current();
+          if (elemRow == null) {
+            // A NULL struct element expands to a row of NULLs, one per field.
+            Arrays.fill(flatElements, column, column + width, null);
+          } else if (elemRow instanceof Object[]) {
+            final Object[] arr = (Object[]) elemRow;
+            for (int p = 0; p < width; p++) {
+              flatElements[column + p] = p < arr.length ? arr[p] : null;
+            }
+          } else {
+            final List lst = (List) elemRow;
+            for (int p = 0; p < width; p++) {
+              flatElements[column + p] = p < lst.size() ? lst.get(p) : null;
+            }
+          }
+        } else {
+          Arrays.fill(flatElements, column, column + width, null);
+        }
+        column += width;
+      }
+      if (withOrdinality) {
+        flatElements[column] = currentOrdinality;
+      }
+      return (FlatLists.ComparableList) FlatLists.of(list);
+    }
+
+    @Override public void reset() {
+      for (Enumerator<List<Comparable>> e : enumerators) {
+        e.reset();
+      }
+      Arrays.fill(endOfCollection, false);
+      currentOrdinality = 0;
+    }
+
+    @Override public void close() {
+      for (Enumerator<List<Comparable>> e : enumerators) {
+        e.close();
+      }
+    }
   }
 
   /**
@@ -7380,9 +8429,9 @@ public class SqlFunctions {
     JSON_KEYS, JSON_KEYS_AND_VALUES, JSON_VALUES
   }
 
-  /** Type of argument passed into {@link #flatProduct}. */
+  /** Type of argument passed into {@link #flatZip}. */
   public enum FlatProductInputType {
-    SCALAR, LIST, MAP
+    SCALAR, LIST, MAP, STRUCT
   }
 
   /** Type of part to extract passed into {@link ParseUrlFunction#parseUrl}. */
@@ -7395,5 +8444,113 @@ public class SqlFunctions {
     FILE,
     AUTHORITY,
     USERINFO;
+  }
+
+  /** SQL {@code AGE(timestamp1, timestamp2)} function. */
+  private static String age(long timestamp1, long timestamp2) {
+    // Convert timestamps to ZonedDateTime objects using UTC to avoid timezone issues
+    Instant instant1 = Instant.ofEpochMilli(timestamp1);
+    Instant instant2 = Instant.ofEpochMilli(timestamp2);
+
+    ZonedDateTime dateTime1 = ZonedDateTime.ofInstant(instant1, ZoneOffset.UTC);
+    ZonedDateTime dateTime2 = ZonedDateTime.ofInstant(instant2, ZoneOffset.UTC);
+
+    // Check if the original timestamps are in the correct order
+    boolean isNegative = timestamp1 < timestamp2;
+
+    // Ensure dateTime1 is later than dateTime2 for consistent calculation
+    if (dateTime1.isBefore(dateTime2)) {
+      ZonedDateTime temp = dateTime1;
+      dateTime1 = dateTime2;
+      dateTime2 = temp;
+    }
+
+    // Calculate period (years, months, days)
+    Period period = Period.between(dateTime2.toLocalDate(), dateTime1.toLocalDate());
+
+    // Calculate duration (hours, minutes, seconds, milliseconds)
+    Duration duration = Duration.between(dateTime2, dateTime1);
+
+    // Adjust for possible day overflow when time part is negative
+    if (dateTime1.toLocalTime().isBefore(dateTime2.toLocalTime())) {
+      period = period.minusDays(1);
+      duration = duration.plusDays(1);
+    }
+
+    // Extract components
+    int years = period.getYears();
+    int months = period.getMonths();
+    int days = period.getDays();
+
+    long hours = duration.toHours() % 24;
+    long minutes = duration.toMinutes() % 60;
+    long seconds = duration.getSeconds() % 60;
+    long millis = duration.toMillis() % 1000;
+
+    // Apply negative sign if needed
+    if (isNegative) {
+      years = -years;
+      months = -months;
+      days = -days;
+    }
+
+    StringBuilder sb = new StringBuilder();
+    if (years != 0) {
+      sb =
+          Math.abs(years) > 1 ? sb.append(years).append(" years ")
+              : sb.append(years).append(" year ");
+    }
+    if (months != 0) {
+      sb =
+          Math.abs(months) > 1 ? sb.append(months).append(" mons ")
+              : sb.append(months).append(" mon ");
+    }
+    if (days != 0) {
+      sb =
+          Math.abs(days) > 1 ? sb.append(days).append(" days ")
+              : sb.append(days).append(" day ");
+    }
+
+
+    // Add negative sign if needed for time part
+    if (isNegative && (hours != 0 || minutes != 0 || seconds != 0)) {
+      sb.append("-");
+    }
+    if (millis != 0) {
+      String millisString = BigDecimal.valueOf(millis)
+          .divide(BigDecimal.valueOf(1000))
+          .stripTrailingZeros()
+          .toPlainString().substring(2);
+      sb.append(
+          String.format(Locale.ROOT, "%02d:%02d:%02d.%s", hours, minutes, seconds,
+              millisString));
+    } else if (sb.length() != 0
+        && hours == 0 && minutes == 0 && seconds == 0 && millis == 0) {
+      return sb.toString().trim();
+    } else {
+      sb.append(String.format(Locale.ROOT, "%02d:%02d:%02d", hours, minutes, seconds));
+    }
+    return sb.toString().trim();
+  }
+
+  /** SQL {@code AGE(timestamp1, timestamp2)} function. Supports 1 or 2 timestamp arguments. */
+  public static String age(long... timestamps) {
+    if (timestamps.length == 0) {
+      throw new IllegalArgumentException("AGE function requires at least one timestamp argument");
+    }
+
+    if (timestamps.length == 1) {
+      // Single parameter version: calculate age relative to current time
+      long timestamp = timestamps[0];
+      // Use the actual current timestamp (including time component) in UTC
+      long currentTimestamp = Instant.now().toEpochMilli();
+      // Call the two-parameter version with current timestamp and input timestamp
+      return age(currentTimestamp, timestamp);
+    } else if (timestamps.length == 2) {
+      // Two parameter version: calculate age between two timestamps
+      return age(timestamps[0], timestamps[1]);
+    } else {
+      throw new IllegalArgumentException("AGE function supports only 1 or 2 timestamp arguments");
+    }
   }
 }

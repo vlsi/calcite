@@ -114,6 +114,29 @@ public final class CalciteSystemProperty<T> {
   public static final CalciteSystemProperty<Boolean> STRICT =
       booleanProperty("calcite.strict.sql", false);
 
+  /** Whether to order UUIDs as unsigned 128-bit values, as SQL requires,
+   * rather than using {@link java.util.UUID#compareTo}, which treats each half
+   * as signed; see
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7716">[CALCITE-7716]</a>. */
+  public static final CalciteSystemProperty<Boolean> UUID_UNSIGNED_COMPARISON =
+      booleanProperty("calcite.uuid.unsigned.comparison", true);
+
+  /**
+   * Whether the fallback dialect that
+   * {@link org.apache.calcite.sql.SqlDialectFactory} uses for an
+   * unrecognized database product doubles backslashes when quoting string
+   * literals.
+   *
+   * <p>The unrecognized backend's string-lexing rules are unknown, so the
+   * default is to double backslashes: this keeps a value from terminating a
+   * generated string literal early on a backend that treats backslash as an
+   * in-string escape character (the MySQL family, among others). Set to
+   * "false" to restore the legacy behavior for backends known to follow the
+   * SQL standard.
+   */
+  public static final CalciteSystemProperty<Boolean> UNKNOWN_DIALECT_ESCAPES_BACKSLASH =
+      booleanProperty("calcite.sql.dialect.unknown.escapes.backslash", true);
+
   /**
    * Whether to include a GraphViz representation when dumping the state of the
    * Volcano planner.
@@ -137,6 +160,22 @@ public final class CalciteSystemProperty<T> {
    */
   public static final CalciteSystemProperty<Boolean> TOPDOWN_OPT =
       booleanProperty("calcite.planner.topdown.opt", false);
+
+  /** Whether {@link org.apache.calcite.plan.hep.HepPlanner} should enable
+   * large-plan mode by default.
+   *
+   * <p>This property only affects planners that do not call
+   * {@code setLargePlanMode} explicitly. */
+  public static final CalciteSystemProperty<Boolean> HEP_PLANNER_LARGE_PLAN_MODE =
+      booleanProperty("calcite.hep.large.plan.mode", false);
+
+
+  /** Whether to disable generate rel data type digest string.
+   *
+   * <p> Disable generate rel data type digest string for every type can
+   * reduce composite type's digest memory and digest relative operation's latency. */
+  public static final CalciteSystemProperty<Boolean> DISABLE_GENERATE_REL_DATA_TYPE_DIGEST_STRING =
+      booleanProperty("calcite.disable.generate.rel.data.type.digest.string", false);
 
   /**
    * Whether to run integration tests.
@@ -438,6 +477,112 @@ public final class CalciteSystemProperty<T> {
    */
   public static final CalciteSystemProperty<Integer> JOIN_SELECTOR_COMPACT_CODE_THRESHOLD =
       intProperty("calcite.join.selector.compact.code.threshold", 100);
+
+  /**
+   * Comma-separated allowlist of class-name patterns that may be loaded
+   * by reflection from a Calcite model (user-defined functions, custom
+   * schemas/tables, JDBC drivers, dialect factories, lattice statistic
+   * providers).
+   *
+   * <p>By default, the allowlist is empty and class loading is fully disabled.
+   * When non-empty, a class name must match the allowlist in addition to
+   * clearing the denylist.
+   *
+   * <p>Pattern syntax: a pattern ending in {@code "."} matches any class
+   * in that package or its sub-packages; otherwise the pattern matches a
+   * class name exactly.
+   *
+   * @see org.apache.calcite.model.ModelHandler
+   */
+  public static final CalciteSystemProperty<String> MODEL_CLASSES_ALLOWED =
+      stringProperty("calcite.model.classes.allowed", "");
+
+  /**
+   * Comma-separated patterns to add to the built-in denylist of class
+   * names that may not be loaded by reflection from a Calcite model
+   * (user-defined functions, custom schemas/tables, JDBC drivers,
+   * dialect factories, lattice statistic providers).
+   *
+   * <p>Setting this property <em>extends</em> the built-in denylist; the
+   * built-in entries cannot be removed at runtime.
+   *
+   * <p>Pattern syntax: a pattern ending in {@code "."} matches any class
+   * in that package or its sub-packages; otherwise the pattern matches a
+   * class name exactly.
+   *
+   * @see org.apache.calcite.model.ModelHandler
+   */
+  public static final CalciteSystemProperty<String> MODEL_CLASSES_DENIED =
+      stringProperty("calcite.model.classes.denied", "");
+
+  /**
+   * Base directory that file-based connection models
+   * ({@code model=<path>}) must reside in.
+   *
+   * <p>The {@code model} connection property is settable by a query
+   * author, and a non-{@code inline:} value is read from the local
+   * filesystem before any schema is created. When this property is empty
+   * (the default), any local path is accepted. When it is set, relative
+   * model paths resolve under the configured directory and any model path
+   * that resolves outside it is rejected. The check is lexical and does
+   * not follow symbolic links.
+   *
+   * @see org.apache.calcite.model.ModelHandler
+   */
+  public static final CalciteSystemProperty<String> MODEL_BASE_DIRECTORY =
+      stringProperty("calcite.model.baseDirectory", "");
+
+  /**
+   * Whether the Kafka adapter forwards the {@code consumer.params} model
+   * operand to the Kafka client without filtering it.
+   *
+   * <p>The operand comes from the (query-author-supplied) model, and several
+   * Kafka consumer config keys ({@code key.deserializer},
+   * {@code value.deserializer}, {@code interceptor.classes},
+   * {@code metric.reporters}, {@code partition.assignment.strategy},
+   * {@code sasl.jaas.config}, {@code security.providers}, and any key
+   * ending in {@code .class} or {@code .classes}) cause the Kafka client
+   * to load and initialize classes named in the operand.
+   *
+   * <p>By default (empty / {@code false}) the Kafka adapter rejects those
+   * keys in {@code consumer.params}, and only accepts
+   * {@code key.deserializer}/{@code value.deserializer} after checking that
+   * the named class implements
+   * {@code org.apache.kafka.common.serialization.Deserializer} without
+   * initializing it. Set this property to {@code true} only when models
+   * come exclusively from trusted operators.
+   */
+  public static final CalciteSystemProperty<Boolean> KAFKA_CONSUMER_PARAMS_TRUSTED =
+      booleanProperty("calcite.kafka.consumer.params.trusted", false);
+
+  /**
+   * Maximum number of decimal digits that the plain-notation expansion of a {@code DECIMAL}
+   * literal may contain.
+   *
+   * <p>{@link java.math.BigDecimal} accepts any {@code int} exponent, so without a bound
+   * a ~15-character literal such as {@code DECIMAL '1E2147483647'} would ask
+   * {@link java.math.BigDecimal#toPlainString()} to materialize one character per digit,
+   * i.e. a multi-gigabyte allocation that would end in {@link OutOfMemoryError} inside the parser.
+   *
+   * <p>Default {@code 10000} is well beyond any dialect's realistic maximum {@code DECIMAL}
+   * precision while still bounding worst-case allocation to ~20 KB. Raise if a dialect
+   * legitimately needs more.
+   */
+  public static final CalciteSystemProperty<Integer> MAX_DECIMAL_LITERAL_PLAIN_DIGITS =
+      intProperty("calcite.parser.maxDecimalLiteralPlainDigits", 10_000, v -> v > 0);
+
+  /** Whether the Spark engine is enabled, making the {@code spark} connection property honored. */
+  public static final CalciteSystemProperty<Boolean> ENABLE_SPARK_ENGINE =
+      booleanProperty("calcite.enable.spark", false);
+
+  /**
+   * Whether the Geode schema operand {@code pdxSerializablePackagePath} is enabled.
+   *
+   * <p>The operand configures Geode's {@code ReflectionBasedAutoSerializer} class-name pattern.
+   * It is disabled by default; set this property to {@code "true"} to opt back in.
+   */
+  public static final CalciteSystemProperty<Boolean> GEODE_PDX_PACKAGE_PATH_ALLOWED =
+      booleanProperty("calcite.geode.pdxSerializablePackagePath.allowed", false);
 
   private static CalciteSystemProperty<Boolean> booleanProperty(String key,
       boolean defaultValue) {

@@ -44,6 +44,7 @@ import org.apache.calcite.util.TimeWithTimeZoneString;
 import org.apache.calcite.util.TimestampString;
 import org.apache.calcite.util.TimestampWithTimeZoneString;
 import org.apache.calcite.util.Util;
+import org.apache.calcite.util.UuidValue;
 
 import com.google.common.collect.ImmutableList;
 
@@ -60,6 +61,11 @@ import java.math.MathContext;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.text.SimpleDateFormat;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.util.Calendar;
 import java.util.List;
 import java.util.Locale;
@@ -318,7 +324,7 @@ public class RexLiteral extends RexNode {
     }
     switch (typeName) {
     case UUID:
-      return value instanceof UUID;
+      return value instanceof UuidValue;
     case VARIANT:
       return value instanceof VariantValue;
     case BOOLEAN:
@@ -397,6 +403,8 @@ public class RexLiteral extends RexNode {
       return value instanceof List;
     case GEOMETRY:
       return value instanceof Geometry;
+    case MAP:
+      return value instanceof Map;
     case ANY:
       // Literal of type ANY is not legal. "CAST(2 AS ANY)" remains
       // an integer literal surrounded by a cast function.
@@ -700,7 +708,7 @@ public class RexLiteral extends RexNode {
           printSarg(sb2, (Sarg) value, type));
       break;
     case UUID:
-      assert value instanceof UUID;
+      assert value instanceof UuidValue;
       sb.append(value);
       break;
     case SYMBOL:
@@ -1072,7 +1080,9 @@ public class RexLiteral extends RexNode {
     switch (typeName) {
     case UUID:
       if (clazz == String.class) {
-        return clazz.cast(((UUID) value).toString());
+        return clazz.cast(value.toString());
+      } else if (clazz == UUID.class) {
+        return clazz.cast(((UuidValue) value).uuid());
       }
       break;
     case BINARY:
@@ -1181,9 +1191,18 @@ public class RexLiteral extends RexNode {
       break;
     case TIMESTAMP_TZ:
       if (clazz == Long.class) {
-        return clazz.cast(((TimestampWithTimeZoneString) value)
+        TimestampWithTimeZoneString tstz = (TimestampWithTimeZoneString) value;
+        long ms = tstz
             .getLocalTimestampString()
-            .getMillisSinceEpoch());
+            .getMillisSinceEpoch();
+        // Interpret the timestamp part as a UTC timestamp
+        LocalDateTime local = Instant.ofEpochMilli(ms).atZone(ZoneOffset.UTC).toLocalDateTime();
+        // Adjust for the time zone
+        ZoneId id = tstz.getTimeZone().toZoneId();
+        ZonedDateTime zoned = local.atZone(id);
+        ZonedDateTime utc = zoned.withZoneSameInstant(ZoneOffset.UTC);
+        ms = utc.toInstant().toEpochMilli();
+        return clazz.cast(ms);
       } else if (clazz == Calendar.class) {
         TimestampWithTimeZoneString ts = (TimestampWithTimeZoneString) value;
         return clazz.cast(ts.getLocalTimestampString().toCalendar(ts.getTimeZone()));
@@ -1288,6 +1307,12 @@ public class RexLiteral extends RexNode {
   public static long longValue(RexNode node) {
     final Number number = numberValue(node);
     return number.longValue();
+  }
+
+  /** Returns the value of a literal, cast, or unary minus, as a BigDecimal;
+   * never null. */
+  public static BigDecimal bigDecimalValue(RexNode node) {
+    return (BigDecimal) numberValue(node);
   }
 
   public static @Nullable String stringValue(RexNode node) {

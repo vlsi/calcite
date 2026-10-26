@@ -58,6 +58,22 @@ Correlate:[[USE_HASH_JOIN inheritPath:[0] options:[ORDERS, PRODUCTS_TEMPORAL]]]
 ]]>
     </Resource>
   </TestCase>
+  <TestCase name="testDocumentationExample">
+    <Resource name="sql">
+      <![CDATA[SELECT /*+ hint1, hint2(a=1, b=2) */ *
+FROM emp /*+ hint3(5, 'x') */
+JOIN dept /*+ hint4(c=id), hint5 */
+ON emp.deptno = dept.deptno]]>
+    </Resource>
+    <Resource name="hints">
+      <![CDATA[
+Project:[[HINT1 inheritPath:[]], [HINT2 inheritPath:[] options:{A=1, B=2}]]
+LogicalJoin:[[HINT1 inheritPath:[0]], [HINT2 inheritPath:[0] options:{A=1, B=2}]]
+TableScan:[[HINT3 inheritPath:[] options:[5, x]]]
+TableScan:[[HINT4 inheritPath:[] options:{C=ID}], [HINT5 inheritPath:[]]]
+]]>
+    </Resource>
+  </TestCase>
   <TestCase name="testFilterHints">
     <Resource name="sql">
       <![CDATA[select /*+ resource(parallelism='3') */ avg(sal) as avg_sal, deptno
@@ -337,6 +353,17 @@ TableScan:[[PROPERTIES inheritPath:[0, 1, 0] options:{K1=v1, K2=v2}], [INDEX inh
 ]]>
     </Resource>
   </TestCase>
+  <TestCase name="testQueryHintWithKeyValueNumericLiteralOptions">
+    <Resource name="sql">
+      <![CDATA[select /*+ hint2(a=1, b=-1, c=1.1, d=-1.1, e=1e3, f=-1e-4) */ *
+from emp]]>
+    </Resource>
+    <Resource name="hints">
+      <![CDATA[
+Project:[[HINT2 inheritPath:[] options:{A=1, B=-1, C=1.1, D=-1.1, E=1E3, F=-1E-4}]]
+]]>
+    </Resource>
+  </TestCase>
   <TestCase name="testQueryHintWithLiteralOptions">
     <Resource name="sql">
       <![CDATA[select /*+ time_zone(1, 1.23, 'a bc', -1.0) */ *
@@ -420,6 +447,16 @@ TableScan:[[PROPERTIES inheritPath:[] options:{K1=v1, K2=v2}]]
     <Resource name="hints">
       <![CDATA[
 TableScan:[[PROPERTIES inheritPath:[] options:{K1=v1, K2=v2}], [INDEX inheritPath:[] options:[ENAME]]]
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testTableScanHint">
+    <Resource name="sql">
+      <![CDATA[select * from emp /*+ index(idx1) */]]>
+    </Resource>
+    <Resource name="hints">
+      <![CDATA[
+TableScan:[[INDEX inheritPath:[] options:[IDX1]]]
 ]]>
     </Resource>
   </TestCase>

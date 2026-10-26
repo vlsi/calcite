@@ -22,8 +22,10 @@ import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeSystem;
 import org.apache.calcite.rel.type.RelDataTypeSystemImpl;
 import org.apache.calcite.sql.SqlAbstractDateTimeLiteral;
+import org.apache.calcite.sql.SqlAlienSystemTypeNameSpec;
 import org.apache.calcite.sql.SqlBasicFunction;
 import org.apache.calcite.sql.SqlCall;
+import org.apache.calcite.sql.SqlDataTypeSpec;
 import org.apache.calcite.sql.SqlDialect;
 import org.apache.calcite.sql.SqlFunction;
 import org.apache.calcite.sql.SqlFunctionCategory;
@@ -36,7 +38,9 @@ import org.apache.calcite.sql.SqlNodeList;
 import org.apache.calcite.sql.SqlOperator;
 import org.apache.calcite.sql.SqlSyntax;
 import org.apache.calcite.sql.SqlUtil;
+import org.apache.calcite.sql.SqlUuidLiteral;
 import org.apache.calcite.sql.SqlWriter;
+import org.apache.calcite.sql.fun.SqlLibraryOperators;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.OperandTypes;
@@ -79,6 +83,10 @@ public class MssqlSqlDialect extends SqlDialect {
       SqlBasicFunction.create("SUBSTRING", ReturnTypes.ARG0_NULLABLE_VARYING,
           OperandTypes.VARIADIC, SqlFunctionCategory.STRING);
 
+  /** Maximum fractional-seconds precision of SQL Server's {@code DATETIME2}
+   * and {@code DATETIMEOFFSET} types. */
+  private static final int MAX_DATETIME_PRECISION = 7;
+
   /** Whether to generate "SELECT TOP(fetch)" rather than
    * "SELECT ... FETCH NEXT fetch ROWS ONLY". */
   private final boolean top;
@@ -89,6 +97,50 @@ public class MssqlSqlDialect extends SqlDialect {
     // MSSQL 2008 (version 10) and earlier only supports TOP
     // MSSQL 2012 (version 11) and higher supports OFFSET and FETCH
     top = context.databaseMajorVersion() < 11;
+  }
+
+  @Override public @Nullable SqlNode getCastSpec(RelDataType type) {
+    switch (type.getSqlTypeName()) {
+    case TIMESTAMP:
+      // In SQL Server, TIMESTAMP is a deprecated synonym for ROWVERSION
+      // (a binary, auto-generated type), not a temporal type. The correct
+      // fixed-precision date/time type is DATETIME2 (SQL Server 2008+).
+      return createDatetimeCastSpec("DATETIME2", type);
+    case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+      // SQL Server's timezone-aware date/time type.
+      return createDatetimeCastSpec("DATETIMEOFFSET", type);
+    case VARCHAR:
+      // SQL Server interprets a bare VARCHAR in a CAST as VARCHAR(30).
+      // Fix the precision to VARCHAR(MAX) if it is unspecified, so that the
+      // CAST does not truncate the value.
+      if (type.getPrecision() == RelDataType.PRECISION_NOT_SPECIFIED) {
+        return new SqlDataTypeSpec(
+            new SqlAlienSystemTypeNameSpec("VARCHAR(MAX)",
+              SqlTypeName.VARCHAR, SqlParserPos.ZERO),
+            SqlParserPos.ZERO);
+      }
+      return super.getCastSpec(type);
+    default:
+      return super.getCastSpec(type);
+    }
+  }
+
+  /** Builds a SQL Server date/time cast target such as {@code DATETIME2(3)}.
+   *
+   * <p>SQL Server supports a fractional-seconds precision in the range
+   * {@code [0, 7]}. An unspecified precision is omitted, letting SQL Server
+   * apply its own default (7); a higher precision is clamped to 7. A precision
+   * above 7 is only reachable through a custom type system, since Calcite's
+   * default caps TIMESTAMP precision at
+   * {@link org.apache.calcite.sql.type.SqlTypeName#MAX_DATETIME_PRECISION}. */
+  private static SqlNode createDatetimeCastSpec(String typeAlias, RelDataType type) {
+    final int precision = type.getPrecision();
+    final String spec = precision < 0
+        ? typeAlias
+        : typeAlias + "(" + Math.min(precision, MAX_DATETIME_PRECISION) + ")";
+    return new SqlDataTypeSpec(
+        new SqlAlienSystemTypeNameSpec(spec, type.getSqlTypeName(), SqlParserPos.ZERO),
+        SqlParserPos.ZERO);
   }
 
   /** {@inheritDoc}
@@ -160,6 +212,11 @@ public class MssqlSqlDialect extends SqlDialect {
     writer.literal("'" + literal.toFormattedString() + "'");
   }
 
+  @Override public void unparseUuidLiteral(SqlWriter writer,
+      SqlUuidLiteral literal, int leftPrec, int rightPrec) {
+    writer.literal("'" + literal.toFormattedString() + "'");
+  }
+
   @Override public void unparseCall(SqlWriter writer, SqlCall call,
       int leftPrec, int rightPrec) {
     if (call.getOperator() == SqlStdOperatorTable.SUBSTRING) {
@@ -172,6 +229,11 @@ public class MssqlSqlDialect extends SqlDialect {
       final SqlWriter.Frame frame = writer.startFunCall("CEILING");
       call.operand(0).unparse(writer, leftPrec, rightPrec);
       writer.endFunCall(frame);
+    } else if (call.getOperator().equals(SqlStdOperatorTable.CONCAT)) {
+      // MSSQL has no || operator. + concatenates and propagates NULL, as ||
+      // does; the CONCAT function does not, reading a NULL operand as ''.
+      SqlSyntax.BINARY.unparse(writer, SqlStdOperatorTable.PLUS, call, leftPrec,
+          rightPrec);
     } else {
       switch (call.getKind()) {
       case FLOOR:
@@ -185,6 +247,13 @@ public class MssqlSqlDialect extends SqlDialect {
         SqlOperator op = SqlStdOperatorTable.PERCENT_REMAINDER;
         SqlSyntax.BINARY.unparse(writer, op, call, leftPrec, rightPrec);
         break;
+      case SAFE_CAST:
+        // MSSQL uses TRY_CAST instead of SAFE_CAST (BigQuery)
+        super.unparseCall(writer,
+            SqlLibraryOperators.TRY_CAST.createCall(
+                call.getParserPosition(), call.getOperandList()),
+            leftPrec, rightPrec);
+        break;
       default:
         super.unparseCall(writer, call, leftPrec, rightPrec);
       }
@@ -197,7 +266,22 @@ public class MssqlSqlDialect extends SqlDialect {
     if (value == null) {
       return;
     }
-    unparseBoolLiteralToCondition(writer, value);
+
+    SqlWriter.Frame frame = writer.getCurrentFrame();
+    boolean expressionAllowed = true;
+    if (frame != null) {
+      SqlWriter.FrameType frameType = frame.getFrameType();
+      if (frameType == SqlWriter.FrameTypeEnum.SELECT_LIST
+          || frameType == SqlWriter.FrameTypeEnum.VALUES) {
+        expressionAllowed = false;
+      }
+    }
+
+    if (expressionAllowed) {
+      unparseBoolLiteralToCondition(writer, value);
+    } else {
+      writer.literal(value ? "1" : "0");
+    }
   }
 
   @Override public boolean supportsApproxCountDistinct() {
@@ -205,6 +289,10 @@ public class MssqlSqlDialect extends SqlDialect {
   }
 
   @Override public boolean supportsCharSet() {
+    return false;
+  }
+
+  @Override public boolean supportsGroupByLiteral() {
     return false;
   }
 

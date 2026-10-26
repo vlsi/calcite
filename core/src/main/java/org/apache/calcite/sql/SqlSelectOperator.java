@@ -16,7 +16,6 @@
  */
 package org.apache.calcite.sql;
 
-import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.ReturnTypes;
 import org.apache.calcite.sql.util.SqlBasicVisitor;
@@ -24,7 +23,6 @@ import org.apache.calcite.sql.util.SqlVisitor;
 
 import org.checkerframework.checker.nullness.qual.Nullable;
 
-import java.util.ArrayList;
 import java.util.List;
 
 import static org.apache.calcite.linq4j.Nullness.castNonNull;
@@ -80,7 +78,8 @@ public class SqlSelectOperator extends SqlOperator {
         (SqlNodeList) operands[8],
         operands[9],
         operands[10],
-        (SqlNodeList) operands[11]);
+        (SqlNodeList) operands[11],
+        operands.length > 12 ? (SqlNodeList) operands[12] : null);
   }
 
   /**
@@ -116,7 +115,8 @@ public class SqlSelectOperator extends SqlOperator {
         orderBy,
         offset,
         fetch,
-        hints);
+        hints,
+        null);
   }
 
   @Override public <R> void acceptCall(
@@ -152,6 +152,13 @@ public class SqlSelectOperator extends SqlOperator {
       final SqlNode keyword = select.keywordList.get(i);
       keyword.unparse(writer, 0, 0);
     }
+    if (select.isDistinctOn()) {
+      writer.keyword("ON");
+      final SqlWriter.Frame frame =
+          writer.startList("(", ")");
+      castNonNull(select.distinctOn).unparse(writer, 0, 0);
+      writer.endList(frame);
+    }
     writer.topN(select.fetch, select.offset);
     final SqlNodeList selectClause = select.selectList;
     writer.list(SqlWriter.FrameTypeEnum.SELECT_LIST, SqlWriter.COMMA,
@@ -176,33 +183,7 @@ public class SqlSelectOperator extends SqlOperator {
     SqlNode where = select.where;
     if (where != null) {
       writer.sep("WHERE");
-
-      if (!writer.isAlwaysUseParentheses()) {
-        SqlNode node = where;
-
-        // decide whether to split on ORs or ANDs
-        SqlBinaryOperator whereSep = SqlStdOperatorTable.AND;
-        if ((node instanceof SqlCall)
-            && node.getKind() == SqlKind.OR) {
-          whereSep = SqlStdOperatorTable.OR;
-        }
-
-        // unroll whereClause
-        final List<SqlNode> list = new ArrayList<>(0);
-        while (node.getKind() == whereSep.kind) {
-          assert node instanceof SqlCall;
-          final SqlCall call1 = (SqlCall) node;
-          list.add(0, call1.operand(1));
-          node = call1.operand(0);
-        }
-        list.add(0, node);
-
-        // unparse in a WHERE_LIST frame
-        writer.list(SqlWriter.FrameTypeEnum.WHERE_LIST, whereSep,
-            new SqlNodeList(list, where.getParserPosition()));
-      } else {
-        where.unparse(writer, 0, 0);
-      }
+      SqlUtil.unparseConditionClause(writer, where, 0, 0);
     }
     if (select.groupBy != null) {
       SqlNodeList groupBy =
@@ -214,6 +195,10 @@ public class SqlSelectOperator extends SqlOperator {
         writer.sep("GROUP BY DISTINCT");
         List<SqlNode> operandList = ((SqlCall) groupBy.get(0)).getOperandList();
         groupBy = new SqlNodeList(operandList, groupBy.getParserPosition());
+      } else if (groupBy.size() == 1 && groupBy.get(0) != null
+          && groupBy.get(0).getKind() == SqlKind.GROUP_BY_ALL) {
+        writer.sep("GROUP BY ALL");
+        groupBy = new SqlNodeList(groupBy.getParserPosition());
       } else {
         writer.sep("GROUP BY");
       }

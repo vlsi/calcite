@@ -30,6 +30,7 @@ import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rel.core.Window;
+import org.apache.calcite.rel.logical.LogicalAsofJoin;
 import org.apache.calcite.rel.logical.LogicalCalc;
 import org.apache.calcite.rel.logical.LogicalFilter;
 import org.apache.calcite.rel.logical.LogicalProject;
@@ -373,6 +374,12 @@ public abstract class ReduceExpressionsRule<C extends ReduceExpressionsRule.Conf
 
     @Override public void onMatch(RelOptRuleCall call) {
       final Join join = call.rel(0);
+      if (join instanceof LogicalAsofJoin) {
+        // Currently ASOF JOINs are restricted by the validator to use very specific
+        // conditions, so there isn't much to simplify about them.
+        // Moreover, calling join.copy() below for an ASOF JOIN will throw.
+        return;
+      }
       final List<RexNode> expList = Lists.newArrayList(join.getCondition());
       final int fieldCount = join.getLeft().getRowType().getFieldCount();
       final RelMetadataQuery mq = call.getMetadataQuery();
@@ -579,7 +586,8 @@ public abstract class ReduceExpressionsRule<C extends ReduceExpressionsRule.Conf
           final List<RexNode> expList = new ArrayList<>(aggCall.getOperands());
           if (reduceExpressions(window, expList, predicates)) {
             aggCall =
-                new Window.RexWinAggCall((SqlAggFunction) aggCall.getOperator(),
+                new Window.RexWinAggCall(aggCall.getParserPosition(),
+                    (SqlAggFunction) aggCall.getOperator(),
                     aggCall.type, expList,
                     aggCall.ordinal, aggCall.distinct, aggCall.ignoreNulls);
             reduced = true;
@@ -617,7 +625,7 @@ public abstract class ReduceExpressionsRule<C extends ReduceExpressionsRule.Conf
       }
       if (reduced) {
         call.transformTo(LogicalWindow
-            .create(window.getTraitSet(), window.getInput(),
+            .create(window.getTraitSet(), window.getHints(), window.getInput(),
                 window.getConstants(), window.getRowType(), groups));
         call.getPlanner().prune(window);
       }
@@ -1181,6 +1189,19 @@ public abstract class ReduceExpressionsRule<C extends ReduceExpressionsRule.Conf
     }
 
     @Override public Void visitLambda(RexLambda lambda) {
+      // A lambda as a whole is not a constant (it contains lambda parameter
+      // references), but its body may contain constant sub-expressions (e.g.
+      // the "1 + 2" in "x -> x > 1 + 2").  Recursively analyze the body so
+      // that those inner constants are discovered and later replaced by
+      // RexReplacer (which already recurses into lambda bodies via
+      // RexShuttle.visitLambda).
+      final int stackSizeBefore = stack.size();
+      lambda.getExpression().accept(this);
+      // Discard whatever the body analysis pushed onto the stack – the lambda
+      // itself is not a constant from the outer context's point of view.
+      while (stack.size() > stackSizeBefore) {
+        stack.remove(stack.size() - 1);
+      }
       return pushVariable();
     }
 

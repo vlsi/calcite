@@ -64,6 +64,7 @@ import java.util.stream.IntStream;
 import static org.apache.calcite.sql.fun.SqlLibrary.ALL;
 import static org.apache.calcite.sql.fun.SqlLibrary.BIG_QUERY;
 import static org.apache.calcite.sql.fun.SqlLibrary.CALCITE;
+import static org.apache.calcite.sql.fun.SqlLibrary.CLICKHOUSE;
 import static org.apache.calcite.sql.fun.SqlLibrary.HIVE;
 import static org.apache.calcite.sql.fun.SqlLibrary.MSSQL;
 import static org.apache.calcite.sql.fun.SqlLibrary.MYSQL;
@@ -424,7 +425,7 @@ public abstract class SqlLibraryOperators {
           OperandTypes.STRING_SAME_SAME);
 
   /** The "ENDSWITH(value1, value2)" function (Snowflake). */
-  @LibraryOperator(libraries = {SNOWFLAKE, SPARK})
+  @LibraryOperator(libraries = {SNOWFLAKE, SPARK, CLICKHOUSE})
   public static final SqlFunction ENDSWITH = ENDS_WITH.withName("ENDSWITH");
 
   /** The "STARTS_WITH(value1, value2)" function (BigQuery, PostgreSQL). */
@@ -434,7 +435,7 @@ public abstract class SqlLibraryOperators {
           OperandTypes.STRING_SAME_SAME);
 
   /** The "STARTSWITH(value1, value2)" function (Snowflake). */
-  @LibraryOperator(libraries = {SNOWFLAKE, SPARK})
+  @LibraryOperator(libraries = {SNOWFLAKE, SPARK, CLICKHOUSE})
   public static final SqlFunction STARTSWITH = STARTS_WITH.withName("STARTSWITH");
 
   /** BigQuery's "SUBSTR(string, position [, substringLength ])" function. */
@@ -704,11 +705,10 @@ public abstract class SqlLibraryOperators {
   public static final SqlFunction REGEXP_SUBSTR = REGEXP_EXTRACT.withName("REGEXP_SUBSTR");
 
   /** The "REGEXP(value, regexp)" function, equivalent to {@link #RLIKE}. */
-  @LibraryOperator(libraries = {SPARK})
+  @LibraryOperator(libraries = {SPARK, HIVE})
   public static final SqlFunction REGEXP =
-      SqlBasicFunction.create("REGEXP", ReturnTypes.BOOLEAN_NULLABLE,
-          OperandTypes.STRING_STRING,
-          SqlFunctionCategory.STRING);
+      SqlBasicFunction.create("REGEXP", SqlKind.RLIKE, ReturnTypes.BOOLEAN_NULLABLE,
+          OperandTypes.STRING_STRING);
 
   /** The "REGEXP_LIKE(value, regexp)" function, equivalent to {@link #RLIKE}. */
   @LibraryOperator(libraries = {SPARK, MYSQL, POSTGRESQL, ORACLE})
@@ -846,7 +846,7 @@ public abstract class SqlLibraryOperators {
   @LibraryOperator(libraries = {BIG_QUERY, POSTGRESQL}, exceptLibraries = {REDSHIFT})
   public static final SqlAggFunction STRING_AGG =
       SqlBasicAggFunction
-          .create(SqlKind.STRING_AGG, ReturnTypes.ARG0_NULLABLE,
+          .create(SqlKind.STRING_AGG, ReturnTypes.ARG0_NULLABLE_IF_EMPTY,
               OperandTypes.STRING.or(OperandTypes.STRING_STRING))
           .withFunctionType(SqlFunctionCategory.SYSTEM)
           .withSyntax(SqlSyntax.ORDERED_FUNCTION);
@@ -862,7 +862,7 @@ public abstract class SqlLibraryOperators {
       SqlBasicAggFunction
           .create(SqlKind.GROUP_CONCAT,
               ReturnTypes.andThen(ReturnTypes::stripOrderBy,
-                  ReturnTypes.ARG0_NULLABLE),
+                  ReturnTypes.ARG0_NULLABLE_IF_EMPTY),
               OperandTypes.STRING.or(OperandTypes.STRING_STRING))
           .withFunctionType(SqlFunctionCategory.SYSTEM)
           .withAllowsNullTreatment(false)
@@ -1069,14 +1069,12 @@ public abstract class SqlLibraryOperators {
           ReturnTypes.INTEGER_NULLABLE, OperandTypes.DATE,
           SqlFunctionCategory.TIMEDATE);
 
-  /** "CONTAINS_SUBSTR(expression, string[, json_scope &#61;&#62; json_scope_value ])"
+  /** "CONTAINS_SUBSTR(expression, string[, json_scope =&gt; json_scope_value ])"
    * function; returns whether string exists as substring in expression, with optional
    * json_scope argument. */
   @LibraryOperator(libraries = {BIG_QUERY})
   public static final SqlFunction CONTAINS_SUBSTR =
-      SqlBasicFunction.create("CONTAINS_SUBSTR",
-          ReturnTypes.BOOLEAN_NULLABLE, OperandTypes.ANY_STRING_OPTIONAL_STRING,
-          SqlFunctionCategory.STRING);
+      new SqlContainsSubstrFunction();
 
   /** The "MONTHNAME(datetime)" function; returns the name of the month,
    * in the current locale, of a TIMESTAMP or DATE argument. */
@@ -1217,13 +1215,16 @@ public abstract class SqlLibraryOperators {
    * "CONCAT(null, null, null)" returns "".
    *
    * <p>It differs from {@link #CONCAT_FUNCTION} when processing
-   * null values. */
+   * null values.
+   *
+   * <p>Requires character operands because MSSQL and PostgreSQL convert
+   * every argument to a character string. */
   @LibraryOperator(libraries = {MSSQL, POSTGRESQL}, exceptLibraries = {REDSHIFT})
   public static final SqlFunction CONCAT_FUNCTION_WITH_NULL =
       SqlBasicFunction.create("CONCAT",
           ReturnTypes.MULTIVALENT_STRING_SUM_PRECISION_NOT_NULLABLE,
           OperandTypes.repeat(SqlOperandCountRanges.from(1),
-              OperandTypes.STRING),
+              OperandTypes.CHARACTER),
           SqlFunctionCategory.STRING)
           .withOperandTypeInference(InferTypes.RETURN_TYPE)
           .withKind(SqlKind.CONCAT_WITH_NULL);
@@ -1470,7 +1471,7 @@ public abstract class SqlLibraryOperators {
             adjustTypeForArrayFunctions(type, opBinding, 1);
       } else {
         SqlValidatorUtil.
-            adjustTypeForArrayFunctions(type, opBinding, 0);
+            adjustArrayTypeForArrayFunctions(type, opBinding, 0);
       }
     }
 
@@ -1592,14 +1593,15 @@ public abstract class SqlLibraryOperators {
     // The spec says that "ARRAY_INSERT may pad the array with NULL values if the
     // position is large", it implies that in the result the element type is always nullable.
     type = opBinding.getTypeFactory().createTypeWithNullability(type, true);
-    // make explicit CAST for array elements and inserted element to the biggest type
-    // if array component type is not equal to the inserted element type
-    if (!componentType.equalsSansFieldNamesAndNullability(elementType2)) {
-      // For array_insert, 0 is the array arg and 2 is the inserted element
+    // make explicit CAST for array elements and inserted element to the biggest type.
+    // For array_insert, 0 is the array arg and 2 is the inserted element
+    if (!elementType2.equalsSansFieldNamesAndNullability(type)) {
       SqlValidatorUtil.
           adjustTypeForArrayFunctions(type, opBinding, 2);
+    }
+    if (!componentType.equalsSansFieldNamesAndNullability(type)) {
       SqlValidatorUtil.
-          adjustTypeForArrayFunctions(type, opBinding, 0);
+          adjustArrayTypeForArrayFunctions(type, opBinding, 0);
     }
     boolean nullable = arrayType.isNullable() || elementType1.isNullable();
     return SqlTypeUtil.createArrayType(opBinding.getTypeFactory(), type, nullable);
@@ -1763,23 +1765,47 @@ public abstract class SqlLibraryOperators {
           OperandTypes.ARRAY.or(OperandTypes.ARRAY_BOOLEAN_LITERAL));
 
   private static RelDataType deriveTypeMapConcat(SqlOperatorBinding opBinding) {
+    final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
     if (opBinding.getOperandCount() == 0) {
-      final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      final RelDataType type = typeFactory.createSqlType(SqlTypeName.VARCHAR);
-      requireNonNull(type, "type");
+      final RelDataType type = typeFactory.createSqlType(SqlTypeName.ANY);
       return SqlTypeUtil.createMapType(typeFactory, type, type, true);
-    } else {
-      final List<RelDataType> operandTypes = opBinding.collectOperandTypes();
-      for (RelDataType operandType : operandTypes) {
-        if (!SqlTypeUtil.isMap(operandType)) {
-          throw opBinding.newError(
-              RESOURCE.typesShouldAllBeMap(
-                  opBinding.getOperator().getName(),
-                  operandType.getFullTypeString()));
-        }
-      }
-      return requireNonNull(opBinding.getTypeFactory().leastRestrictive(operandTypes));
     }
+    final List<RelDataType> operandTypes = opBinding.collectOperandTypes();
+    final List<RelDataType> mapTypes = new ArrayList<>();
+    boolean hasNull = false;
+    for (RelDataType operandType : operandTypes) {
+      if (operandType.getSqlTypeName() == SqlTypeName.NULL) {
+        hasNull = true;
+      } else if (SqlTypeUtil.isMap(operandType)) {
+        mapTypes.add(operandType);
+      } else {
+        throw opBinding.newError(
+            RESOURCE.typesShouldAllBeMap(
+                opBinding.getOperator().getName(),
+                operandType.getFullTypeString()));
+      }
+    }
+    if (mapTypes.isEmpty() || hasNull) {
+      // All arguments are NULL literals, or at least one null argument;
+      // the result is NULL.
+      return typeFactory.createSqlType(SqlTypeName.NULL);
+    }
+    // If there are MAP<ANY, ANY> placeholders (e.g. from map_concat() with no
+    // arguments) alongside more specific MAP types, ignore the placeholders and
+    // infer the type from the specific maps.
+    final List<RelDataType> concreteMapTypes = new ArrayList<>();
+    for (RelDataType mapType : mapTypes) {
+      final RelDataType keyType = requireNonNull(mapType.getKeyType());
+      final RelDataType valueType = requireNonNull(mapType.getValueType());
+      if (keyType.getSqlTypeName() == SqlTypeName.ANY
+          && valueType.getSqlTypeName() == SqlTypeName.ANY) {
+        continue;
+      }
+      concreteMapTypes.add(mapType);
+    }
+    final List<RelDataType> typesToUse =
+        concreteMapTypes.isEmpty() ? mapTypes : concreteMapTypes;
+    return requireNonNull(typeFactory.leastRestrictive(typesToUse));
   }
 
   /** The "MAP_CONCAT(map [, map]*)" function. */
@@ -2561,6 +2587,15 @@ public abstract class SqlLibraryOperators {
           OperandTypes.NUMERIC,
           SqlFunctionCategory.STRING);
 
+  /** The {@code HYPOT(numeric1, numeric2)} function; returns
+   * sqrt(numeric1^2 + numeric2^2) without intermediate overflow or underflow. */
+  @LibraryOperator(libraries = {SPARK, CLICKHOUSE})
+  public static final SqlFunction HYPOT =
+      SqlBasicFunction.create("HYPOT",
+          ReturnTypes.DOUBLE_NULLABLE,
+          OperandTypes.NUMERIC_NUMERIC,
+          SqlFunctionCategory.NUMERIC);
+
   @LibraryOperator(libraries = {BIG_QUERY, MYSQL, POSTGRESQL, SPARK, HIVE})
   public static final SqlFunction MD5 =
       SqlBasicFunction.create("MD5",
@@ -2774,4 +2809,21 @@ public abstract class SqlLibraryOperators {
   public static final SqlFunction RANDOM = SqlStdOperatorTable.RAND
       .withName("RANDOM")
       .withOperandTypeChecker(OperandTypes.NILADIC);
+
+  /**
+   * AGE function for PostgreSQL.
+   * Returns a human-readable VARCHAR describing the interval between
+   * one or two timestamps (for example,
+   * "3 years 11 mons 24 days 0 hours 0 mins 0.0 secs").
+   *
+   * @see <a href="https://www.postgresql.org/docs/current/functions-datetime.html">PostgreSQL AGE</a>
+   */
+  @LibraryOperator(libraries = {POSTGRESQL}, exceptLibraries = {REDSHIFT})
+  public static final SqlBasicFunction AGE =
+      SqlBasicFunction.create("AGE",
+          ReturnTypes.VARCHAR_NULLABLE,
+          OperandTypes.or(
+              OperandTypes.family(SqlTypeFamily.TIMESTAMP),
+              OperandTypes.family(SqlTypeFamily.TIMESTAMP, SqlTypeFamily.TIMESTAMP)),
+          SqlFunctionCategory.TIMEDATE);
 }

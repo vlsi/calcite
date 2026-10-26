@@ -33,15 +33,26 @@ public class UncollectNode extends AbstractSingleNode<Uncollect> {
   }
 
   @Override public void run() throws InterruptedException {
+    // Under isOuter an empty or NULL collection still produces one row, with
+    // every column NULL.
+    final int width = rel.getRowType().getFieldCount();
     Row row = null;
     while ((row = source.receive()) != null) {
       for (Object value : row.getValues()) {
         if (value == null) {
+          if (rel.isOuter) {
+            sink.send(Row.of(new Object[width]));
+            continue;
+          }
           throw new NullPointerException("NULL value for unnest.");
         }
         int i = 1;
         if (value instanceof List) {
           List list = (List) value;
+          if (list.isEmpty() && rel.isOuter) {
+            sink.send(Row.of(new Object[width]));
+            continue;
+          }
           for (Object o : list) {
             if (rel.withOrdinality) {
               sink.send(Row.of(o, i++));
@@ -50,12 +61,16 @@ public class UncollectNode extends AbstractSingleNode<Uncollect> {
             }
           }
         } else if (value instanceof Map) {
-          Map map = (Map) value;
-          for (Object key : map.keySet()) {
+          Map<?, ?> map = (Map<?, ?>) value;
+          if (map.isEmpty() && rel.isOuter) {
+            sink.send(Row.of(new Object[width]));
+            continue;
+          }
+          for (Map.Entry<?, ?> entry : map.entrySet()) {
             if (rel.withOrdinality) {
-              sink.send(Row.of(key, map.get(key), i++));
+              sink.send(Row.of(entry.getKey(), entry.getValue(), i++));
             } else {
-              sink.send(Row.of(key, map.get(key)));
+              sink.send(Row.of(entry.getKey(), entry.getValue()));
             }
           }
         } else {

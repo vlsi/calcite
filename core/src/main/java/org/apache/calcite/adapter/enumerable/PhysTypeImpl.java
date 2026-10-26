@@ -319,6 +319,10 @@ public class PhysTypeImpl implements PhysType {
     body.add(Expressions.declare(mod, parameterC, null));
     for (RelFieldCollation collation : collations) {
       final int index = collation.getFieldIndex();
+      // NULL literal (Void) is always null; comparing null == null yields 0, skip.
+      if (fieldClass(index) == Void.class) {
+        continue;
+      }
       final RelDataType fieldType = rowType.getFieldList().get(index).getType();
       final Expression fieldComparator = generateCollatorExpression(fieldType.getCollation());
       Expression arg0 = fieldReference(parameterV0, index);
@@ -443,6 +447,10 @@ public class PhysTypeImpl implements PhysType {
     body.add(Expressions.declare(mod, parameterC, null));
     for (RelFieldCollation fieldCollation : collation.getFieldCollations()) {
       final int index = fieldCollation.getFieldIndex();
+      // NULL literal (Void) is always null; comparing null == null yields 0, skip.
+      if (fieldClass(index) == Void.class) {
+        continue;
+      }
       final RelDataType fieldType = rowType.getFieldList().get(index).getType();
       final Expression fieldComparator = generateCollatorExpression(fieldType.getCollation());
       Expression arg0 = fieldReference(parameterV0, index);
@@ -491,7 +499,10 @@ public class PhysTypeImpl implements PhysType {
                 ImmutableList.of(parameterV0, parameterV1),
                 body.toBlock()));
 
-    if (EnumerableRules.BRIDGE_METHODS) {
+    // When javaRowClass is Object the primary compare method already has the
+    // signature compare(Object, Object), so a bridge method would be a
+    // duplicate and the generated Comparator would fail to compile.
+    if (EnumerableRules.BRIDGE_METHODS && javaRowClass != Object.class) {
       final ParameterExpression parameterO0 =
           Expressions.parameter(Object.class, "o0");
       final ParameterExpression parameterO1 =
@@ -574,7 +585,58 @@ public class PhysTypeImpl implements PhysType {
   }
 
   @Override public @Nullable Expression comparer() {
-    return format.comparer();
+    final Expression comparer = format.comparer();
+    if (comparer != null) {
+      // ARRAY compares nested arrays by content, but a List or Map compares
+      // the Object[] values it contains by reference.
+      if (format == JavaRowFormat.ARRAY && containsStructInCollection(rowType)) {
+        return Expressions.call(BuiltInMethod.DEEP_COMPARER.method);
+      }
+      return comparer;
+    }
+    if (anyFieldContainsStruct(rowType)) {
+      // A row or key containing struct (ROW) values needs deep equality;
+      // the default equality of the runtime representations of struct values (Object[], List)
+      // compares nested Object[] values by reference. Here we implement the "not
+      // distinct" semantics used by GROUP BY, DISTINCT and set operations.
+      return Expressions.call(BuiltInMethod.DEEP_COMPARER.method);
+    }
+    return null;
+  }
+
+  /** Returns whether a struct occurs inside a collection or map, including
+   * collections and maps nested in struct fields. Plain nested structs do not
+   * require overriding the ARRAY format's comparer. */
+  private static boolean containsStructInCollection(RelDataType type) {
+    if (type.isStruct()) {
+      return type.getFieldList().stream()
+          .anyMatch(f -> containsStructInCollection(f.getType()));
+    }
+    return containsStruct(type);
+  }
+
+  /** Returns whether any field of {@code rowType} contains a struct value:
+   * the field is itself a struct, or a collection or map whose elements
+   * contain one. */
+  private static boolean anyFieldContainsStruct(RelDataType rowType) {
+    return rowType.getFieldList().stream()
+        .anyMatch(f -> containsStruct(f.getType()));
+  }
+
+  private static boolean containsStruct(RelDataType type) {
+    if (type.isStruct()) {
+      return true;
+    }
+    final RelDataType componentType = type.getComponentType();
+    if (componentType != null && containsStruct(componentType)) {
+      return true;
+    }
+    final RelDataType keyType = type.getKeyType();
+    if (keyType != null && containsStruct(keyType)) {
+      return true;
+    }
+    final RelDataType valueType = type.getValueType();
+    return valueType != null && containsStruct(valueType);
   }
 
   private List<Expression> fieldReferences(
@@ -639,6 +701,21 @@ public class PhysTypeImpl implements PhysType {
         list.add(fieldReference(v1, field));
       }
       return Expressions.lambda(Function1.class, getListExpression(list), v1);
+    }
+  }
+
+  private static Expression getListExpressionAllowSingleElement(
+      Expressions.FluentList<Expression> list) {
+    assert list.size() > 0;
+
+    if (list.size() == 1) {
+      return Expressions.call(
+          List.class,
+          null,
+          BuiltInMethod.LIST1.method,
+          list);
+    } else {
+      return getListExpression(list);
     }
   }
 
@@ -711,6 +788,76 @@ public class PhysTypeImpl implements PhysType {
               exp);
     }
     return Expressions.lambda(Function1.class, exp, v1);
+  }
+
+  @Override public Expression generateNullAwareAccessor(
+      List<Integer> fields,
+      List<Boolean> nullExclusionFlags) {
+    assert fields.size() == nullExclusionFlags.size();
+    ParameterExpression v1 = Expressions.parameter(javaRowClass, "v1");
+    if (fields.isEmpty()) {
+      return Expressions.lambda(
+          Function1.class,
+          Expressions.field(
+              null,
+              BuiltInMethod.COMPARABLE_EMPTY_LIST.field),
+          v1);
+    }
+    Expressions.FluentList<Expression> list = Expressions.list();
+    for (int field : fields) {
+      list.add(fieldReference(v1, field));
+    }
+
+    // in the HashJoin key selector scenario, when there is exactly one join key and it is
+    // null-safe, a row whose join key is null must still be correctly recognized and extracted.
+    // Therefore, when list.size() == 1, this method returns a list containing a single
+    // element (which may be null) rather than returning the element directly.
+    Expression exp = getListExpressionAllowSingleElement(list);
+    for (int i = list.size() - 1; i >= 0; i--) {
+      if (nullExclusionFlags.get(i)) {
+        final RelDataType fieldType =
+            rowType.getFieldList().get(fields.get(i)).getType();
+        // Under the SQL = operator, a NULL never compares TRUE. A
+        // ROW containing a NULL field (at any nesting depth) cannot
+        // compare TRUE either: the pairwise comparison of its fields yields
+        // UNKNOWN or FALSE. In both these cases the result is null.
+        final Expression isNull = fieldType.isStruct()
+            ? structIsNullOrContainsNullExpression(list.get(i), fieldType)
+            : Expressions.equal(list.get(i), Expressions.constant(null));
+        exp =
+            Expressions.condition(isNull,
+                Expressions.constant(null),
+                exp);
+      }
+    }
+    return Expressions.lambda(Function1.class, exp, v1);
+  }
+
+  /** Returns an expression that evaluates whether {@code e}, a value of
+   * ROW type {@code type}, is null or has a null field, descending into
+   * struct-typed fields (but not into collection-typed fields). */
+  private static Expression structIsNullOrContainsNullExpression(Expression e,
+      RelDataType type) {
+    Expression result = Expressions.equal(e, Expressions.constant(null));
+    for (Ord<RelDataTypeField> field : Ord.zip(type.getFieldList())) {
+      final RelDataType fieldType = field.e.getType();
+      if (!fieldType.isStruct() && !fieldType.isNullable()) {
+        continue;
+      }
+      // structAccess handles both runtime representations of a struct value
+      // (Object[] and List); it is only evaluated when e is not null,
+      // thanks to the short-circuit OR.
+      final Expression access =
+          Expressions.call(BuiltInMethod.STRUCT_ACCESS.method, e,
+              Expressions.constant(field.i),
+              Expressions.constant(field.e.getName()));
+      result =
+          Expressions.orElse(result,
+              fieldType.isStruct()
+                  ? structIsNullOrContainsNullExpression(access, fieldType)
+                  : Expressions.equal(access, Expressions.constant(null)));
+    }
+    return result;
   }
 
   @Override public Expression fieldReference(

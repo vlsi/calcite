@@ -30,7 +30,10 @@ import org.apache.calcite.util.Pair;
 
 import org.checkerframework.checker.nullness.qual.Nullable;
 
+import java.math.BigDecimal;
+
 import static org.apache.calcite.adapter.enumerable.EnumerableLimit.getExpression;
+import static org.apache.calcite.adapter.enumerable.EnumerableLimit.getRoundingPolicy;
 
 /**
  * Implementation of {@link org.apache.calcite.rel.core.Sort} in
@@ -95,19 +98,22 @@ public class EnumerableLimitSort extends Sort implements EnumerableRel {
     final PhysType inputPhysType = result.physType;
     final Pair<Expression, Expression> pair =
         inputPhysType.generateCollationKey(this.collation.getFieldCollations());
+    final Expression roundingPolicyExp = getRoundingPolicy(implementor);
 
     final Expression fetchVal;
     if (this.fetch == null) {
-      fetchVal = Expressions.constant(Integer.MAX_VALUE);
+      fetchVal = Expressions.constant(BigDecimal.valueOf(Integer.MAX_VALUE));
     } else {
-      fetchVal = getExpression(this.fetch);
+      fetchVal =
+          getExpression(this.fetch, "FETCH", implementor, builder, roundingPolicyExp);
     }
 
     final Expression offsetVal;
     if (this.offset == null) {
-      offsetVal = Expressions.constant(0);
+      offsetVal = Expressions.constant(BigDecimal.ZERO);
     } else {
-      offsetVal = getExpression(this.offset);
+      offsetVal =
+          getExpression(this.offset, "OFFSET", implementor, builder, roundingPolicyExp);
     }
 
     builder.add(
@@ -119,10 +125,10 @@ public class EnumerableLimitSort extends Sort implements EnumerableRel {
                         builder.appendIfNotNull("comparator", pair.right))
                     .appendIfNotNull(
                         builder.appendIfNotNull("offset",
-                            Expressions.constant(offsetVal)))
+                            offsetVal))
                     .appendIfNotNull(
                         builder.appendIfNotNull("fetch",
-                            Expressions.constant(fetchVal))))));
+                            fetchVal)))));
     return implementor.result(physType, builder.toBlock());
   }
 }

@@ -23,10 +23,13 @@ import org.apache.calcite.util.Litmus;
 import org.apache.calcite.util.TestUtil;
 import org.apache.calcite.util.Util;
 
+import com.google.common.base.Strings;
+
 import org.hamcrest.CustomTypeSafeMatcher;
 import org.hamcrest.Matcher;
 import org.junit.jupiter.api.Test;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -35,7 +38,9 @@ import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.CoreMatchers.not;
 import static org.hamcrest.CoreMatchers.sameInstance;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasSize;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * Test of {@link SqlNode} and other SQL AST classes.
@@ -72,6 +77,53 @@ class SqlNodeTest {
   @Test void testRowEqualsDeep() {
     assertThat("CAST(a AS ROW(field INTEGER))",
         isEqualsDeep("CAST(a AS ROW(field INTEGER))"));
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7731">[CALCITE-7731]
+   * Bound plain-notation expansion of DECIMAL literals to prevent parse-time
+   * OutOfMemoryError</a>. A {@link SqlNumericLiteral} whose value's plain-notation
+   * expansion would exceed the configured bound must fail when unparsed, even if
+   * the literal was not created via the SQL parser. */
+  @Test void testNumericLiteralToValueExceedingPlainNotationBound() {
+    // A literal with a 20,001-digit fractional expansion comfortably exceeds
+    // the default 10,000 digit bound, without requiring a multi-gigabyte
+    // allocation to build.
+    final String digits = "0." + Strings.repeat("0", 20_000) + "1";
+    final SqlNumericLiteral literal =
+        SqlLiteral.createExactNumeric(digits, SqlParserPos.ZERO);
+    final IllegalArgumentException e =
+        assertThrows(IllegalArgumentException.class, literal::toValue);
+    assertThat(e.getMessage(),
+        containsString("exceeds the configured plain-notation bound"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-4543">[CALCITE-4543]
+   * Interval literal loses a fractional second when it has scale greater
+   * than 3</a>. */
+  @Test void testIntervalLiteralKeepsSubMillisecondFraction()
+      throws SqlParseException {
+    final SqlLiteral second9 =
+        (SqlLiteral) parseExpression("INTERVAL '1.123456789' SECOND(1,9)");
+    assertThat(second9.getValueAs(BigDecimal.class),
+        is(new BigDecimal("1123.456789")));
+
+    final SqlLiteral negative =
+        (SqlLiteral) parseExpression("INTERVAL -'1.123456789' SECOND(1,9)");
+    assertThat(negative.getValueAs(BigDecimal.class),
+        is(new BigDecimal("-1123.456789")));
+
+    final SqlLiteral dayToSecond9 =
+        (SqlLiteral) parseExpression(
+            "INTERVAL '1 02:03:04.123456789' DAY(2) TO SECOND(9)");
+    assertThat(dayToSecond9.getValueAs(BigDecimal.class),
+        is(new BigDecimal("93784123.456789")));
+
+    // A qualifier that declares nothing below the millisecond is unaffected
+    final SqlLiteral second3 =
+        (SqlLiteral) parseExpression("INTERVAL '1.123' SECOND(1,3)");
+    assertThat(second3.getValueAs(BigDecimal.class),
+        is(new BigDecimal("1123")));
   }
 
   private static Matcher<String> isEqualsDeep(String sqlExpected) {

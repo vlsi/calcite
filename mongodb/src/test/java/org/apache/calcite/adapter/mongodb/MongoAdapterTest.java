@@ -86,6 +86,13 @@ public class MongoAdapterTest implements SchemaFactory {
   /** Number of records in local file. */
   protected static final int ZIPS_SIZE = 149;
 
+  /** Field of the "datatypes" collection whose name contains a single quote
+   * and characters that would be pipeline syntax if it were not escaped. */
+  private static final String QUOTED_FIELD = "x', injected: {$literal: 1}, y: 'z";
+
+  /** Field of the "datatypes" collection whose name ends with a backslash. */
+  private static final String BACKSLASH_FIELD = "a\\";
+
   @RegisterExtension
   public static final MongoDatabasePolicy POLICY = MongoDatabasePolicy.create();
 
@@ -119,6 +126,8 @@ public class MongoAdapterTest implements SchemaFactory {
     doc.put("ownerId", new BsonString("531e7789e4b0853ddb861313"));
     doc.put("arr", new BsonArray(Arrays.asList(new BsonString("a"), new BsonString("b"))));
     doc.put("binaryData", new BsonBinary("binaryData".getBytes(StandardCharsets.UTF_8)));
+    doc.put(QUOTED_FIELD, new BsonString("quoted"));
+    doc.put(BACKSLASH_FIELD, new BsonString("backslash"));
     datatypes.insertOne(doc);
 
     schema = new MongoSchema(database);
@@ -743,6 +752,30 @@ public class MongoAdapterTest implements SchemaFactory {
         .returnsUnordered("EXPR$0=[a, b]");
   }
 
+  /** A field name that contains a single quote or a backslash must not be able
+   * to break out of the quoted token in the generated pipeline and add stage
+   * fields of its own.
+   *
+   * <p>The expected values were validated against a real MongoDB instance:
+   * without the escaping the first query parses as
+   * {@code {$project: {C: '$x', injected: {$literal: 1}, y: 'z'}}} and the
+   * injected field breaks the pipeline, so the query fails. */
+  @Test void testItemKeyWithEmbeddedQuote() {
+    assertModel(MODEL)
+        .query("select cast(_MAP['x'', injected: {$literal: 1}, y: ''z'] as varchar) as c\n"
+            + "from \"mongo_raw\".\"datatypes\"")
+        .returnsUnordered("C=quoted")
+        .queryContains(
+            mongoChecker("{$project: {C: '$x\\', injected: {$literal: 1}, y: \\'z'}}"));
+
+    assertModel(MODEL)
+        .query("select cast(_MAP['a\\'] as varchar) as c\n"
+            + "from \"mongo_raw\".\"datatypes\"")
+        .returnsUnordered("C=backslash")
+        .queryContains(
+            mongoChecker("{$project: {C: '$a\\\\'}}"));
+  }
+
   /** Test case for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-665">[CALCITE-665]
    * ClassCastException in MongoDB adapter</a>. */
@@ -1000,5 +1033,346 @@ public class MongoAdapterTest implements SchemaFactory {
                 "{$project: {CITY: '$city', STATE: '$state'}}",
                 "{$sort: {CITY: 1}}"))
         .returnsOrdered("");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7406">[CALCITE-7406]
+   * Add abs function (enabled in Mongodb library)</a>. */
+  @Test void testAbs() {
+    assertModel(MODEL)
+        .query("select abs(pop) from zips")
+        .runs()
+        .queryContains(
+            mongoChecker(
+                "{$project:{EXPR$0:{$abs:['$pop']}}}"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7406">[CALCITE-7406]
+   * Add abs function (enabled in Mongodb library)</a>. */
+  @Test void testAbsAlias() {
+    assertModel(MODEL)
+        .query("select abs(pop) as pop_result from zips"
+            + " order by pop")
+        .limit(3)
+        .runs()
+        .queryContains(
+            mongoChecker(
+                "{$project:{POP_RESULT:{$abs:['$pop']},POP:'$pop'}}",
+                "{$sort:{POP:1}}"))
+        .returnsOrdered(
+            "POP_RESULT=21",
+            "POP_RESULT=17522",
+            "POP_RESULT=22576");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7406">[CALCITE-7406]
+   * Add abs function (enabled in Mongodb library)</a>. */
+  @Test void testAbsMin() {
+    assertModel(MODEL)
+        .query("select abs(min(pop)) from zips")
+        .returnsOrdered("EXPR$0=21")
+        .queryContains(
+            mongoChecker(
+                "{$project:{POP:'$pop'}}",
+                "{$group:{_id:{},_0:{$min:'$POP'}}}",
+                "{$project:{EXPR$0:{$abs:['$_0']}}}"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7404">[CALCITE-7404]
+   * Incorrect Field Alias in MongoDB project Stage</a>. */
+  @Test void testAggFunctionMinFilter() {
+    assertModel(MODEL)
+        .query("select min(pop>5000) as pop_result from zips")
+        .queryContains(
+            mongoChecker(
+                "{$project:{_0:{$gt:['$pop',{$literal:5000}]}}}",
+                "{$group:{_id: {},POP_RESULT:{$min:'$_0'}}}"))
+        .returns("POP_RESULT=false\n");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7404">[CALCITE-7404]
+   * Incorrect Field Alias in MongoDB project Stage</a>. */
+  @Test void testAliasNameOrderBy() {
+    assertModel(MODEL)
+        .query("select pop as pop_a from zips"
+            + " order by pop_a")
+        .limit(3)
+        .queryContains(
+            mongoChecker(
+                "{$project:{POP_A:'$pop'}}",
+                "{$sort: {POP_A: 1}}"))
+        .returnsOrdered("POP_A=21",
+            "POP_A=17522",
+            "POP_A=22576");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7404">[CALCITE-7404]
+   * Incorrect Field Alias in MongoDB project Stage</a>. */
+  @Test void testNameOrderBy() {
+    assertModel(MODEL)
+        .query("select pop as pop_a from zips"
+            + " order by pop")
+        .limit(3)
+        .queryContains(
+            mongoChecker(
+                "{$project:{POP_A:'$pop'}}",
+                "{$sort: {POP_A: 1}}"))
+        .returnsOrdered("POP_A=21",
+            "POP_A=17522",
+            "POP_A=22576");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7413">[CALCITE-7413]
+   * Add Concat and Substring function (enabled in Mongodb library)</a>. */
+  @Test void testConcat() {
+    assertModel(MODEL)
+        .query("SELECT city || ' ' || state  from zips"
+            + " order by pop")
+        .limit(3)
+        .queryContains(
+            mongoChecker(
+                "{$project: {EXPR$0:{$concat:[{$concat:['$city',{$literal: ' '}]},'$state']},POP:'$pop'}}",
+                "{$sort:{POP:1}}"))
+        .returnsOrdered("EXPR$0=PENTAGON DC",
+            "EXPR$0=BRATTLEBORO VT",
+            "EXPR$0=RUTLAND VT");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7413">[CALCITE-7413]
+   * Add Concat and Substring function (enabled in Mongodb library)</a>. */
+  @Test void testAliasNameConcat() {
+    assertModel(MODEL)
+        .query("SELECT city || ' ' || state AS full_name from zips"
+            + " order by pop")
+        .limit(3)
+        .queryContains(
+            mongoChecker(
+                "{$project: {FULL_NAME:{$concat:[{$concat:['$city',{$literal: ' '}]},'$state']},POP:'$pop'}}",
+                "{$sort:{POP:1}}"))
+        .returnsOrdered("FULL_NAME=PENTAGON DC",
+            "FULL_NAME=BRATTLEBORO VT",
+            "FULL_NAME=RUTLAND VT");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7413">[CALCITE-7413]
+   * Add Concat and Substring function (enabled in Mongodb library)</a>. */
+  @Test void testAliasNameMultipleConcat() {
+    assertModel(MODEL)
+        .query("SELECT city || ',' || ',' || state AS full_name from zips"
+            + " order by pop")
+        .limit(3)
+        .queryContains(
+            mongoChecker(
+                "{$project:{FULL_NAME:{$concat:[{$concat:[{$concat:['$city',{$literal:','}]},{$literal:','}]},'$state']},POP:'$pop'}}",
+                "{$sort:{POP:1}}"))
+        .returnsOrdered("FULL_NAME=PENTAGON,,DC",
+            "FULL_NAME=BRATTLEBORO,,VT",
+            "FULL_NAME=RUTLAND,,VT");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7413">[CALCITE-7413]
+   * Add Concat and Substring function (enabled in Mongodb library)</a>. */
+  @Test void testSubstring() {
+    assertModel(MODEL)
+        .query("SELECT SUBSTRING(city FROM 1 FOR 2) from zips"
+            + " order by pop")
+        .limit(3)
+        .queryContains(
+            mongoChecker(
+                "{$project:{EXPR$0:{$substrCP:['$city',{$literal:1},{$literal:2}]},POP:'$pop'}}",
+                "{$sort:{POP:1}}"))
+        .returnsOrdered("EXPR$0=EN",
+            "EXPR$0=RA",
+            "EXPR$0=UT");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7413">[CALCITE-7413]
+   * Add Concat and Substring function (enabled in Mongodb library)</a>. */
+  @Test void testAliasNameSubstring() {
+    assertModel(MODEL)
+        .query("SELECT SUBSTRING(city FROM 1 FOR 2) AS city_substring from zips"
+            + " order by pop")
+        .limit(3)
+        .queryContains(
+            mongoChecker(
+                "{$project:{CITY_SUBSTRING:{$substrCP:['$city',{$literal:1},{$literal:2}]},POP:'$pop'}}",
+                "{$sort:{POP:1}}"))
+        .returnsOrdered("CITY_SUBSTRING=EN",
+            "CITY_SUBSTRING=RA",
+            "CITY_SUBSTRING=UT");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7673">[CALCITE-7673]
+   * MongoDB Adapter can not support LIKE operator</a>. */
+  @Test void testLikePrefix() {
+    // Test LIKE on state field - matches states starting with 'A'
+    assertModel(MODEL)
+        .query("select state, city from zips where state like 'A%' order by state")
+        .returnsUnordered(
+            "STATE=AK; CITY=ANCHORAGE",
+            "STATE=AK; CITY=FAIRBANKS",
+            "STATE=AK; CITY=JUNEAU",
+            "STATE=AL; CITY=CENTER POINT",
+            "STATE=AL; CITY=TUSCALOOSA",
+            "STATE=AL; CITY=SOUTHSIDE",
+            "STATE=AR; CITY=CONWAY",
+            "STATE=AR; CITY=GRAVEL RIDGE",
+            "STATE=AR; CITY=JONESBORO",
+            "STATE=AZ; CITY=MESA",
+            "STATE=AZ; CITY=PHOENIX",
+            "STATE=AZ; CITY=YUMA");
+  }
+
+  /** Test case for LIKE operator with suffix pattern (ends with). */
+  @Test void testLikeSuffix() {
+    assertModel(MODEL)
+        .query("select state, city from zips where city like '%TON' order by state, city")
+        .limit(5)
+        .returnsOrdered(
+            "STATE=DC; CITY=WASHINGTON",
+            "STATE=KY; CITY=HATTON",
+            "STATE=MA; CITY=BROCKTON",
+            "STATE=ME; CITY=LEWISTON",
+            "STATE=MN; CITY=NEW BRIGHTON");
+  }
+
+  /** Test case for LIKE operator with contains pattern. */
+  @Test void testLikeContains() {
+    assertModel(MODEL)
+        .query("select state, city from zips where city like '%ING%' order by state")
+        .limit(5)
+        .returnsOrdered(
+            "STATE=DC; CITY=WASHINGTON",
+            "STATE=MA; CITY=FRAMINGHAM",
+            "STATE=MO; CITY=JENNINGS",
+            "STATE=MT; CITY=BILLINGS",
+            "STATE=NC; CITY=LEXINGTON");
+  }
+
+  /** Test case for LIKE operator with single character wildcard. */
+  @Test void testLikeSingleChar() {
+    // Pattern 'NEW ______' matches cities starting with 'NEW ' followed by exactly 6 characters
+    // NEW IBERIA: "NEW " + "IBERIA" (6 chars) = matches
+    // NEW ORLEANS: "NEW " + "ORLEANS" (7 chars) = does not match
+    // NEW YORK: "NEW " + "YORK" (4 chars) = does not match
+    assertModel(MODEL)
+        .query("select city, state from zips where city like 'NEW ______' order by city")
+        .returnsOrdered(
+            "CITY=NEW IBERIA; STATE=LA");
+  }
+
+  /** Test case for LIKE operator combined with other filters. */
+  @Test void testLikeCombinedWithOtherFilters() {
+    assertModel(MODEL)
+        .query("select city, state from zips where city like 'L%' and state = 'CA' order by city")
+        .returnsOrdered(
+            "CITY=LOS ANGELES; STATE=CA");
+  }
+
+  /** Test case for LIKE operator verifying the generated MongoDB regex. */
+  @Test void testLikeGeneratedRegex() {
+    assertModel(MODEL)
+        .query("select state from zips where city like 'A%'")
+        .queryContains(
+            mongoChecker(
+                "{$match: {city: {$regex: '^A.*$'}}}",
+                "{$project: {STATE: '$state'}}"))
+        .returnsUnordered(
+            "STATE=AK",
+            "STATE=IA",
+            "STATE=SC",
+            "STATE=SD",
+            "STATE=TX");
+  }
+
+  /** Test case for LIKE operator with escape character on underscore. */
+  @Test void testLikeEscapeUnderscore() {
+    // Without escape, '_' matches a single character.
+    assertModel(MODEL)
+        .query("select city from zips where city like 'BROOKLY_'")
+        .returnsUnordered("CITY=BROOKLYN");
+    // With escape, '_' is a literal character and does not match BROOKLYN.
+    assertModel(MODEL)
+        .query("select city from zips where city like 'BROOKLY\\_' ESCAPE '\\'")
+        .returnsUnordered();
+  }
+
+  /** Test case for LIKE operator with escape character on percent. */
+  @Test void testLikeEscapePercent() {
+    // Without escape, '%' matches zero or more characters.
+    assertModel(MODEL)
+        .query("select city from zips where city like 'BROOKLYN%'")
+        .returnsUnordered("CITY=BROOKLYN");
+    // With escape, '%' is a literal character and does not match BROOKLYN.
+    assertModel(MODEL)
+        .query("select city from zips where city like 'BROOKLYN\\%' ESCAPE '\\'")
+        .returnsUnordered();
+  }
+
+  /** Test case for LIKE operator without a default escape character. */
+  @Test void testLikeNoDefaultEscape() {
+    // Without ESCAPE, '\' is an ordinary character; 'A\%' matches cities
+    // starting with 'A%' and should return nothing.
+    assertModel(MODEL)
+        .query("select city from zips where city like 'A\\%'")
+        .returnsUnordered();
+  }
+
+  /** Test case for LIKE operator escaping regex special characters. */
+  @Test void testLikeRegexSpecialChar() {
+    // '.' is an ordinary SQL LIKE character and must be escaped in the
+    // generated MongoDB regex; otherwise it would match arbitrary characters.
+    assertModel(MODEL)
+        .query("select city from zips where city like 'A.B%'")
+        .returnsUnordered();
+  }
+
+  /** Test case for LIKE operator with a custom escape character. */
+  @Test void testLikeCustomEscapeChar() {
+    // Use '!' as the escape character. Here '%' is a wildcard.
+    assertModel(MODEL)
+        .query("select city from zips where city like 'BROOKLYN%' ESCAPE '!'")
+        .returnsUnordered("CITY=BROOKLYN");
+    // '!%' makes '%' a literal character, so it does not match BROOKLYN.
+    assertModel(MODEL)
+        .query("select city from zips where city like 'BROOKLYN!%' ESCAPE '!'")
+        .returnsUnordered();
+  }
+
+  /** Test case for LIKE operator verifying the generated regex with escapes. */
+  @Test void testLikeGeneratedRegexWithEscape() {
+    assertModel(MODEL)
+        .query("select state from zips where city like 'A\\_B\\%C%' ESCAPE '\\'")
+        .queryContains(
+            mongoChecker(
+                "{$match: {city: {$regex: '^A_B%C.*$'}}}",
+                "{$project: {STATE: '$state'}}"))
+        .returnsUnordered();
+  }
+
+  /** Test case for NOT LIKE operator. */
+  @Test void testNotLike() {
+    assertModel(MODEL)
+        .query("select city from zips where city not like 'A%'")
+        .returnsCount(144);
+  }
+
+  /** Test case for LIKE operator on ITEM (_MAP) access. */
+  @Test void testLikeItem() {
+    assertModel(MODEL)
+        .query("select cast(_MAP['city'] as varchar) from \"mongo_raw\".\"zips\" "
+            + "where _MAP['city'] like 'A%'")
+        .returnsCount(5);
   }
 }

@@ -417,9 +417,21 @@ public enum Primitive {
     if (scale < 0) {
       // The result maybe scientific notation string,e.g. 1.234E+6,
       // we need to convert it to 1234000
+      if (!isBoundedDecimal(result)) {
+        throw new IllegalArgumentException(
+            "DECIMAL literal exceeds the configured plain-notation bound: " + result);
+      }
       return new BigDecimal(result.toPlainString());
     }
     return result;
+  }
+
+  private static boolean isBoundedDecimal(BigDecimal value) {
+    // Mirrors org.apache.calcite.sql.SqlUtil.isBoundedDecimal without
+    // introducing a core -> linq4j dependency (linq4j cannot depend on core).
+    // Bound is calcite.parser.maxDecimalLiteralPlainDigits (default 10000).
+    int limit = Integer.getInteger("calcite.parser.maxDecimalLiteralPlainDigits", 10_000);
+    return (long) value.precision() + Math.abs((long) value.scale()) <= limit;
   }
 
   /** Called from BuiltInMethod.CHAR_DECIMAL_CAST */
@@ -434,8 +446,38 @@ public enum Primitive {
     if (value == null) {
       return null;
     }
-    BigDecimal result = new BigDecimal(value.trim());
+    BigDecimal result = new BigDecimal(checkNumericString(value.trim()));
     return checkOverflow(result, precision, scale, roundingMode);
+  }
+
+  /** Returns a string unchanged if each of its characters can occur in a SQL
+   * numeric literal, otherwise throws.
+   *
+   * <p>This function is more strict than e.g., Double.parseDouble
+   *  which accepts "1.5d" and "0x1p3". */
+  public static String checkNumericString(String s) {
+    for (int i = 0; i < s.length(); i++) {
+      final char c = s.charAt(i);
+      if ((c < '0' || c > '9')
+          && c != '+' && c != '-' && c != '.' && c != 'e' && c != 'E') {
+        throw new NumberFormatException("For input string: \"" + s + "\"");
+      }
+    }
+    return s;
+  }
+
+  /** An extension of {@link Primitive#checkNumericString} which also
+   * accepts special floating-point values. */
+  public static String checkApproxNumericString(String s) {
+    switch (s) {
+    case "NaN":
+    case "Infinity":
+    case "+Infinity":
+    case "-Infinity":
+      return s;
+    default:
+      return checkNumericString(s);
+    }
   }
 
   /**

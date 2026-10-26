@@ -18,6 +18,12 @@ package org.apache.calcite.sql.dialect;
 
 import org.apache.calcite.avatica.util.TimeUnitRange;
 import org.apache.calcite.config.NullCollation;
+import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.core.Correlate;
+import org.apache.calcite.rel.core.Filter;
+import org.apache.calcite.rel.core.Join;
+import org.apache.calcite.rel.core.Project;
+import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeSystem;
 import org.apache.calcite.rel.type.RelDataTypeSystemImpl;
@@ -33,6 +39,7 @@ import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlTimeLiteral;
 import org.apache.calcite.sql.SqlTimestampLiteral;
 import org.apache.calcite.sql.SqlWriter;
+import org.apache.calcite.sql.fun.SqlLibraryOperators;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.SqlTypeName;
@@ -69,10 +76,6 @@ public class ClickHouseSqlDialect extends SqlDialect {
             return super.getMaxScale(typeName);
           }
         }
-
-        @Override public int getMaxNumericScale() {
-          return getMaxScale(SqlTypeName.DECIMAL);
-        }
       };
 
   public static final SqlDialect.Context DEFAULT_CONTEXT = SqlDialect.EMPTY_CONTEXT
@@ -94,6 +97,24 @@ public class ClickHouseSqlDialect extends SqlDialect {
 
   @Override public boolean supportsCharSet() {
     return false;
+  }
+
+  @Override public void quoteStringLiteral(StringBuilder buf,
+      @Nullable String charsetName, String val) {
+    // ClickHouse treats backslash as an escape character inside string
+    // literals, so a literal backslash must be doubled before the base method
+    // escapes the enclosing quote. Otherwise a value ending in a backslash
+    // terminates the literal early and the trailing text is parsed as SQL
+    // rather than data.
+    super.quoteStringLiteral(buf, charsetName, escapeBackslash(val));
+  }
+
+  @Override public StringBuilder quoteIdentifier(StringBuilder buf, String val) {
+    // ClickHouse applies the same backslash escape sequences inside
+    // back-tick-quoted identifiers as inside string literals, so a backslash
+    // in an identifier must be doubled or it would escape the closing
+    // back-tick and shift the identifier boundary.
+    return super.quoteIdentifier(buf, escapeBackslash(val));
   }
 
   @Override public boolean supportsNestedAggregations() {
@@ -226,6 +247,20 @@ public class ClickHouseSqlDialect extends SqlDialect {
       return;
     }
 
+    // refer to https://clickhouse.com/docs/sql-reference/functions/url-functions#encodeURLComponent
+    if (call.getOperator() == SqlLibraryOperators.URL_ENCODE) {
+      RelToSqlConverterUtil.specialOperatorByName("encodeURLComponent")
+          .unparse(writer, call, 0, 0);
+      return;
+    }
+
+    // refer to https://clickhouse.com/docs/sql-reference/functions/url-functions#decodeURLComponent
+    if (call.getOperator() == SqlLibraryOperators.URL_DECODE) {
+      RelToSqlConverterUtil.specialOperatorByName("decodeURLComponent")
+          .unparse(writer, call, 0, 0);
+      return;
+    }
+
     switch (call.getKind()) {
     case MAP_VALUE_CONSTRUCTOR:
       writer.print(call.getOperator().getName().toLowerCase(Locale.ROOT));
@@ -244,6 +279,18 @@ public class ClickHouseSqlDialect extends SqlDialect {
         operand.unparse(writer, leftPrec, rightPrec);
       }
       writer.endList(arrayFrame);
+      break;
+    case POSITION:
+      final SqlWriter.Frame f = writer.startFunCall("POSITION");
+      writer.sep(",");
+      call.operand(1).unparse(writer, leftPrec, rightPrec);
+      writer.sep(",");
+      call.operand(0).unparse(writer, leftPrec, rightPrec);
+      if (call.operandCount() == 3) {
+        writer.sep(",");
+        call.operand(2).unparse(writer, leftPrec, rightPrec);
+      }
+      writer.endFunCall(f);
       break;
     case FLOOR:
       if (call.operandCount() != 2) {
@@ -392,4 +439,51 @@ public class ClickHouseSqlDialect extends SqlDialect {
     call.operand(0).unparse(writer, 0, 0);
     writer.endList(frame);
   }
+
+  @Override public boolean shouldWrapNestedJoin(RelNode rel) {
+    if (!(rel instanceof Join)) {
+      return false;
+    }
+    Join join = (Join) rel;
+
+    // ClickHouse requires wrapping the right-side input if it's a JOIN
+    // to ensure that internal table qualifiers are flattened into explicit aliases.
+    // This solves the Code 47 UNKNOWN_IDENTIFIER error.
+    RelNode right = join.getRight();
+
+    // If the right side is a Join or a Project containing a Join, it needs aliasing protection
+    return right instanceof Join || containsJoinRecursive(right);
+  }
+
+  /**
+   * Checks whether the given RelNode contains a JOIN that is directly exposed
+   * to the outer scope, which could lead to "Unknown Identifier" errors in ClickHouse.
+   *
+   * <p>ClickHouse (v25.x+) has strict scoping rules: when a JOIN appears on the
+   * right side of another JOIN, internal table qualifiers (e.g., 'd2.loc') are
+   * stripped and become invisible to the outer query unless they are explicitly
+   * aliased within a subquery.
+   *
+   * <p>We only check for JOINs wrapped by transparent single-input operators
+   * (Project, Filter, Sort) because these operators are typically collapsed
+   * into the same SELECT block, exposing the problematic JOIN structure to
+   * the outer boundary.
+   */
+  private static boolean containsJoinRecursive(RelNode rel) {
+    if (rel instanceof Join || rel instanceof Correlate) {
+      return true;
+    }
+
+    // Look through transparent single-input operators.
+    // We exclude Aggregate here because it naturally triggers a subquery
+    // boundary in RelToSqlConverter, which already provides the necessary isolation.
+    if (rel instanceof Project
+        || rel instanceof Filter
+        || rel instanceof Sort) {
+      return rel.getInputs().size() == 1 && containsJoinRecursive(rel.getInput(0));
+    }
+
+    return false;
+  }
+
 }

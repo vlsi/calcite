@@ -21,14 +21,11 @@ import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlLambda;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.type.SqlTypeName;
-import org.apache.calcite.util.Litmus;
 
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 import java.util.HashMap;
 import java.util.Map;
-
-import static com.google.common.base.Preconditions.checkArgument;
 
 import static org.apache.calcite.util.Static.RESOURCE;
 
@@ -54,7 +51,10 @@ public class SqlLambdaScope extends ListScope {
 
   /** True if the identifier matches one of the parameter names. */
   public boolean isParameter(SqlIdentifier id) {
-    return this.parameterTypes.containsKey(id.toString());
+    final SqlNameMatcher nameMatcher = validator.catalogReader.nameMatcher();
+    final String name = id.getSimple();
+    return parameterTypes.keySet().stream()
+        .anyMatch(paramName -> nameMatcher.matches(paramName, name));
   }
 
   @Override public SqlNode getNode() {
@@ -62,21 +62,36 @@ public class SqlLambdaScope extends ListScope {
   }
 
   @Override public SqlQualified fullyQualify(SqlIdentifier identifier) {
+    final SqlNameMatcher nameMatcher = validator.catalogReader.nameMatcher();
+    final String name = identifier.names.get(0);
     boolean found = lambdaExpr.getParameters()
         .stream()
-        .anyMatch(param -> param.equalsDeep(identifier, Litmus.IGNORE));
+        .anyMatch(param ->
+            nameMatcher.matches(((SqlIdentifier) param).getSimple(), name));
     if (found) {
+      // If the first component names a parameter, in a compound identifier
+      // such as 'x.name' the remaining components are fields of the
+      // parameter's struct.
       return SqlQualified.create(this, 1, null, identifier);
-    } else {
-      throw validator.newValidationError(identifier,
-          RESOURCE.paramNotFoundInLambdaExpression(identifier.toString(), lambdaExpr.toString()));
     }
+    if (!validator.config().conformance().allowLambdaClosure()) {
+      throw validator.newValidationError(identifier,
+          RESOURCE.lambdaClosureNotAllowed(identifier.toString()));
+    }
+    return parent.fullyQualify(identifier);
   }
 
   @Override public @Nullable RelDataType resolveColumn(String columnName, SqlNode ctx) {
-    checkArgument(parameterTypes.containsKey(columnName),
-        "column %s not found", columnName);
-    return parameterTypes.get(columnName);
+    final SqlNameMatcher nameMatcher = validator.catalogReader.nameMatcher();
+    for (Map.Entry<String, RelDataType> entry : parameterTypes.entrySet()) {
+      if (nameMatcher.matches(entry.getKey(), columnName)) {
+        return entry.getValue();
+      }
+    }
+    // Delegate to parent scope for nested lambda closure resolution.
+    // In a nested lambda like x -> EXISTS(arr, y -> x + y), the inner lambda
+    // scope does not contain 'x', but the outer lambda scope does.
+    return parent.resolveColumn(columnName, ctx);
   }
 
   public Map<String, RelDataType> getParameterTypes() {

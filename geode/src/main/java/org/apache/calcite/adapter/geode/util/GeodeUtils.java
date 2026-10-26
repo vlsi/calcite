@@ -17,12 +17,12 @@
 package org.apache.calcite.adapter.geode.util;
 
 import org.apache.calcite.avatica.util.DateTimeUtils;
+import org.apache.calcite.config.CalciteSystemProperty;
 import org.apache.calcite.linq4j.tree.Primitive;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.util.Util;
 
-import org.apache.commons.lang3.Strings;
 import org.apache.geode.cache.CacheClosedException;
 import org.apache.geode.cache.GemFireCache;
 import org.apache.geode.cache.Region;
@@ -46,6 +46,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 
 import static java.util.Objects.requireNonNull;
 
@@ -69,6 +70,26 @@ public class GeodeUtils {
   private GeodeUtils() {
   }
 
+  /** Checks whether the {@code pdxSerializablePackagePath} schema operand is enabled.
+   *
+   * <p>The operand configures Geode's {@link ReflectionBasedAutoSerializer}. It is disabled by
+   * default; deployments that need it can opt back in by setting the system property
+   * {@code calcite.geode.pdxSerializablePackagePath.allowed} to {@code "true"}.
+   *
+   * @param pdxSerializablePackagePath operand value, or null if not set
+   * @see CalciteSystemProperty#GEODE_PDX_PACKAGE_PATH_ALLOWED
+   */
+  public static void checkPdxPackagePathOperand(
+      @Nullable String pdxSerializablePackagePath) {
+    if (pdxSerializablePackagePath == null
+        || CalciteSystemProperty.GEODE_PDX_PACKAGE_PATH_ALLOWED.value()) {
+      return;
+    }
+    throw new IllegalStateException("Operand 'pdxSerializablePackagePath'"
+        + " is disabled by default; set system property"
+        + " 'calcite.geode.pdxSerializablePackagePath.allowed' to 'true' to enable it");
+  }
+
   /**
    * Creates a Geode client instance connected to locator and configured to
    * support PDX instances.
@@ -84,7 +105,7 @@ public class GeodeUtils {
       int locatorPort, String autoSerializerPackagePath,
       boolean readSerialized) {
     if (locatorPort != currentLocatorPort
-        || !Strings.CI.equals(currentLocatorHost, locatorHost)) {
+        || !equalsIgnoreCase(currentLocatorHost, locatorHost)) {
       LOGGER.info("Close existing ClientCache ["
           + currentLocatorHost + ":" + currentLocatorPort + "] for new Locator connection at: ["
           + locatorHost + ":" + locatorPort + "]");
@@ -115,6 +136,10 @@ public class GeodeUtils {
       // Do nothing if there is no existing instance
     }
     REGION_MAP.clear();
+  }
+
+  private static boolean equalsIgnoreCase(@Nullable String a, @Nullable String b) {
+    return a == null ? b == null : b != null && a.equalsIgnoreCase(b);
   }
 
   /**
@@ -312,6 +337,37 @@ public class GeodeUtils {
 
     final Object entry = region.get(iter.next());
     return createRelDataType(entry);
+  }
+
+  /**
+   * OQL has no way to escape identifiers, so an identifier that is copied
+   * verbatim into the generated query must be a simple alphanumeric name (with
+   * optional dotted path or bracketed integer subscript for nested access).
+   * Anything else could shift the boundaries of the emitted statement.
+   */
+  private static final Pattern SAFE_OQL_IDENTIFIER =
+      Pattern.compile(
+          "[A-Za-z_$][A-Za-z0-9_$]*+(?:\\.[A-Za-z_$][A-Za-z0-9_$]*+|\\[[0-9]++\\])*+");
+
+  /**
+   * Returns whether {@code name} may be emitted verbatim as an OQL identifier
+   * (a field name, alias, or dotted path). Since OQL provides no way to quote
+   * an identifier, callers should refuse to push down when this returns false.
+   */
+  public static boolean isSafeOqlIdentifier(String name) {
+    return name != null && SAFE_OQL_IDENTIFIER.matcher(name).matches();
+  }
+
+  /**
+   * Validates that {@code name} may be emitted verbatim into a generated OQL
+   * statement, throwing a {@link RuntimeException} otherwise.
+   */
+  public static String checkSafeOqlIdentifier(String name) {
+    if (!isSafeOqlIdentifier(name)) {
+      throw new RuntimeException(
+          "Cannot push down expression: not a simple OQL identifier: " + name);
+    }
+    return name;
   }
 
   // Create Relational Type by inferring a Geode entry or response instance.

@@ -61,9 +61,22 @@ public class EnumerableRules {
       EnumerableMergeJoinRule.DEFAULT_CONFIG
           .toRule(EnumerableMergeJoinRule.class);
 
+  /** Rule that converts a compatible
+   * {@link org.apache.calcite.rel.logical.LogicalJoin} to an
+   * {@link EnumerableIEJoin}. */
+  public static final RelOptRule ENUMERABLE_IE_JOIN_RULE =
+      EnumerableIEJoinRule.DEFAULT_CONFIG.toRule(EnumerableIEJoinRule.class);
+
   public static final RelOptRule ENUMERABLE_CORRELATE_RULE =
       EnumerableCorrelateRule.DEFAULT_CONFIG
           .toRule(EnumerableCorrelateRule.class);
+
+  /** Rule that converts a
+   * {@link org.apache.calcite.rel.logical.LogicalConditionalCorrelate} to
+   * {@link EnumerableConvention enumerable calling convention}. */
+  public static final RelOptRule ENUMERABLE_CONDITIONAL_CORRELATE_RULE =
+      EnumerableConditionalCorrelateRule.DEFAULT_CONFIG
+          .toRule(EnumerableConditionalCorrelateRule.class);
 
   /** Rule that converts a
    * {@link org.apache.calcite.rel.logical.LogicalJoin} into an
@@ -102,6 +115,11 @@ public class EnumerableRules {
    * to an {@link EnumerableUnion}. */
   public static final EnumerableUnionRule ENUMERABLE_UNION_RULE =
       EnumerableUnionRule.DEFAULT_CONFIG.toRule(EnumerableUnionRule.class);
+
+  /** Rule that converts a {@link org.apache.calcite.rel.core.Combine}
+   * to an {@link EnumerableCombine}. */
+  public static final EnumerableCombineRule ENUMERABLE_COMBINE_RULE =
+      EnumerableCombineRule.DEFAULT_CONFIG.toRule(EnumerableCombineRule.class);
 
   /** Rule that converts a {@link LogicalRepeatUnion} into an
    * {@link EnumerableRepeatUnion}. */
@@ -213,7 +231,9 @@ public class EnumerableRules {
       ImmutableList.of(EnumerableRules.ENUMERABLE_JOIN_RULE,
           EnumerableRules.ENUMERABLE_ASOFJOIN_RULE,
           EnumerableRules.ENUMERABLE_MERGE_JOIN_RULE,
+          EnumerableRules.ENUMERABLE_IE_JOIN_RULE,
           EnumerableRules.ENUMERABLE_CORRELATE_RULE,
+          EnumerableRules.ENUMERABLE_CONDITIONAL_CORRELATE_RULE,
           EnumerableRules.ENUMERABLE_PROJECT_RULE,
           EnumerableRules.ENUMERABLE_FILTER_RULE,
           EnumerableRules.ENUMERABLE_CALC_RULE,
@@ -224,6 +244,7 @@ public class EnumerableRules {
           EnumerableRules.ENUMERABLE_UNCOLLECT_RULE,
           EnumerableRules.ENUMERABLE_MERGE_UNION_RULE,
           EnumerableRules.ENUMERABLE_UNION_RULE,
+          EnumerableRules.ENUMERABLE_COMBINE_RULE,
           EnumerableRules.ENUMERABLE_REPEAT_UNION_RULE,
           EnumerableRules.ENUMERABLE_TABLE_SPOOL_RULE,
           EnumerableRules.ENUMERABLE_INTERSECT_RULE,

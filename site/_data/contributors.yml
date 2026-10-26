@@ -17,10 +17,14 @@
 
 # Database of contributors to Apache Calcite.
 # Pages such as developer.md use this data.
+#
 # List must be sorted by first name, last name.
+# The following directive tells LintTest to check:
+# // lint: sort where ' name:' erase '^.*name:'
 #
 - name: Alan Gates
-  emeritus: 2018/05/04
+  status: emeritus
+  status_date: 2018/05/04
   apacheId: gates
   githubId: alanfgates
   org: Hortonworks
@@ -141,10 +145,13 @@
   org: Tencent
   role: Committer
 - name: Istvan Toth
+  status: deceased
+  status_date: 2026/04/03
+  status_url: https://calcite.apache.org/avatica/news/2026/05/12/release-1.28.0/
   apacheId: stoty
   githubId: stoty
   org: Cloudera
-  role: Committer
+  role: PMC
 - name: Jacques Nadeau
   apacheId: jacques
   githubId: jacques-n
@@ -249,7 +256,8 @@
   apacheId: mbudiu
   githubId: mihaibudiu
   org: Feldera.com
-  role: PMC
+  role: PMC Chair
+  homepage: https://mihaibudiu.github.io/work/index.html
 - name: Milinda Pathirage
   apacheId: milinda
   githubId: milinda
@@ -284,15 +292,15 @@
   role: Committer
 - name: Ran Tao
   apacheId: taoran
-  githubId: chucheng92
+  githubId: taoran92
   pronouns: he/him
   org: ByteDance
   role: Committer
 - name: Ruben Quesada Lopez
   apacheId: rubenql
   githubId: rubenada
-  org: Voltron Data
-  role: PMC Chair
+  org: Cloudera
+  role: PMC
 - name: Rui Wang
   apacheId: amaliujia
   githubId: amaliujia
@@ -307,12 +315,17 @@
 - name: Sergey Nuyanzin
   apacheId: snuyanzin
   githubId: snuyanzin
-  org: EPAM
-  role: Committer
+  org: Confluent
+  role: PMC
 - name: Shuyi Chen
   apacheId: shuyichen
   githubId: suez1224
   org: Uber
+  role: Committer
+- name: Silun Dong
+  apacheId: silun
+  githubId: silundong
+  org:
   role: Committer
 - name: Slim Bouguerra
   apacheId: bslim
@@ -325,7 +338,7 @@
   pronouns: he/him
   org: Cloudera
   role: PMC
-  homepage: https://people.apache.org/~zabetak/
+  homepage: https://zabetak.github.io/
 - name: Steven Noels
   apacheId: stevenn
   githubId: stevenn
@@ -342,6 +355,12 @@
   githubId: tdunning
   org: MapR
   role: PMC
+- name: Thomas Rebele
+  apacheId: thomasrebele
+  githubId: thomasrebele
+  pronouns: he/him
+  org: Cloudera
+  role: Committer
 - name: TJ Banghart
   apacheId: tjbanghart
   githubId: tjbanghart
@@ -373,6 +392,16 @@
   githubId: yanlin-Lynn
   org: Ant Financial
   role: Committer
+- name: Weihua Zhang
+  apacheId: zwh
+  githubId: iwanttobepowerful
+  org: Tencent
+  role: Committer
+- name: Weiqing Zhou
+  apacheId: zwq
+  githubId: zzwqqq
+  org:
+  role: Committer
 - name: Xiong Duan
   apacheId: xiong
   githubId: NobiGo
@@ -384,6 +413,11 @@
   githubId: liuyongvs
   pronouns: he/him
   org: Ant Financial
+  role: Committer
+- name: Yu Xu
+  apacheId: xuzifu666
+  githubId: xuzifu666
+  org:
   role: Committer
 - name: Zhaohui Xu
   apacheId: zhaohui
@@ -400,7 +434,7 @@
   apacheId: zhenchen
   githubId: xiedeyantu
   org:
-  role: Committer
+  role: PMC
 - name: Zhen Wang
   apacheId: zhenw
   githubId: zinking

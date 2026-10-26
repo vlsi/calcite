@@ -33,6 +33,7 @@ import com.google.common.collect.Multimap;
 
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import java.net.URL;
@@ -3464,6 +3465,7 @@ public class DruidAdapterIT {
         .returnsUnordered("EXPR$0=86829");
   }
 
+  @Disabled("CALCITE-7271")
   @Test void testComplexExpressionsIsNull() {
     final String sql = "SELECT COUNT(*) FROM \"foodmart\"  where ( cast(null as INTEGER) + cast"
         + "(\"city\" as INTEGER)) IS NULL";
@@ -4375,8 +4377,8 @@ public class DruidAdapterIT {
     CalciteAssert.AssertQuery q = sql(sql, FOODMART)
         .explainContains("PLAN=EnumerableInterpreter\n"
             + "  DruidQuery(table=[[foodmart, foodmart]], intervals=[[1900-01-09T00:00:00.000Z/"
-            + "2992-01-10T00:00:00.000Z]], filter=[>($1, '10')], projects=[[$1, $90]], groups=[{0}],"
-            + " aggs=[[SUM($1)]], filter=[>($1, 220.0E0)], sort0=[0], dir0=[ASC], fetch=[2])\n")
+            + "2992-01-10T00:00:00.000Z]], filter=[>($1, '10')], groups=[{1}],"
+            + " aggs=[[SUM($90)]], filter=[>($1, 220.0E0)], sort0=[0], dir0=[ASC], fetch=[2])\n")
         .queryContains(
             new DruidChecker("{'queryType':'groupBy','dataSource':'foodmart','granularity':'all'"));
     q.returnsOrdered("P=100; S=343.2", "P=1000; S=532.62");

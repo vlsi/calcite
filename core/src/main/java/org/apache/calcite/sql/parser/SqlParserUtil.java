@@ -21,6 +21,7 @@ import org.apache.calcite.avatica.util.DateTimeUtils;
 import org.apache.calcite.config.CalciteSystemProperty;
 import org.apache.calcite.rel.type.RelDataTypeSystem;
 import org.apache.calcite.runtime.CalciteContextException;
+import org.apache.calcite.runtime.SqlFunctions;
 import org.apache.calcite.sql.SqlBinaryOperator;
 import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlDateLiteral;
@@ -65,6 +66,8 @@ import java.math.BigInteger;
 import java.nio.charset.Charset;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
+import java.time.DateTimeException;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.IllformedLocaleException;
@@ -335,15 +338,18 @@ public final class SqlParserUtil {
   }
 
   public static SqlNumericLiteral parseDecimalLiteral(String s, SqlParserPos pos) {
+    final BigDecimal value;
     try {
-      // The s maybe scientific notation string,e.g. 1.2E-3,
-      // we need to convert it to 0.0012
-      s = new BigDecimal(s).toPlainString();
+      value = new BigDecimal(s);
     } catch (NumberFormatException e) {
       throw SqlUtil.newContextException(pos,
           RESOURCE.invalidLiteral(s, "DECIMAL"));
     }
-    return SqlLiteral.createExactNumeric(s, pos);
+    if (!SqlUtil.isBoundedDecimal(value)) {
+      throw SqlUtil.newContextException(pos,
+          RESOURCE.invalidLiteral(s, "DECIMAL"));
+    }
+    return SqlLiteral.createExactNumeric(value.toPlainString(), pos);
   }
 
   public static SqlTimeLiteral parseTimeLiteral(String s, SqlParserPos pos) {
@@ -369,16 +375,24 @@ public final class SqlParserUtil {
       final String timeZone = s.substring(lastSpace + 1);
       final String time = s.substring(0, lastSpace);
 
-      final TimeZone tz = TimeZone.getTimeZone(timeZone);
-      if (tz != null) {
+      try {
+        ZoneId zoneId = ZoneId.of(timeZone);
+        TimeZone tz = TimeZone.getTimeZone(zoneId);
         pt =
             DateTimeUtils.parsePrecisionDateTimeLiteral(time, Format.get().time, tz, -1);
+      } catch (DateTimeException e) {
+        String message = e.getMessage();
+        if (message == null) {
+          message = "Error parsing TIME ZONE";
+        }
+        throw SqlUtil.newContextException(pos,
+            RESOURCE.illegalLiteral("TIME WITH TIME ZONE", s, message));
       }
     }
     if (pt == null) {
       throw SqlUtil.newContextException(pos,
           RESOURCE.illegalLiteral("TIME WITH TIME ZONE", s,
-              RESOURCE.badFormat(DateTimeUtils.TIME_FORMAT_STRING).str()));
+              RESOURCE.badFormat(DateTimeUtils.TIME_FORMAT_STRING + " zone").str()));
     }
     final TimeWithTimeZoneString t = TimeWithTimeZoneString.fromCalendarFields(pt.getCalendar())
         .withFraction(pt.getFraction());
@@ -397,27 +411,40 @@ public final class SqlParserUtil {
   }
 
   public static SqlUuidLiteral parseUuidLiteral(String s, SqlParserPos pos) {
-    UUID uuid = UUID.fromString(s);
+    UUID uuid = SqlFunctions.stringToUuid(s);
     return SqlLiteral.createUuid(uuid, pos);
   }
 
   public static SqlTimestampTzLiteral parseTimestampTzLiteral(
       String s, SqlParserPos pos) {
-    // We expect the string to end in a timezone.
-    int lastSpace = s.lastIndexOf(" ");
-    if (lastSpace >= 0) {
+    // We expect the string to to contain exactly two spaces:
+    // - one between date and time
+    // - one between time and timezone
+    long spaces = s.chars().filter(c -> c == ' ').count();
+    if (spaces == 2) {
+      int lastSpace = s.lastIndexOf(" ");
       final String timeZone = s.substring(lastSpace + 1);
       final String timestamp = s.substring(0, lastSpace);
-      TimeZone tz = TimeZone.getTimeZone(timeZone);
-      if (tz != null) {
-        SqlTimestampLiteral ts = parseTimestampLiteral(SqlTypeName.TIMESTAMP, timestamp, pos);
-        TimestampWithTimeZoneString tsz = new TimestampWithTimeZoneString(ts.getTimestamp(), tz);
-        return SqlLiteral.createTimestamp(tsz, ts.getPrec(), pos);
+      try {
+        ZoneId zoneId = ZoneId.of(timeZone);
+        TimeZone tz = TimeZone.getTimeZone(zoneId);
+        if (tz != null) {
+          SqlTimestampLiteral ts = parseTimestampLiteral(SqlTypeName.TIMESTAMP, timestamp, pos);
+          TimestampWithTimeZoneString tsz = new TimestampWithTimeZoneString(ts.getTimestamp(), tz);
+          return SqlLiteral.createTimestamp(tsz, ts.getPrec(), pos);
+        }
+      } catch (DateTimeException e) {
+        String message = e.getMessage();
+        if (message == null) {
+          message = "Error parsing TIME ZONE";
+        }
+        throw SqlUtil.newContextException(pos,
+            RESOURCE.illegalLiteral("TIMESTAMP WITH TIME ZONE", s, message));
       }
     }
     throw SqlUtil.newContextException(pos,
         RESOURCE.illegalLiteral("TIMESTAMP WITH TIME ZONE", s,
-            RESOURCE.badFormat(DateTimeUtils.TIMESTAMP_FORMAT_STRING).str()));
+            RESOURCE.badFormat(DateTimeUtils.TIMESTAMP_FORMAT_STRING + " zone").str()));
   }
 
   private static SqlTimestampLiteral parseTimestampLiteral(SqlTypeName typeName,
@@ -500,17 +527,56 @@ public final class SqlParserUtil {
   public static long intervalToMillis(
       String literal,
       SqlIntervalQualifier intervalQualifier) {
+    final int[] ret = evaluateDayTimeLiteral(literal, intervalQualifier);
+    return ret[0] * dayTimeToMillis(ret);
+  }
+
+  /**
+   * Converts the interval value into a millisecond representation that keeps
+   * the digits below the millisecond.
+   *
+   * <p>{@link #intervalToMillis(SqlIntervalLiteral.IntervalValue)} rounds
+   * towards zero, so a literal whose qualifier declares a fractional second
+   * precision greater than 3 loses the digits it was allowed to declare. This
+   * method reports them.
+   *
+   * @param interval Interval
+   * @return a value that represents the millisecond equivalent of the
+   * interval value, with a fraction if the literal has one
+   */
+  public static BigDecimal intervalToExactMillis(
+      SqlIntervalLiteral.IntervalValue interval) {
+    return intervalToExactMillis(
+        interval.getIntervalLiteral(),
+        interval.getIntervalQualifier());
+  }
+
+  public static BigDecimal intervalToExactMillis(
+      String literal,
+      SqlIntervalQualifier intervalQualifier) {
+    final int[] ret = evaluateDayTimeLiteral(literal, intervalQualifier);
+    final BigDecimal wholeMillis = BigDecimal.valueOf(dayTimeToMillis(ret));
+    // Keep the scale at 0 unless the literal really has digits below the
+    // millisecond, so that a plan for an ordinary interval is unchanged.
+    final BigDecimal millis =
+        ret[6] == 0 ? wholeMillis : wholeMillis.add(BigDecimal.valueOf(ret[6], 6));
+    return ret[0] < 0 ? millis.negate() : millis;
+  }
+
+  private static int[] evaluateDayTimeLiteral(String literal,
+      SqlIntervalQualifier intervalQualifier) {
     checkArgument(!intervalQualifier.isYearMonth(),
         "interval must be day time");
-    int[] ret;
     try {
-      ret =
-          intervalQualifier.evaluateIntervalLiteral(literal,
-              intervalQualifier.getParserPosition(), RelDataTypeSystem.DEFAULT);
+      return intervalQualifier.evaluateIntervalLiteral(literal,
+          intervalQualifier.getParserPosition(), RelDataTypeSystem.DEFAULT);
     } catch (CalciteContextException e) {
       throw new RuntimeException("while parsing day-to-second interval "
           + literal, e);
     }
+  }
+
+  private static long dayTimeToMillis(int[] ret) {
     long l = 0;
     long[] conv = new long[5];
     conv[4] = 1; // millisecond
@@ -518,10 +584,10 @@ public final class SqlParserUtil {
     conv[2] = conv[3] * 60; // minute
     conv[1] = conv[2] * 60; // hour
     conv[0] = conv[1] * 24; // day
-    for (int i = 1; i < ret.length; i++) {
+    for (int i = 1; i <= conv.length; i++) {
       l += conv[i - 1] * ret[i];
     }
-    return ret[0] * l;
+    return l;
   }
 
   /**
@@ -960,8 +1026,14 @@ public final class SqlParserUtil {
         SqlNode firstItem = list.get(0);
         if (item.op == SqlStdOperatorTable.UNARY_MINUS
             && firstItem instanceof SqlNumericLiteral) {
-          return SqlLiteral.createNegative((SqlNumericLiteral) firstItem,
-              item.pos.plusAll(list));
+          final SqlNumericLiteral num = (SqlNumericLiteral) firstItem;
+          // Do not fold "-0.0E0" into a literal: BigDecimal, which backs
+          // SqlNumericLiteral, cannot represent IEEE 754 negative zero.
+          // Keeping the unary minus call preserves the sign at runtime.
+          if (num.isExact()
+              || ((BigDecimal) requireNonNull(num.getValue())).signum() != 0) {
+            return SqlLiteral.createNegative(num, item.pos.plusAll(list));
+          }
         }
         if (item.op == SqlStdOperatorTable.UNARY_PLUS
             && firstItem instanceof SqlNumericLiteral) {

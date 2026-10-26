@@ -24,6 +24,7 @@ import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexSimplify;
 import org.apache.calcite.rex.RexUnknownAs;
 import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.SqlOperator;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.util.DateString;
@@ -106,6 +107,51 @@ public class RexImplicationCheckerTest {
     f.checkImplies(iEq30, iNe10);
     f.checkNotImplies(iNe10, iEq30);
     f.checkNotImplies(iNe30, iEq30);
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7811">[CALCITE-7811]
+   * RexImplicationChecker incorrectly proves NOT(x = a) implies (x = a OR x = b)</a>. */
+  @Test void testNotOfEqualsDoesNotImplyEqualsOr() {
+    final Fixture f = new Fixture();
+    final RexNode sEqA = f.eq(f.str, f.charLiteral("a"));
+    final RexNode sEqB = f.eq(f.str, f.charLiteral("b"));
+    final RexNode sNeA = f.ne(f.str, f.charLiteral("a"));
+    final RexNode sNotEqA = f.not(sEqA);
+    final RexNode sEqAOrEqB = f.or(sEqA, sEqB);
+
+    f.checkNotImplies(sNeA, sEqAOrEqB);
+    f.checkNotImplies(sNotEqA, sEqAOrEqB);
+  }
+
+  /** {@code NOT(comparison)} must be rewritten to the equivalent negated comparison
+   * for every operator, in either direction. */
+  @Test void testNotOfComparison() {
+    final Fixture f = new Fixture();
+    final RexNode iGt10 = f.gt(f.i, f.literal(10));
+    final RexNode iLe10 = f.le(f.i, f.literal(10));
+    final RexNode iLt10 = f.lt(f.i, f.literal(10));
+    final RexNode iGe10 = f.ge(f.i, f.literal(10));
+    final RexNode iEq10 = f.eq(f.i, f.literal(10));
+    final RexNode iNe10 = f.ne(f.i, f.literal(10));
+
+    f.checkImplies(f.not(iGt10), iLe10);
+    f.checkImplies(iLe10, f.not(iGt10));
+    f.checkImplies(f.not(iLt10), iGe10);
+    f.checkImplies(iGe10, f.not(iLt10));
+    f.checkImplies(f.not(iNe10), iEq10);
+    f.checkImplies(iEq10, f.not(iNe10));
+
+    f.checkImplies(f.not(iLe10), f.gt(f.i, f.literal(5)));
+    f.checkImplies(f.gt(f.i, f.literal(20)), f.not(iLe10));
+    f.checkImplies(f.not(iGe10), f.lt(f.i, f.literal(20)));
+    f.checkImplies(f.lt(f.i, f.literal(5)), f.not(iGe10));
+
+    f.checkImplies(f.not(f.not(iGt10)), iGt10);
+    f.checkImplies(iGt10, f.not(f.not(iGt10)));
+
+    final RexNode iGt10AndLt30 = f.and(iGt10, f.lt(f.i, f.literal(30)));
+    f.checkNotImplies(f.not(iGt10AndLt30), iLe10);
   }
 
   // Simple Tests for DataTypes
@@ -554,6 +600,84 @@ public class RexImplicationCheckerTest {
         assertThat(ceilSimplifiedExpr, hasToString(outerCeilCall.toString()));
       }
     }
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7304">[CALCITE-7304]
+   * Floor/Ceil can not simplify with WEEK TimeUnit</a>. */
+  @Test void testSimplifyCeilFloorWeek() {
+    final Fixture f = new Fixture();
+    // RexInterpreter does not support WEEK and DAY, so we disable paranoid
+    // verification for this test.
+    final RexSimplify nonParanoidSimplify = f.simplify.withParanoid(false);
+    final RexNode literalTs =
+        f.timestampLiteral(new TimestampString("2010-10-10 00:00:00"));
+
+    // Positive tests: floor(floor(x, inner), WEEK) -> floor(x, WEEK)
+    // when inner is DAY or finer.
+    for (TimeUnitRange innerRange : ImmutableList.of(
+        TimeUnitRange.WEEK, TimeUnitRange.DAY)) {
+      final RexNode innerFloorCall =
+          f.rexBuilder.makeCall(SqlStdOperatorTable.FLOOR, literalTs,
+              f.rexBuilder.makeFlag(innerRange));
+      final RexNode innerCeilCall =
+          f.rexBuilder.makeCall(SqlStdOperatorTable.CEIL, literalTs,
+              f.rexBuilder.makeFlag(innerRange));
+      final RexNode outerFloorCall =
+          f.rexBuilder.makeCall(SqlStdOperatorTable.FLOOR, innerFloorCall,
+              f.rexBuilder.makeFlag(TimeUnitRange.WEEK));
+      final RexNode outerCeilCall =
+          f.rexBuilder.makeCall(SqlStdOperatorTable.CEIL, innerCeilCall,
+              f.rexBuilder.makeFlag(TimeUnitRange.WEEK));
+      final RexCall floorSimplifiedExpr =
+          (RexCall) nonParanoidSimplify.simplifyPreservingType(outerFloorCall,
+              RexUnknownAs.UNKNOWN, true);
+      assertThat(floorSimplifiedExpr.getKind(), is(SqlKind.FLOOR));
+      assertThat(((RexLiteral) floorSimplifiedExpr.getOperands().get(1))
+              .getValue(),
+          hasToString(TimeUnitRange.WEEK.toString()));
+      assertThat(floorSimplifiedExpr.getOperands().get(0),
+          hasToString(literalTs.toString()));
+      final RexCall ceilSimplifiedExpr =
+          (RexCall) nonParanoidSimplify.simplifyPreservingType(outerCeilCall,
+              RexUnknownAs.UNKNOWN, true);
+      assertThat(ceilSimplifiedExpr.getKind(), is(SqlKind.CEIL));
+      assertThat(((RexLiteral) ceilSimplifiedExpr.getOperands().get(1))
+              .getValue(),
+          hasToString(TimeUnitRange.WEEK.toString()));
+      assertThat(ceilSimplifiedExpr.getOperands().get(0),
+          hasToString(literalTs.toString()));
+    }
+
+    // Negative tests: WEEK cannot rollup to MONTH or DAY,
+    // and MONTH cannot rollup to WEEK.
+    for (TimeUnitRange outerRange : ImmutableList.of(
+        TimeUnitRange.MONTH, TimeUnitRange.DAY)) {
+      assertNotSimplified(f, nonParanoidSimplify, SqlStdOperatorTable.FLOOR, literalTs,
+          TimeUnitRange.WEEK, outerRange);
+      assertNotSimplified(f, nonParanoidSimplify, SqlStdOperatorTable.CEIL, literalTs,
+          TimeUnitRange.WEEK, outerRange);
+    }
+    for (TimeUnitRange innerRange : ImmutableList.of(
+        TimeUnitRange.MONTH, TimeUnitRange.YEAR)) {
+      assertNotSimplified(f, nonParanoidSimplify, SqlStdOperatorTable.FLOOR, literalTs,
+          innerRange, TimeUnitRange.WEEK);
+      assertNotSimplified(f, nonParanoidSimplify, SqlStdOperatorTable.CEIL, literalTs,
+          innerRange, TimeUnitRange.WEEK);
+    }
+  }
+
+  private void assertNotSimplified(Fixture f, RexSimplify simplify, SqlOperator operator,
+      RexNode timestamp, TimeUnitRange innerRange, TimeUnitRange outerRange) {
+    final RexNode innerCall =
+        f.rexBuilder.makeCall(operator, timestamp,
+            f.rexBuilder.makeFlag(innerRange));
+    final RexNode outerCall =
+        f.rexBuilder.makeCall(operator, innerCall,
+            f.rexBuilder.makeFlag(outerRange));
+    final RexNode simplifiedExpr =
+        simplify.simplifyPreservingType(outerCall, RexUnknownAs.UNKNOWN, true);
+    assertThat(simplifiedExpr, hasToString(outerCall.toString()));
   }
 
 }

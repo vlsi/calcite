@@ -90,6 +90,24 @@ public interface SqlConformance {
   boolean allowCharLiteralAlias();
 
   /**
+   * Whether to allow an inverse distribution function such as
+   * {@code PERCENTILE_CONT} or {@code PERCENTILE_DISC} to combine a
+   * {@code WITHIN GROUP (ORDER BY ...)} clause with an {@code OVER} clause, so
+   * that it may be used as an analytic (window) function. For example,
+   *
+   * <blockquote><pre>
+   *   PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x)
+   *     OVER (PARTITION BY y)</pre></blockquote>
+   *
+   * <p>This is non-standard SQL supported by Oracle.
+   *
+   * <p>Among the built-in conformance levels, true in
+   * {@link SqlConformanceEnum#BABEL};
+   * false otherwise.
+   */
+  boolean allowWithinGroupOverAggregate();
+
+  /**
    * Whether to allow aliases from the {@code SELECT} clause to be used as
    * column names in the {@code GROUP BY} clause.
    *
@@ -261,6 +279,18 @@ public interface SqlConformance {
   boolean allowHyphenInUnquotedTableName();
 
   /**
+   * Whether {@code :} is allowed as a field/item access operator.
+   *
+   * <p>If true, expressions such as {@code v:field} and {@code v:['field']}
+   * are accepted. In this mode, {@code JSON_OBJECT} and {@code JSON_OBJECTAGG}
+   * must use the {@code KEY ... VALUE} form rather than {@code :} or
+   * comma-pair syntax.
+   */
+  default boolean isColonFieldAccessAllowed() {
+    return false;
+  }
+
+  /**
    * Whether the bang-equal token != is allowed as an alternative to &lt;&gt; in
    * the parser.
    *
@@ -363,6 +393,7 @@ public interface SqlConformance {
    * fields of T if T is a STRUCT type.
    *
    * <p>Among the built-in conformance levels, true in
+   * {@link SqlConformanceEnum#BIG_QUERY},
    * {@link SqlConformanceEnum#PRESTO};
    * false otherwise.
    */
@@ -599,6 +630,28 @@ public interface SqlConformance {
   boolean allowQualifyingCommonColumn();
 
   /**
+   * Whether to allow lambda expressions to access variables from enclosing
+   * scopes (closure semantics).
+   *
+   * <p>For example, in a higher-order function context like:
+   *
+   * <blockquote><pre>
+   * SELECT *
+   * FROM t1
+   * JOIN t2 ON EXISTS(t1.arr, x -&gt; x = t2.v)</pre></blockquote>
+   *
+   * <p>The {@code t2.v} from the enclosing scope would be accessible inside
+   * the lambda body if closures are allowed.
+   *
+   * <p>Among the built-in conformance levels, false in
+   * {@link SqlConformanceEnum#STRICT_92},
+   * {@link SqlConformanceEnum#STRICT_99},
+   * {@link SqlConformanceEnum#STRICT_2003};
+   * true otherwise.
+   */
+  boolean allowLambdaClosure();
+
+  /**
    * Whether {@code VALUE} is allowed as an alternative to {@code VALUES} in
    * the parser.
    *
@@ -668,4 +721,56 @@ public interface SqlConformance {
    * True when the unsigned versions of integer types are supported.
    */
   boolean supportsUnsignedTypes();
+
+  /**
+   * Whether {@code SELECT DISTINCT ON} is allowed.
+   *
+   * <p>Among the built-in conformance levels, true in
+   * {@link SqlConformanceEnum#BABEL},
+   * {@link SqlConformanceEnum#LENIENT};
+   * false otherwise.
+   */
+  boolean isDistinctOnAllowed();
+
+  /**
+   * Whether an aggregate function inside a scalar sub-query is allowed to
+   * reference columns from an outer query.
+   *
+   * <p>This is not allowed by the SQL standard, but is supported by some
+   * databases, including SQLite, DuckDB and SQL Server.
+   *
+   * <p>Among the built-in conformance levels, true in
+   * {@link SqlConformanceEnum#BABEL},
+   * {@link SqlConformanceEnum#LENIENT};
+   * false otherwise.
+   */
+  default boolean isCorrelatedAggregateAllowed() {
+    return false;
+  }
+
+  /**
+   * Whether {@code *} is allowed as a grouping element in
+   * {@code GROUPING SETS}, {@code ROLLUP} and {@code CUBE} sub-clauses of
+   * {@code GROUP BY}, to produce non-aggregated (detail) rows.
+   *
+   * <p>By analogy with {@code COUNT(*)}, a grouping set containing {@code *}
+   * groups by every input column, so no rows are merged (except identical
+   * duplicate rows) and each input row appears in the output.
+   *
+   * <p>The star may appear only in well-defined positions: as a complete
+   * grouping set ({@code GROUPING SETS (*)}), as an element of a grouping
+   * set ({@code GROUPING SETS ((deptno), (*))}), or as an argument of
+   * {@code ROLLUP} or {@code CUBE} ({@code ROLLUP (deptno, *)}), including
+   * grouping constructs nested within {@code GROUPING SETS}. It may not
+   * appear at the top level of {@code GROUP BY}, nor inside other
+   * expressions.
+   *
+   * <p>Among the built-in conformance levels, true in
+   * {@link SqlConformanceEnum#BABEL},
+   * {@link SqlConformanceEnum#LENIENT};
+   * false otherwise.
+   */
+  default boolean isGroupingSetsStarAllowed() {
+    return false;
+  }
 }

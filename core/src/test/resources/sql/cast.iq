@@ -65,6 +65,31 @@ select 2147483647 * 2147483647;
 Caused by: java.lang.ArithmeticException
 !error
 
+# Test cases for [CALCITE-7725] Review safety of checked arithmetic operators
+# https://issues.apache.org/jira/browse/CALCITE-7725
+
+# A checked operation with a NULL operand is never performed, so the whole
+# expression can still be simplified to NULL
+select cast(null as integer) + empno as c from emp where empno = 7369;
++---+
+| C |
++---+
+|   |
++---+
+(1 row)
+
+!ok
+
+# "empno * 100000000" overflows, so "IS NOT NULL" must not become TRUE
+select empno from emp where empno = 7369 and empno * 100000000 is not null;
+integer overflow
+!error
+
+# and "x + NULL" must not become NULL without computing x
+select empno * 100000000 + cast(null as integer) as c from emp where empno = 7369;
+integer overflow
+!error
+
 !use scott
 
 # Cast a character literal to a timestamp; note: the plan does not contain CAST
@@ -220,8 +245,6 @@ EnumerableCalc(expr#0=[{inputs}], expr#1=['TR'], expr#2=['UE'], expr#3=[||($t1, 
   EnumerableValues(tuples=[[{ 0 }]])
 !plan
 
-!if (fixed.calcite2539) {
-
 # In the following, that we get an error at run time,
 # and that the plan shows that the expression has not been reduced.
 values cast('null' as boolean);
@@ -234,19 +257,19 @@ EnumerableCalc(expr#0=[{inputs}], expr#1=['null'], expr#2=[CAST($t1):BOOLEAN NOT
 # The following throw give an error (good!)
 # but throw java.lang.ExceptionInInitializerError (not great).
 values cast('' as date);
-Caused by: java.lang.NumberFormatException: For input string: ""
+Caused by: java.lang.IllegalArgumentException: Invalid DATE value, ''
 !error
 
 values cast('' as timestamp);
-Caused by: java.lang.NumberFormatException: For input string: ""
+Caused by: java.lang.IllegalArgumentException: Invalid DATE value, ''
 !error
 
 values cast('' as integer);
-Caused by: java.lang.NumberFormatException: For input string: ""
+java.lang.NumberFormatException: For input string: ""
 !error
 
 values cast('' as boolean);
-Caused by: java.lang.RuntimeException: Invalid character for cast
+Caused by: org.apache.calcite.runtime.CalciteException: Invalid character for cast
 !error
 
 values cast('' as double);
@@ -256,7 +279,7 @@ Caused by: java.lang.NumberFormatException: empty String
 # Postgres fails:
 #  ERROR:  invalid input syntax for integer: "1.56"
 values cast('15.6' as integer);
-Caused by: java.lang.NumberFormatException: For input string: "15.6"
+java.lang.NumberFormatException: For input string: "15.6"
 !error
 
 # Postgres fails:
@@ -277,14 +300,13 @@ Caused by: java.lang.NumberFormatException: Value out of range. Value:"50000" Ra
 
 # Out of INTEGER range (max 2.1e9)
 values cast('4567891234' as integer);
-Caused by: java.lang.NumberFormatException: For input string: "4567891234"
+java.lang.NumberFormatException: For input string: "4567891234"
 !error
 
 # Out of BIGINT range (max 9.2e18)
 values cast('12345678901234567890' as bigint);
 Caused by: java.lang.NumberFormatException: For input string: "12345678901234567890"
 !error
-!}
 
 # Out of REAL range
 # (Should give an error, not infinity.)
@@ -1977,5 +1999,246 @@ SELECT ARRAY[cast(null as integer), cast(null as integer), cast(null as integer)
 !ok
 EXPR$0 INTEGER ARRAY NOT NULL
 !type
+
+# [CALCITE-7323] Result of cast Number to Boolean is not correct
+select cast(mod(deptno, 3) as BOOLEAN), mod(deptno, 3) from emp;
++--------+--------+
+| EXPR$0 | EXPR$1 |
++--------+--------+
+| false  |      0 |
+| false  |      0 |
+| false  |      0 |
+| false  |      0 |
+| false  |      0 |
+| false  |      0 |
+| true   |      1 |
+| true   |      1 |
+| true   |      1 |
+| true   |      2 |
+| true   |      2 |
+| true   |      2 |
+| true   |      2 |
+| true   |      2 |
++--------+--------+
+(14 rows)
+
+!ok
+
+# Test case for [CALCITE-7839] CAST(CAST(0 AS TINYINT) AS BOOLEAN) should not evaluate to TRUE
+values (cast(cast(0 as tinyint) as boolean), cast(cast(0 as smallint) as boolean),
+  cast(cast(0 as bigint) as boolean), cast(cast(5 as bigint) as boolean));
++--------+--------+--------+--------+
+| EXPR$0 | EXPR$1 | EXPR$2 | EXPR$3 |
++--------+--------+--------+--------+
+| false  | false  | false  | true   |
++--------+--------+--------+--------+
+(1 row)
+
+!ok
+
+# Test case for [CALCITE-7653] ARRAY[NULL] produces uncompilable Java code
+values (cast(array[null] as integer array));
++--------+
+| EXPR$0 |
++--------+
+| [null] |
++--------+
+(1 row)
+
+!ok
+
+select coalesce(cast(null as integer array), array[null]) as a
+from (values (1));
++--------+
+| A      |
++--------+
+| [null] |
++--------+
+(1 row)
+
+!ok
+
+values (cast(multiset[null] as integer multiset));
++--------+
+| EXPR$0 |
++--------+
+| [null] |
++--------+
+(1 row)
+
+!ok
+
+# Tests for [CALCITE-7677] CAST between ROW types fails at runtime
+# https://issues.apache.org/jira/browse/CALCITE-7677
+!use scott
+
+SELECT ARRAY[ROW(1, 'Alice'), ROW(NULL, 'Dan')] AS people
+FROM (VALUES (0)) AS t(zero);
++---------------------------+
+| PEOPLE                    |
++---------------------------+
+| [{1, Alice}, {null, Dan}] |
++---------------------------+
+(1 row)
+
+!ok
+
+SELECT CAST(ROW(ROW(2, 'b'), 20) AS ROW(a ROW(x INTEGER, y CHAR(1)), b INTEGER)) AS r
+FROM (VALUES (0)) AS t(zero);
++--------------+
+| R            |
++--------------+
+| {{2, b}, 20} |
++--------------+
+(1 row)
+
+!ok
+
+SELECT CAST(ROW(NULL, 30) AS ROW(a ROW(x INTEGER, y CHAR(1)), b INTEGER)) AS r
+FROM (VALUES (0)) AS t(zero);
++------------+
+| R          |
++------------+
+| {null, 30} |
++------------+
+(1 row)
+
+!ok
+
+SELECT ARRAY[ROW(ROW(1, 'a'), 10), NULL] AS xs
+FROM (VALUES (0)) AS t(zero);
++----------------------+
+| XS                   |
++----------------------+
+| [{{1, a}, 10}, null] |
++----------------------+
+(1 row)
+
+!ok
+
+# Test case for [CALCITE-7840] REAL literals should be represented with reduced precision
+values (cast(0.1e0 as real) = cast(0.1 as real),
+  cast(cast(0.1e0 as real) as double) = cast(cast(0.1 as real) as double),
+  cast(0.1e0 as real) = 0.1e0);
++--------+--------+--------+
+| EXPR$0 | EXPR$1 | EXPR$2 |
++--------+--------+--------+
+| true   | true   | false  |
++--------+--------+--------+
+(1 row)
+
+!ok
+
+# Test case for [CALCITE-7870] RexSimplify removes some casts which change
+# semantics
+SELECT CAST(CAST(deptno AS DOUBLE) AS VARCHAR) AS d1,
+  CAST(CAST(deptno AS DECIMAL(5, 2)) AS VARCHAR) AS d2,
+  CAST(CAST(sal AS DECIMAL(10, 4)) AS VARCHAR) AS d3,
+  CAST(CAST(deptno AS INTEGER) AS VARCHAR) AS d4
+FROM emp
+WHERE empno = 7369;
++------+-------+----------+----+
+| D1   | D2    | D3       | D4 |
++------+-------+----------+----+
+| 20.0 | 20.00 | 800.0000 | 20 |
++------+-------+----------+----+
+(1 row)
+
+!ok
+
+SELECT CAST(CAST(deptno AS BIGINT) AS VARBINARY) AS b1,
+  CAST(CAST(CAST(deptno AS DOUBLE) / 3e0 AS VARCHAR(3)) AS VARCHAR) AS s1,
+  CAST(CAST(CAST(deptno AS DOUBLE) / 3e0 AS VARCHAR(3)) AS DOUBLE) AS s2
+FROM emp
+WHERE empno = 7369;
++------------------+-----+-----+
+| B1               | S1  | S2  |
++------------------+-----+-----+
+| 0000000000000014 | 6.6 | 6.6 |
++------------------+-----+-----+
+(1 row)
+
+!ok
+
+SELECT CAST(CAST(deptno AS VARCHAR) AS BOOLEAN) AS b
+FROM emp
+WHERE empno = 7369;
+Invalid character for cast: 20
+!error
+
+SELECT CAST(CAST(deptno AS VARCHAR) AS TIMESTAMP) AS t
+FROM emp
+WHERE empno = 7369;
+Invalid DATE value, '20'
+!error
+
+SELECT CAST(CAST(deptno AS VARCHAR) AS BIGINT) AS b1,
+  CAST(CAST(deptno AS VARCHAR) AS DOUBLE) AS b2
+FROM emp
+WHERE empno = 7369;
++----+------+
+| B1 | B2   |
++----+------+
+| 20 | 20.0 |
++----+------+
+(1 row)
+
+!ok
+
+SELECT CAST(CAST(sal / 3 AS REAL) AS VARCHAR) AS r1,
+  CAST(CAST(CAST(sal / 3 AS REAL) AS DOUBLE) AS VARCHAR) AS r2
+FROM emp
+WHERE empno = 7369;
++-----------+-------------------+
+| R1        | R2                |
++-----------+-------------------+
+| 266.66666 | 266.6666564941406 |
++-----------+-------------------+
+(1 row)
+
+!ok
+
+# The inner casts to DOUBLE are removed; the results do not change
+SELECT CAST(CAST(CAST(deptno AS REAL) AS DOUBLE) AS BOOLEAN) AS b1,
+  CAST(CAST(CAST(deptno - 20 AS REAL) AS DOUBLE) AS BOOLEAN) AS b2
+FROM emp
+WHERE empno = 7369;
++------+-------+
+| B1   | B2    |
++------+-------+
+| true | false |
++------+-------+
+(1 row)
+
+!ok
+
+# A VARIANT keeps the type of its value, so the inner casts must stay
+SELECT TYPEOF(CAST(CAST(deptno AS SMALLINT) AS VARIANT)) AS t1,
+  TYPEOF(CAST(deptno AS VARIANT)) AS t2,
+  CAST(CAST(deptno AS SMALLINT) AS VARIANT) = CAST(deptno AS VARIANT) AS e,
+  TYPEOF(CAST(CAST(ename AS VARCHAR(20)) AS VARIANT)) AS t3
+FROM emp
+WHERE empno = 7369;
++----------+---------+-------+---------+
+| T1       | T2      | E     | T3      |
++----------+---------+-------+---------+
+| SMALLINT | TINYINT | false | VARCHAR |
++----------+---------+-------+---------+
+(1 row)
+
+!ok
+
+!use scott-negative-scale
+SELECT CAST(CAST(CAST(deptno * 1000 AS DECIMAL(2, -3)) AS VARCHAR(3)) AS VARCHAR) AS n1
+FROM emp
+WHERE empno = 7369;
++-----+
+| N1  |
++-----+
+| 200 |
++-----+
+(1 row)
+
+!ok
 
 # End cast.iq

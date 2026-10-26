@@ -153,7 +153,7 @@ public class SqlDelete extends SqlCall {
     SqlNode condition = this.condition;
     if (condition != null) {
       writer.sep("WHERE");
-      condition.unparse(writer, opLeft, opRight);
+      SqlUtil.unparseConditionClause(writer, condition, opLeft, opRight);
     }
     writer.endList(frame);
   }

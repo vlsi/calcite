@@ -151,7 +151,7 @@ public class SqlHint extends SqlCall {
       for (int i = 0; i < options.size() - 1; i += 2) {
         final SqlNode k = options.get(i);
         final SqlNode v = options.get(i + 1);
-        attrs.put(getOptionKeyAsString(k), ((SqlLiteral) v).getValueAs(String.class));
+        attrs.put(getOptionAsString(k), getOptionAsString(v));
       }
       return ImmutableMap.copyOf(attrs);
     } else {
@@ -197,18 +197,19 @@ public class SqlHint extends SqlCall {
      * The hint options are list of key-value pairs.
      * For each pair,
      * the key is a simple identifier or string literal,
-     * the value is a string literal.
+     * the value is a string or numeric literal.
      */
     KV_LIST
   }
 
   //~ Tools ------------------------------------------------------------------
 
-  private static String getOptionKeyAsString(SqlNode node) {
+  private String getOptionAsString(SqlNode node) {
     assert node instanceof SqlIdentifier || SqlUtil.isLiteral(node);
     if (node instanceof SqlIdentifier) {
       return ((SqlIdentifier) node).getSimple();
     }
-    return ((SqlLiteral) node).getValueAs(String.class);
+    return requireNonNull(((SqlLiteral) node).toValue(),
+        () -> "null hint literal in " + options);
   }
 }

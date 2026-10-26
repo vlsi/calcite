@@ -17,6 +17,7 @@
 package org.apache.calcite.sql;
 
 import org.apache.calcite.avatica.util.ByteString;
+import org.apache.calcite.config.CalciteSystemProperty;
 import org.apache.calcite.linq4j.Ord;
 import org.apache.calcite.linq4j.function.Functions;
 import org.apache.calcite.rel.RelNode;
@@ -40,6 +41,7 @@ import org.apache.calcite.sql.type.SqlTypeUtil;
 import org.apache.calcite.sql.util.SqlBasicVisitor;
 import org.apache.calcite.sql.util.SqlVisitor;
 import org.apache.calcite.sql.validate.SqlNameMatcher;
+import org.apache.calcite.sql.validate.SqlNameMatchers;
 import org.apache.calcite.sql.validate.SqlValidatorUtil;
 import org.apache.calcite.util.BarfingInvocationHandler;
 import org.apache.calcite.util.ConversionUtil;
@@ -58,6 +60,7 @@ import com.google.common.collect.Lists;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.checkerframework.checker.nullness.qual.PolyNull;
 
+import java.math.BigDecimal;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.charset.UnsupportedCharsetException;
@@ -455,6 +458,45 @@ public abstract class SqlUtil {
   }
 
   /**
+   * Unparses a condition using a
+   * {@link SqlWriter.FrameTypeEnum#WHERE_LIST} frame, which provides
+   * predicate-list formatting.
+   *
+   * @param writer Writer
+   * @param condition Condition
+   * @param leftPrec Left precedence
+   * @param rightPrec Right precedence
+   */
+  public static void unparseConditionClause(SqlWriter writer,
+      SqlNode condition, int leftPrec, int rightPrec) {
+    if (!writer.isAlwaysUseParentheses()) {
+      SqlNode node = condition;
+
+      // Decide whether to split on ORs or ANDs.
+      SqlBinaryOperator conditionSep = SqlStdOperatorTable.AND;
+      if ((node instanceof SqlCall)
+          && node.getKind() == SqlKind.OR) {
+        conditionSep = SqlStdOperatorTable.OR;
+      }
+
+      // Unroll condition.
+      final List<SqlNode> list = new ArrayList<>(0);
+      while (node.getKind() == conditionSep.kind) {
+        assert node instanceof SqlCall;
+        final SqlCall call1 = (SqlCall) node;
+        list.add(0, call1.operand(1));
+        node = call1.operand(0);
+      }
+      list.add(0, node);
+
+      writer.list(SqlWriter.FrameTypeEnum.WHERE_LIST, conditionSep,
+          new SqlNodeList(list, condition.getParserPosition()));
+    } else {
+      condition.unparse(writer, leftPrec, rightPrec);
+    }
+  }
+
+  /**
    * Concatenates string literals.
    *
    * <p>This method takes an array of arguments, since pairwise concatenation
@@ -519,9 +561,12 @@ public abstract class SqlUtil {
 
   private static Iterator<SqlOperator> filterOperatorRoutinesByKind(
       Iterator<SqlOperator> routines, final SqlKind sqlKind) {
+    // Mirror getFunctionKind() on both sides, or an operator whose kind maps to
+    // something else (e.g. POSITION -> OTHER_FUNCTION) can fail to match itself.
+    final SqlKind sqlFunctionKind = sqlKind.getFunctionKind();
     return Iterators.filter(routines,
         operator -> requireNonNull(operator, "operator")
-            .getKind().getFunctionKind() == sqlKind);
+            .getKind().getFunctionKind() == sqlFunctionKind);
   }
 
   /**
@@ -710,7 +755,7 @@ public abstract class SqlUtil {
     // parameters of all of these names.
     Map<Integer, Integer> map = new HashMap<>();
     for (Ord<String> argName : Ord.zip(argNames)) {
-      int i = paramNames.indexOf(argName.e);
+      int i = lookupParamNameCaseInsensitive(paramNames, argName.e);
       if (i < 0) {
         return null;
       }
@@ -720,6 +765,24 @@ public abstract class SqlUtil {
       Integer argIndex = map.get(index);
       return argIndex != null ? argTypes.get(argIndex) : null;
     });
+  }
+
+  /** Looks up a parameter name in a list of formal parameter names,
+   * case-insensitively.
+   *
+   * @param paramNames list of formal parameter names
+   * @param argName argument name to look up
+   * @return index of the first matching parameter, or -1 if not found
+   */
+  public static int lookupParamNameCaseInsensitive(List<String> paramNames,
+      String argName) {
+    for (int i = 0; i < paramNames.size(); i++) {
+      if (SqlNameMatchers.withCaseSensitive(false)
+          .matches(paramNames.get(i), argName)) {
+        return i;
+      }
+    }
+    return -1;
   }
 
   /**
@@ -758,7 +821,7 @@ public abstract class SqlUtil {
               final List<RelDataType> paramTypes =
                   operandMetadata.paramTypes(typeFactory);
               int index = argNames != null
-                  ? paramNames.indexOf(argNames.get(argType.i))
+                  ? lookupParamNameCaseInsensitive(paramNames, argNames.get(argType.i))
                   : argType.i;
               final RelDataType paramType = paramTypes.get(index);
               return precList.compareTypePrecedence(paramType, bestMatch) >= 0;
@@ -784,7 +847,7 @@ public abstract class SqlUtil {
           operandMetadata.paramTypes(typeFactory);
       final List<String> paramNames = operandMetadata.paramNames();
       final RelDataType paramType = argNames != null
-          ? paramTypes.get(paramNames.indexOf(argNames.get(i)))
+          ? paramTypes.get(lookupParamNameCaseInsensitive(paramNames, argNames.get(i)))
           : paramTypes.get(i);
       if (bestMatch == null) {
         bestMatch = paramType;
@@ -918,6 +981,18 @@ public abstract class SqlUtil {
     }
 
     return ret.toString();
+  }
+
+  /**
+   * Returns whether {@code value}'s plain-notation expansion fits within
+   * the configured bound
+   * ({@link CalciteSystemProperty#MAX_DECIMAL_LITERAL_PLAIN_DIGITS}).
+   * Callers that are about to feed {@code value} to {@code toPlainString}
+   * (or the equivalent) must gate on this method first.
+   */
+  public static boolean isBoundedDecimal(BigDecimal value) {
+    final long limit = CalciteSystemProperty.MAX_DECIMAL_LITERAL_PLAIN_DIGITS.value();
+    return (long) value.precision() + Math.abs((long) value.scale()) <= limit;
   }
 
   /**
@@ -1136,7 +1211,7 @@ public abstract class SqlUtil {
       final SqlHint sqlHint = (SqlHint) node;
       final String hintName = sqlHint.getName();
 
-      final RelHint.Builder builder = RelHint.builder(hintName);
+      final RelHint.Builder builder = RelHint.builder(hintName).position(node.getParserPosition());
       switch (sqlHint.getOptionFormat()) {
       case EMPTY:
         // do nothing.
@@ -1292,6 +1367,50 @@ public abstract class SqlUtil {
       Util.swallow(e, null);
       return true;
     }
+  }
+
+  /**
+   * Returns a copy of the sql node with ordering modifiers removed.
+   *
+   * <p>Does not modify the input. Strips outermost {@code DESC},
+   * {@code NULLS FIRST}, and {@code NULLS LAST} modifiers recursively.
+   */
+  public static SqlNode stripOrderModifiers(SqlNode node) {
+    SqlNode expr = node;
+    while (expr instanceof SqlCall) {
+      final SqlCall call = (SqlCall) expr;
+      final SqlKind kind = call.getKind();
+      if (kind == SqlKind.DESCENDING
+          || kind == SqlKind.NULLS_FIRST
+          || kind == SqlKind.NULLS_LAST) {
+        expr = call.operand(0);
+      } else {
+        break;
+      }
+    }
+    return expr;
+  }
+
+  /**
+   * Returns a copy of the ORDER BY item with {@code AS} alias removed,
+   * preserving sort modifiers (DESC, NULLS FIRST/LAST).
+   */
+  public static SqlNode stripAsFromOrder(SqlNode node) {
+    if (node instanceof SqlCall) {
+      SqlCall call = (SqlCall) node;
+      SqlKind kind = call.getKind();
+      if (kind == SqlKind.DESCENDING
+          || kind == SqlKind.NULLS_FIRST
+          || kind == SqlKind.NULLS_LAST) {
+        SqlNode operand = call.operand(0);
+        SqlNode stripped = stripAsFromOrder(operand);
+        if (stripped != operand) {
+          return call.getOperator().createCall(call.getParserPosition(), stripped);
+        }
+        return node;
+      }
+    }
+    return stripAs(node);
   }
 
   //~ Inner Classes ----------------------------------------------------------

@@ -257,12 +257,12 @@ public abstract class MutableRels {
       final MutableUncollect uncollect = (MutableUncollect) node;
       final RelNode child = fromMutable(uncollect.getInput(), relBuilder);
       return Uncollect.create(child.getTraitSet(), child, uncollect.withOrdinality,
-          Collections.emptyList());
+          Collections.emptyList(), uncollect.expandStructFields, uncollect.isOuter);
     }
     case WINDOW: {
       final MutableWindow window = (MutableWindow) node;
       final RelNode child = fromMutable(window.getInput(), relBuilder);
-      return LogicalWindow.create(child.getTraitSet(),
+      return LogicalWindow.create(child.getTraitSet(), ImmutableList.of(),
           child, window.constants, window.rowType, window.groups);
     }
     case MATCH: {
@@ -378,7 +378,8 @@ public abstract class MutableRels {
     if (rel instanceof Uncollect) {
       final Uncollect uncollect = (Uncollect) rel;
       final MutableRel input = toMutable(uncollect.getInput());
-      return MutableUncollect.of(uncollect.getRowType(), input, uncollect.withOrdinality);
+      return MutableUncollect.of(uncollect.getRowType(), input,
+          uncollect.withOrdinality, uncollect.expandStructFields, uncollect.isOuter);
     }
     if (rel instanceof Window) {
       final Window window = (Window) rel;

@@ -36,6 +36,7 @@ import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.type.SqlTypeUtil;
 import org.apache.calcite.util.Pair;
 import org.apache.calcite.util.Util;
+import org.apache.calcite.util.UuidValue;
 
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joou.UByte;
@@ -224,6 +225,8 @@ public class JavaTypeFactoryImpl
       case BINARY:
       case VARBINARY:
         return ByteString.class;
+      case UUID:
+        return UuidValue.class;
       case GEOMETRY:
         return Geometry.class;
       case SYMBOL:
@@ -364,12 +367,46 @@ public class JavaTypeFactoryImpl
         "Record" + type.getFieldCount() + "_" + syntheticTypes.size();
     final SyntheticRecordType syntheticType =
         new SyntheticRecordType(type, name);
-    for (final RelDataTypeField recordField : type.getFieldList()) {
-      final Type javaClass = getJavaClass(recordField.getType());
+    for (final Ord<RelDataTypeField> ord : Ord.zip(type.getFieldList())) {
+      final RelDataTypeField recordField = ord.e;
+      final Type fieldClass = getJavaClass(recordField.getType());
+      // A field whose type has no real Java class is stored as Object[] at
+      // runtime, like all rows in enumerable convention. For example, the
+      // element type of ARRAY[ROW(ROW(1, 'a'), 10), NULL] becomes a "synthetic" type
+      // named Record2_0
+      //   public static class Record2_0 implements java.io.Serializable {
+      //     public Object[] EXPR$0;  // the nested row, e.g. {1, 'a'}
+      //     public Integer EXPR$1;
+      //     ...equals, hashCode, compareTo, toString...
+      //   }
+      // If EXPR$0 would also have a synthetic type,
+      // this would generate nested synthetic classes, which
+      // EnumerableRelImplementor#classDecl cannot emit.
+      //
+      // A field whose type maps to a real Java class (e.g. a bean from a
+      // ReflectiveSchema) uses its own Java class.
+      //
+      // 'instanceof Class' distinguishes the two cases: getJavaClass
+      // returns a java.lang.reflect.Type, which is a loaded
+      // java.lang.Class for most SQL types.  For a record type with no
+      // Java class (here the nested row's type, which maps to its own
+      // Record2_N), it is a SyntheticRecordType: a description of a class
+      // that is only generated and compiled together with the query, so no
+      // Class object exists for it.
+      final Type javaClass = fieldClass instanceof Class
+          ? fieldClass
+          : Object[].class;
+      // Prefer the SQL field name to allow downstream reflection-based lookups
+      // (e.g. Avatica's Meta.CursorFactory.record(), which reads results
+      // out of the synthetic class by SQL column name); fall back to a
+      // positional name if the SQL name is not a legal Java identifier
+      final String rawName = recordField.getName();
+      final String fieldName =
+          Types.isValidJavaIdentifier(rawName) ? rawName : "f" + ord.i;
       syntheticType.fields.add(
           new RecordFieldImpl(
               syntheticType,
-              recordField.getName(),
+              fieldName,
               javaClass,
               recordField.getType().isNullable()
                   && !Primitive.is(javaClass),

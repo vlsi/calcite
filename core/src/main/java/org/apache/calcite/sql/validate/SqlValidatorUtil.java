@@ -57,6 +57,7 @@ import org.apache.calcite.sql.SqlSyntax;
 import org.apache.calcite.sql.SqlUtil;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
+import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.type.SqlTypeUtil;
 import org.apache.calcite.util.ImmutableBitSet;
 import org.apache.calcite.util.Litmus;
@@ -67,6 +68,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
 
 import org.checkerframework.checker.nullness.qual.Nullable;
 
@@ -365,6 +367,10 @@ public class SqlValidatorUtil {
       // E.g. "foo.bar" --> "bar"
       return Util.last(((SqlIdentifier) node).names);
 
+    case DOT:
+      // E.g. "row(a as x).x" --> "x"
+      return alias_(((SqlCall) node).operand(1), ordinal);
+
     default:
       if (ordinal < 0) {
         return null;
@@ -614,6 +620,41 @@ public class SqlValidatorUtil {
       nameList = fieldNameList;
     }
     return typeFactory.createStructType(typeList, nameList);
+  }
+
+  /**
+   * Returns the type of the result collection produced by a mark join. Taking LEFT_MARK join as an
+   * example, its output is all rows from the left side and creates a new attribute to mark a tuple
+   * as having join partners from right side or not.
+   *
+   * @param typeFactory         Type factory
+   * @param inputType           Type of lhs/rhs of the mark join
+   * @param joinConditionType   Type of the join condition
+   * @param systemFieldList     List of system fields that will be prefixed to output row type;
+   *                            typically empty but must not be null
+   * @return  mark join type
+   */
+  public static RelDataType createMarkJoinType(
+      RelDataTypeFactory typeFactory,
+      RelDataType inputType,
+      RelDataType joinConditionType,
+      List<RelDataTypeField> systemFieldList) {
+    final String markerName =
+        SqlValidatorUtil.uniquify("markCol", Sets.newHashSet(inputType.getFieldNames()),
+            SqlValidatorUtil.EXPR_SUGGESTER);
+    // conceptually the type of marker is a three-valued boolean, but it can be simplified to a
+    // two-valued boolean in specific cases (e.g., rewriting from an EXISTS subquery). Simple
+    // defining the marker type as nullable boolean might cause type mismatch errors after rewriting
+    // some subqueries (such as EXISTS subquery).
+    // When deriving the type of LEFT_MARK join, we no longer know which subquery it was
+    // rewritten from, but that information is implicit in the join condition. For example, after
+    // rewriting and decorrelating an EXISTS (correlated) subquery, the condition will only contain
+    // IS NOT DISTINCT FROM. Therefore, we derive the marker type from the condition.
+    final RelDataType markerType =
+        typeFactory.createStructType(
+            ImmutableList.of(joinConditionType),
+            ImmutableList.of(markerName));
+    return createJoinType(typeFactory, inputType, markerType, null, systemFieldList);
   }
 
   private static void addFields(List<RelDataTypeField> fieldList,
@@ -1387,6 +1428,9 @@ public class SqlValidatorUtil {
    * if targetType is double, this method would ensure that the elements of the
    * first array and the second operand are cast to double.
    *
+   * <p>Use {@link #adjustArrayTypeForArrayFunctions} for an operand that is
+   * itself an array whose element type must become {@code targetType}.
+   *
    * @param targetType The target {@link RelDataType} to which the operands should be cast.
    * @param opBinding  The {@link SqlOperatorBinding} context, which provides access to the
    *                   {@link SqlCall} and its operands.
@@ -1396,8 +1440,33 @@ public class SqlValidatorUtil {
    */
   public static void adjustTypeForArrayFunctions(
       RelDataType targetType, SqlOperatorBinding opBinding, int... indexes) {
+    adjustTypeForArrayFunctions(targetType, opBinding, false, indexes);
+  }
+
+  /**
+   * Same as {@link #adjustTypeForArrayFunctions}, for operands that are
+   * arrays whose element type must become {@code targetType}.
+   *
+   * <p>The two methods differ for an operand that is not a call to the ARRAY
+   * constructor (e.g., a CAST expression): this method casts such an operand to an array of
+   * {@code targetType} rather than to {@code targetType} itself.
+   *
+   * @param targetType The array element type to which the operands' elements
+   *                   should be cast.
+   * @param arrayOperands The indexes of the array operands within the {@link SqlCall}
+   *                   that need to be adjusted to the target type.
+   */
+  public static void adjustArrayTypeForArrayFunctions(
+      RelDataType targetType, SqlOperatorBinding opBinding, int... arrayOperands) {
+    adjustTypeForArrayFunctions(targetType, opBinding, true, arrayOperands);
+  }
+
+  private static void adjustTypeForArrayFunctions(
+      RelDataType targetType, SqlOperatorBinding opBinding, boolean arrayOperands,
+      int... indexes) {
     if (opBinding instanceof SqlCallBinding) {
       requireNonNull(targetType, "array function target type");
+      final SqlValidator validator = ((SqlCallBinding) opBinding).getValidator();
       SqlCall call = ((SqlCallBinding) opBinding).getCall();
       List<SqlNode> operands = call.getOperandList();
       for (int idx : indexes) {
@@ -1407,9 +1476,31 @@ public class SqlValidatorUtil {
             // such as spark array, the SqlKind is other function.
             // however, the name is same for those different array forms.
             && "ARRAY".equals(((SqlBasicCall) operand).getOperator().getName())) {
-          call.setOperand(idx, castArrayElementTo(operand, targetType));
+          RelDataType elementType =
+              arrayOperands ? targetType
+                  : requireNonNull(targetType.getComponentType(),
+                      () -> "componentType of " + targetType);
+          call.setOperand(idx, castArrayElementTo(validator, operand, elementType));
+          // The rewrite changes the element types of the array constructor,
+          // so the type the validator has recorded for it must change too
+          RelDataType priorType = validator.getValidatedNodeTypeIfKnown(operand);
+          if (priorType != null) {
+            validator.setValidatedNodeType(operand,
+                SqlTypeUtil.createArrayType(opBinding.getTypeFactory(),
+                    elementType, priorType.isNullable()));
+          }
         } else {
-          call.setOperand(idx, castTo(operand, targetType));
+          RelDataType castType = targetType;
+          if (arrayOperands) {
+            // An array operand that is not an ARRAY constructor call must be
+            // cast to an array of the target type, not to the target type
+            castType =
+                SqlTypeUtil.createArrayType(opBinding.getTypeFactory(),
+                    targetType, opBinding.getOperandType(idx).isNullable());
+          }
+          SqlNode cast = castTo(operand, castType);
+          call.setOperand(idx, cast);
+          validator.setValidatedNodeType(cast, castType);
         }
       }
     }
@@ -1457,6 +1548,7 @@ public class SqlValidatorUtil {
     SqlCall call = sqlCallBinding.getCall();
     List<RelDataType> operandTypes = sqlCallBinding.collectOperandTypes();
     List<SqlNode> operands = call.getOperandList();
+    @Nullable List<SqlNode> adjustedOperands = null;
     RelDataType elementType;
     for (int i = 0; i < operands.size(); i++) {
       if (i % 2 == 0) {
@@ -1465,8 +1557,14 @@ public class SqlValidatorUtil {
         elementType = oddType;
       }
       if (!operandTypes.get(i).equalsSansFieldNames(elementType)) {
-        call.setOperand(i, castTo(operands.get(i), elementType));
+        if (adjustedOperands == null) {
+          adjustedOperands = new ArrayList<>(operands);
+        }
+        adjustedOperands.set(i, castTo(operands.get(i), elementType));
       }
+    }
+    if (adjustedOperands != null) {
+      call.setOperandList(adjustedOperands);
     }
   }
 
@@ -1495,11 +1593,13 @@ public class SqlValidatorUtil {
    * Each element of original 'node' is cast to the desired 'type', preserving the
    * nullability of the 'type'.
    *
+   * @param validator Validator used, to record the new types
    * @param node the {@link SqlNode} the sqlnode representing an array
    * @param type the target {@link RelDataType} the target type
    * @return a new {@link SqlNode} representing the CAST operation
    */
-  private static SqlNode castArrayElementTo(SqlNode node, RelDataType type) {
+  private static SqlNode castArrayElementTo(SqlValidator validator,
+      SqlNode node, RelDataType type) {
     int i = 0;
     for (SqlNode operand : ((SqlBasicCall) node).getOperandList()) {
       SqlNode castedOperand =
@@ -1507,6 +1607,7 @@ public class SqlValidatorUtil {
               operand,
               SqlTypeUtil.convertTypeToSpec(type).withNullable(type.isNullable()));
       ((SqlBasicCall) node).setOperand(i++, castedOperand);
+      validator.setValidatedNodeType(castedOperand, type);
     }
     return node;
   }
@@ -1636,6 +1737,26 @@ public class SqlValidatorUtil {
     @Override protected Map<String, Table> getTableMap() {
       return tableMap;
     }
+  }
+
+  /** Returns whether {@code scope} is enclosed in the scope of a lambda
+   * expression whose parameter types have not yet been inferred.
+   *
+   * <p>Un-inferred parameters have type ANY, and so does any expression
+   * computed from them, whatever its shape; field resolution on such
+   * values must be deferred until the enclosing call has inferred the
+   * parameter types and re-validates the lambda body (see
+   * {@link SqlValidator#validateLambda}). */
+  public static boolean inLambdaWithUntypedParameters(SqlValidatorScope scope) {
+    for (SqlValidatorScope s = scope; s instanceof DelegatingScope;
+        s = ((DelegatingScope) s).getParent()) {
+      if (s instanceof SqlLambdaScope
+          && ((SqlLambdaScope) s).getParameterTypes().values().stream()
+              .anyMatch(t -> t.getSqlTypeName() == SqlTypeName.ANY)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** Flattens any FILTER, WITHIN DISTINCT, WITHIN GROUP surrounding a call to

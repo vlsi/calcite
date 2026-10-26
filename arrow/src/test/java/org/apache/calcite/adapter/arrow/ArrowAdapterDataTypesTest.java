@@ -61,14 +61,54 @@ public class ArrowAdapterDataTypesTest {
     ArrowDataTest arrowDataGenerator = new ArrowDataTest();
     arrowDataGenerator.writeArrowDataType(dataLocationFile);
 
+    File listDataLocationFile = arrowFilesDirectory.resolve("arrowlist.arrow").toFile();
+    ArrowDataTest arrowListDataGenerator = new ArrowDataTest();
+    arrowListDataGenerator.writeArrowListData(listDataLocationFile);
+
+    File binaryDataLocationFile = arrowFilesDirectory.resolve("arrowbinary.arrow").toFile();
+    ArrowDataTest arrowBinaryDataGenerator = new ArrowDataTest();
+    arrowBinaryDataGenerator.writeArrowBinaryData(binaryDataLocationFile);
+
     arrow = ImmutableMap.of("model", modelFileTarget.toAbsolutePath().toString());
+  }
+
+  @Test void testListProject() {
+    String sql = "select \"intListField\" from arrowlist";
+    String plan = "PLAN=ArrowToEnumerableConverter\n"
+        + "  ArrowTableScan(table=[[ARROW, ARROWLIST]], fields=[[0]])\n\n";
+    String result = "intListField=[0, 1]\n"
+        + "intListField=null\n"
+        + "intListField=[2, null]\n";
+    CalciteAssert.that()
+        .with(arrow)
+        .query(sql)
+        .returns(result)
+        .explainContains(plan);
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7541">[CALCITE-7541]
+   * Support Binary Arrow types in Arrow adapter</a>. */
+  @Test void testBinaryProject() {
+    String sql = "select \"binaryField\", \"largeBinaryField\", \"fixedSizeBinaryField\" "
+        + "from arrowbinary";
+    String plan = "PLAN=ArrowToEnumerableConverter\n"
+        + "  ArrowTableScan(table=[[ARROW, ARROWBINARY]], fields=[[0, 1, 2]])\n\n";
+    String result = "binaryField=0001; largeBinaryField=0a0b; fixedSizeBinaryField=141516\n"
+        + "binaryField=null; largeBinaryField=null; fixedSizeBinaryField=null\n"
+        + "binaryField=020304; largeBinaryField=0c0d0e; fixedSizeBinaryField=171819\n";
+    CalciteAssert.that()
+        .with(arrow)
+        .query(sql)
+        .returns(result)
+        .explainContains(plan);
   }
 
   @Test void testTinyIntProject() {
     String sql = "select \"tinyIntField\" from arrowdatatype";
     String plan = "PLAN=ArrowToEnumerableConverter\n"
         + "  ArrowProject(tinyIntField=[$0])\n"
-        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]])\n\n";
+        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])\n\n";
     String result = "tinyIntField=0\ntinyIntField=1\n";
     CalciteAssert.that()
         .with(arrow)
@@ -82,7 +122,7 @@ public class ArrowAdapterDataTypesTest {
     String sql = "select \"smallIntField\" from arrowdatatype";
     String plan = "PLAN=ArrowToEnumerableConverter\n"
         + "  ArrowProject(smallIntField=[$1])\n"
-        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]])\n\n";
+        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])\n\n";
     String result = "smallIntField=0\nsmallIntField=1\n";
     CalciteAssert.that()
         .with(arrow)
@@ -96,7 +136,7 @@ public class ArrowAdapterDataTypesTest {
     String sql = "select \"intField\" from arrowdatatype";
     String plan = "PLAN=ArrowToEnumerableConverter\n"
         + "  ArrowProject(intField=[$2])\n"
-        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]])\n\n";
+        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])\n\n";
     String result = "intField=0\nintField=1\n";
     CalciteAssert.that()
         .with(arrow)
@@ -110,7 +150,7 @@ public class ArrowAdapterDataTypesTest {
     String sql = "select \"longField\" from arrowdatatype";
     String plan = "PLAN=ArrowToEnumerableConverter\n"
         + "  ArrowProject(longField=[$5])\n"
-        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]])\n\n";
+        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])\n\n";
     String result = "longField=0\nlongField=1\n";
     CalciteAssert.that()
         .with(arrow)
@@ -124,7 +164,7 @@ public class ArrowAdapterDataTypesTest {
     String sql = "select \"floatField\" from arrowdatatype";
     String plan = "PLAN=ArrowToEnumerableConverter\n"
         + "  ArrowProject(floatField=[$4])\n"
-        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]])\n\n";
+        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])\n\n";
     String result = "floatField=0.0\nfloatField=1.0\n";
     CalciteAssert.that()
         .with(arrow)
@@ -138,7 +178,7 @@ public class ArrowAdapterDataTypesTest {
     String sql = "select \"doubleField\" from arrowdatatype";
     String plan = "PLAN=ArrowToEnumerableConverter\n"
         + "  ArrowProject(doubleField=[$6])\n"
-        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]])\n\n";
+        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])\n\n";
     String result = "doubleField=0.0\ndoubleField=1.0\n";
     CalciteAssert.that()
         .with(arrow)
@@ -152,7 +192,7 @@ public class ArrowAdapterDataTypesTest {
     String sql = "select \"decimalField\" from arrowdatatype";
     String plan = "PLAN=ArrowToEnumerableConverter\n"
         + "  ArrowProject(decimalField=[$8])\n"
-        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]])\n\n";
+        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])\n\n";
     String result = "decimalField=0.00\ndecimalField=1.00\n";
     CalciteAssert.that()
         .with(arrow)
@@ -166,7 +206,7 @@ public class ArrowAdapterDataTypesTest {
     String sql = "select \"dateField\" from arrowdatatype";
     String plan = "PLAN=ArrowToEnumerableConverter\n"
         + "  ArrowProject(dateField=[$9])\n"
-        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]])\n\n";
+        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])\n\n";
     String result = "dateField=1970-01-01\n"
         + "dateField=1970-01-02\n";
     CalciteAssert.that()
@@ -181,7 +221,7 @@ public class ArrowAdapterDataTypesTest {
     String sql = "select \"booleanField\" from arrowdatatype";
     String plan = "PLAN=ArrowToEnumerableConverter\n"
         + "  ArrowProject(booleanField=[$7])\n"
-        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]])\n\n";
+        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])\n\n";
     String result = "booleanField=null\nbooleanField=true\nbooleanField=false\n";
     CalciteAssert.that()
         .with(arrow)
@@ -198,7 +238,7 @@ public class ArrowAdapterDataTypesTest {
     String sql = "select \"decimalField2\" from arrowdatatype";
     String plan = "PLAN=ArrowToEnumerableConverter\n"
         + "  ArrowProject(decimalField2=[$10])\n"
-        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]])\n\n";
+        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])\n\n";
     String result = "decimalField2=20.000\ndecimalField2=21.000\n";
     CalciteAssert.that()
         .with(arrow)
@@ -212,9 +252,83 @@ public class ArrowAdapterDataTypesTest {
     String sql = "select \"timeField\" from arrowdatatype";
     String plan = "PLAN=ArrowToEnumerableConverter\n"
         + "  ArrowProject(timeField=[$11])\n"
-        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]])\n\n";
+        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])\n\n";
     String result = "timeField=00:00:00\n"
         + "timeField=00:00:01\n";
+    CalciteAssert.that()
+        .with(arrow)
+        .query(sql)
+        .limit(2)
+        .returns(result)
+        .explainContains(plan);
+  }
+
+  @Test void testTimestampSecProject() {
+    String sql = "select \"timestampSecField\" from arrowdatatype";
+    String plan = "PLAN=ArrowToEnumerableConverter\n"
+        + "  ArrowProject(timestampSecField=[$12])\n"
+        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])\n\n";
+    String result = "timestampSecField=2024-01-01 00:00:00\n"
+        + "timestampSecField=2024-01-02 00:00:00\n";
+    CalciteAssert.that()
+        .with(arrow)
+        .query(sql)
+        .limit(2)
+        .returns(result)
+        .explainContains(plan);
+  }
+
+  @Test void testTimestampMilliProject() {
+    String sql = "select \"timestampMilliField\" from arrowdatatype";
+    String plan = "PLAN=ArrowToEnumerableConverter\n"
+        + "  ArrowProject(timestampMilliField=[$13])\n"
+        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])\n\n";
+    String result = "timestampMilliField=2024-01-01 00:00:00.000\n"
+        + "timestampMilliField=2024-01-02 00:00:00.000\n";
+    CalciteAssert.that()
+        .with(arrow)
+        .query(sql)
+        .limit(2)
+        .returns(result)
+        .explainContains(plan);
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6646">[CALCITE-6646]
+   * Support timestamp data type in Arrow adapter</a>.
+   *
+   * <p>The source data is {@code 2024-01-01 00:00:00.123456} in microseconds.
+   * The Enumerable runtime only supports millisecond precision, so the result
+   * is truncated to {@code 2024-01-01 00:00:00.123}. */
+  @Test void testTimestampMicroProject() {
+    String sql = "select \"timestampMicroField\" from arrowdatatype";
+    String plan = "PLAN=ArrowToEnumerableConverter\n"
+        + "  ArrowProject(timestampMicroField=[$14])\n"
+        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])\n\n";
+    String result = "timestampMicroField=2024-01-01 00:00:00.123\n"
+        + "timestampMicroField=2024-01-02 00:00:00.123\n";
+    CalciteAssert.that()
+        .with(arrow)
+        .query(sql)
+        .limit(2)
+        .returns(result)
+        .explainContains(plan);
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6646">[CALCITE-6646]
+   * Arrow adapter should support Timestamp data type</a>.
+   *
+   * <p>The source data is {@code 2024-01-01 00:00:00.123456789} in nanoseconds.
+   * The Enumerable runtime only supports millisecond precision, so the result
+   * is truncated to {@code 2024-01-01 00:00:00.123}. */
+  @Test void testTimestampNanoProject() {
+    String sql = "select \"timestampNanoField\" from arrowdatatype";
+    String plan = "PLAN=ArrowToEnumerableConverter\n"
+        + "  ArrowProject(timestampNanoField=[$15])\n"
+        + "    ArrowTableScan(table=[[ARROW, ARROWDATATYPE]], fields=[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])\n\n";
+    String result = "timestampNanoField=2024-01-01 00:00:00.123\n"
+        + "timestampNanoField=2024-01-02 00:00:00.123\n";
     CalciteAssert.that()
         .with(arrow)
         .query(sql)

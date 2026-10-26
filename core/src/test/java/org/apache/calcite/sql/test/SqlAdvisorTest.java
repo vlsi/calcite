@@ -71,6 +71,10 @@ class SqlAdvisorTest extends SqlValidatorTestCase {
       Collections.singletonList(
           "KEYWORD(*)");
 
+  private static final List<String> ORDER_BY_ALL_KEYWORD =
+      Collections.singletonList(
+          "KEYWORD(ALL)");
+
   protected static final List<String> FROM_KEYWORDS =
       Arrays.asList(
           "KEYWORD(()",
@@ -96,6 +100,7 @@ class SqlAdvisorTest extends SqlValidatorTestCase {
           "TABLE(CATALOG.SALES.DOUBLE_PK)",
           "TABLE(CATALOG.SALES.DEPT_NESTED)",
           "TABLE(CATALOG.SALES.DEPT_NESTED_EXPANDED)",
+          "TABLE(CATALOG.SALES.DEPT_NESTED_PEEK)",
           "TABLE(CATALOG.SALES.BONUS)",
           "TABLE(CATALOG.SALES.ORDERS)",
           "TABLE(CATALOG.SALES.SALGRADE)",
@@ -272,6 +277,7 @@ class SqlAdvisorTest extends SqlValidatorTestCase {
   private static final List<String> ORDER_KEYWORDS =
       Arrays.asList(
           "KEYWORD(,)",
+          "KEYWORD(AS)",
           "KEYWORD(ASC)",
           "KEYWORD(DESC)",
           "KEYWORD(NULLS)");
@@ -308,6 +314,7 @@ class SqlAdvisorTest extends SqlValidatorTestCase {
           "KEYWORD(.)",
           "KEYWORD(/)",
           "KEYWORD(%)",
+          "KEYWORD(:)",
           "KEYWORD(<)",
           "KEYWORD(<=)",
           "KEYWORD(<<)",
@@ -742,10 +749,12 @@ class SqlAdvisorTest extends SqlValidatorTestCase {
     String sql;
 
     sql = "select emp.empno from sales.emp where empno=1 order by ^dummy";
-    f.withSql(sql).assertHint(EXPR_KEYWORDS, EMP_COLUMNS, EMP_TABLE);
+    f.withSql(sql).assertHint(EXPR_KEYWORDS, ORDER_BY_ALL_KEYWORD, EMP_COLUMNS,
+        EMP_TABLE);
 
     sql = "select emp.empno from sales.emp where empno=1 order by ^";
-    f.withSql(sql).assertComplete(EXPR_KEYWORDS, EMP_COLUMNS, EMP_TABLE);
+    f.withSql(sql).assertComplete(EXPR_KEYWORDS, ORDER_BY_ALL_KEYWORD,
+        EMP_COLUMNS, EMP_TABLE);
 
     sql =
         "select emp.empno\n"
@@ -753,7 +762,7 @@ class SqlAdvisorTest extends SqlValidatorTestCase {
             + "  mpno,name,ob,gr,iredate,al,omm,eptno,lacker)\n"
             + "where e.mpno=1 order by ^";
     f.withSql(sql)
-        .assertComplete(EXPR_KEYWORDS,
+        .assertComplete(EXPR_KEYWORDS, ORDER_BY_ALL_KEYWORD,
             Arrays.asList("COLUMN(MPNO)",
                 "COLUMN(NAME)",
                 "COLUMN(OB)",

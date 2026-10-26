@@ -43,6 +43,7 @@ import org.junit.jupiter.api.Test;
 import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -106,6 +107,180 @@ class ServerTest {
     executor.execute((SqlDropFunction) o, context);
     executor.execute((SqlDropSchema) o, context);
     executor.execute((SqlTruncateTable) o, context);
+  }
+
+  @Test void testUpdate() throws Exception {
+    try (Connection c = connect();
+         Statement s = c.createStatement()) {
+      s.execute("create table t (i int not null, j int not null)");
+      s.executeUpdate("insert into t values (1, 10)");
+      s.executeUpdate("insert into t values (2, 20)");
+      s.executeUpdate("insert into t values (3, 30)");
+
+      // Update one row
+      int count = s.executeUpdate("update t set j = 99 where i = 2");
+      assertThat(count, is(1));
+
+      try (ResultSet r = s.executeQuery("select i, j from t order by i")) {
+        assertThat(r.next(), is(true));
+        assertThat(r.getInt(1), is(1));
+        assertThat(r.getInt(2), is(10));
+        assertThat(r.next(), is(true));
+        assertThat(r.getInt(1), is(2));
+        assertThat(r.getInt(2), is(99));
+        assertThat(r.next(), is(true));
+        assertThat(r.getInt(1), is(3));
+        assertThat(r.getInt(2), is(30));
+        assertThat(r.next(), is(false));
+      }
+
+      // Update multiple rows
+      count = s.executeUpdate("update t set j = 0 where i > 1");
+      assertThat(count, is(2));
+
+      try (ResultSet r = s.executeQuery("select sum(j) from t")) {
+        assertThat(r.next(), is(true));
+        assertThat(r.getInt(1), is(10));
+        assertThat(r.next(), is(false));
+      }
+
+      // Update zero rows (no predicate match)
+      count = s.executeUpdate("update t set j = 100 where i = 99");
+      assertThat(count, is(0));
+    }
+  }
+
+  @Test void testUpdateDuplicateRows() throws Exception {
+    try (Connection c = connect();
+         Statement s = c.createStatement()) {
+      s.execute("create table t (i int not null, j int not null)");
+      s.executeUpdate("insert into t values (1, 10)");
+      s.executeUpdate("insert into t values (1, 10)");
+      s.executeUpdate("insert into t values (1, 10)");
+      s.executeUpdate("insert into t values (2, 20)");
+
+      final int count = s.executeUpdate("update t set j = 99 where i = 1 and j = 10");
+      assertThat(count, is(3));
+
+      try (ResultSet r =
+          s.executeQuery("select "
+              + "sum(case when i = 1 and j = 99 then 1 else 0 end), "
+              + "sum(case when i = 1 and j = 10 then 1 else 0 end), "
+              + "sum(case when i = 2 and j = 20 then 1 else 0 end) "
+              + "from t")) {
+        assertThat(r.next(), is(true));
+        assertThat(r.getInt(1), is(3));
+        assertThat(r.getInt(2), is(0));
+        assertThat(r.getInt(3), is(1));
+        assertThat(r.next(), is(false));
+      }
+    }
+  }
+
+  /** Tests that INSERT ... SELECT returns the correct row count when
+   * 0, 1, or multiple rows are produced by the source query.
+   * Exercises {@link org.apache.calcite.server.MutableArrayTable} via the
+   * enumerable INSERT path. */
+  @Test void testInsertSelectRowCount() throws Exception {
+    try (Connection c = connect();
+         Statement s = c.createStatement()) {
+      s.execute("create table src (i int not null, j int not null)");
+      s.executeUpdate("insert into src values (1, 10)");
+      s.executeUpdate("insert into src values (2, 20)");
+      s.execute("create table dst (i int not null, j int not null)");
+
+      // Insert 0 rows (source query returns nothing)
+      int count = s.executeUpdate("insert into dst select * from src where 1 = 0");
+      assertThat(count, is(0));
+
+      // Insert 1 row
+      count = s.executeUpdate("insert into dst select * from src where i = 1");
+      assertThat(count, is(1));
+
+      // Insert multiple rows
+      count = s.executeUpdate("insert into dst select * from src");
+      assertThat(count, is(2));
+    }
+  }
+
+  /** Tests that DELETE returns the correct row count when
+   * 0, 1, or multiple rows match the predicate.
+   * Exercises {@link org.apache.calcite.server.MutableArrayTable} via the
+   * enumerable DELETE path. */
+  @Test void testDelete() throws Exception {
+    try (Connection c = connect();
+         Statement s = c.createStatement()) {
+      s.execute("create table t (i int not null, j int not null)");
+      s.executeUpdate("insert into t values (1, 10)");
+      s.executeUpdate("insert into t values (2, 20)");
+      s.executeUpdate("insert into t values (3, 30)");
+
+      // Delete 0 rows (no predicate match)
+      int count = s.executeUpdate("delete from t where i = 99");
+      assertThat(count, is(0));
+
+      // Verify all 3 rows are still present
+      try (ResultSet r = s.executeQuery("select count(*) from t")) {
+        assertThat(r.next(), is(true));
+        assertThat(r.getInt(1), is(3));
+      }
+
+      // Delete 1 row
+      count = s.executeUpdate("delete from t where i = 2");
+      assertThat(count, is(1));
+
+      // Delete multiple rows (both remaining rows: i=1 and i=3)
+      count = s.executeUpdate("delete from t where i > 0");
+      assertThat(count, is(2));
+
+      // Verify table is empty
+      try (ResultSet r = s.executeQuery("select count(*) from t")) {
+        assertThat(r.next(), is(true));
+        assertThat(r.getInt(1), is(0));
+      }
+    }
+  }
+
+  @Test void testDeleteDuplicateRows() throws Exception {
+    try (Connection c = connect();
+         Statement s = c.createStatement()) {
+      s.execute("create table t (i int not null, j int not null)");
+      s.executeUpdate("insert into t values (1, 10)");
+      s.executeUpdate("insert into t values (1, 10)");
+      s.executeUpdate("insert into t values (1, 10)");
+      s.executeUpdate("insert into t values (2, 20)");
+
+      final int count = s.executeUpdate("delete from t where i = 1 and j = 10");
+      assertThat(count, is(3));
+
+      try (ResultSet r = s.executeQuery("select i, j from t")) {
+        assertThat(r.next(), is(true));
+        assertThat(r.getInt(1), is(2));
+        assertThat(r.getInt(2), is(20));
+        assertThat(r.next(), is(false));
+      }
+    }
+  }
+
+  /** Unit test for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-5796">[CALCITE-5796]
+   * DELETE statement is not effective</a>. */
+  @Test void testDeleteAllRowsWithoutWhereClause() throws Exception {
+    try (Connection c = connect();
+         Statement s = c.createStatement()) {
+      s.execute("create table t (i int not null, j int not null)");
+      s.executeUpdate("insert into t values (1, 10)");
+      s.executeUpdate("insert into t values (2, 20)");
+      s.executeUpdate("insert into t values (3, 30)");
+
+      final int count = s.executeUpdate("delete from t");
+      assertThat(count, is(3));
+
+      try (ResultSet r = s.executeQuery("select count(*) from t")) {
+        assertThat(r.next(), is(true));
+        assertThat(r.getInt(1), is(0));
+      }
+    }
   }
 
   @Test void testStatement() throws Exception {
@@ -296,6 +471,67 @@ class ServerTest {
         s.execute("create or replace table t2 (i int not null)");
         s.executeUpdate("insert into t2 values (1)");
       }, "REPLACE must recreate the table, leaving only one column");
+    }
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testFetchExpressionCannotReferenceInputColumn() throws Exception {
+    try (Connection c = connect();
+         Statement s = c.createStatement()) {
+      s.execute("create table person (id int not null, name varchar(20))");
+      try (PreparedStatement p =
+               c.prepareStatement("insert into person (id, name) values (?, ?)")) {
+        p.setInt(1, 1);
+        p.setString(2, "foo");
+        assertThat(p.executeUpdate(), is(1));
+      }
+
+      SQLException e =
+          assertThrows(
+              SQLException.class, () -> s.executeQuery("select * from person "
+              + "fetch next id rows only"));
+      assertThat(e.getMessage(), containsString("Encountered \"id\""));
+
+      e =
+          assertThrows(
+              SQLException.class, () -> s.executeQuery("select * from person "
+              + "fetch next (id) rows only"));
+      assertThat(e.getMessage(),
+          containsString("FETCH expression cannot reference table column 'ID'"));
+
+      e =
+          assertThrows(
+              SQLException.class, () -> s.executeQuery("select * from person "
+              + "fetch next (1 + id) rows only"));
+      assertThat(e.getMessage(),
+          containsString("FETCH expression cannot reference table column 'ID'"));
+    }
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7662">[CALCITE-7662]
+   * Add expression support for OFFSET</a>. */
+  @Test void testOffsetExpressionCannotReferenceInputColumn() throws Exception {
+    try (Connection c = connect();
+         Statement s = c.createStatement()) {
+      s.execute("create table person (id int not null, name varchar(20))");
+      try (PreparedStatement p =
+               c.prepareStatement("insert into person (id, name) values (?, ?)")) {
+        p.setInt(1, 1);
+        p.setString(2, "foo");
+        assertThat(p.executeUpdate(), is(1));
+      }
+
+      for (String offset : new String[] {"id", "(id)", "1 + id"}) {
+        final SQLException e =
+            assertThrows(
+                SQLException.class, () -> s.executeQuery("select * from person "
+                + "offset " + offset + " rows"));
+        assertThat(e.getMessage(),
+            containsString("OFFSET expression cannot reference table column 'ID'"));
+      }
     }
   }
 

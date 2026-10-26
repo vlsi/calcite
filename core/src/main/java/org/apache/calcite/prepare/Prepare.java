@@ -256,11 +256,20 @@ public abstract class Prepare {
 
     RelRoot root =
         sqlToRelConverter.convertQuery(sqlQuery, needsValidation, true);
-    if (this.context.config().conformance().checkedArithmetic()) {
-      ConvertToChecked checkedConv = new ConvertToChecked(root.rel.getCluster().getRexBuilder());
-      RelNode rel = checkedConv.visit(root.rel);
-      root = root.withRel(rel);
-    }
+    boolean convertToChecked = this.context.config().conformance().checkedArithmetic();
+    // Convert some operations to use checked arithmetic:
+    // - all arithmetic operations on exact types if the conformance requires checked arithmetic
+    // - all arithmetic that produces INTERVAL results, regardless of the conformance
+    //
+    // SqlToRelConverter already runs ConvertToChecked. This second conversion is needed for:
+    // - INTERVAL arithmetic under a conformance without checked
+    //   arithmetic (SqlToRelConverter installs no converter at all)
+    // - expressions that SqlToRelConverter does not build through
+    //   Blackboard#convertExpression
+    ConvertToChecked checkedConv =
+        new ConvertToChecked(root.rel.getCluster().getRexBuilder(), convertToChecked);
+    RelNode rel = checkedConv.visit(root.rel);
+    root = root.withRel(rel);
     Hook.CONVERTED.run(root.rel);
 
     if (timingTracer != null) {
@@ -294,7 +303,9 @@ public abstract class Prepare {
     // storage.
     root = root.withRel(flattenTypes(root.rel, true));
 
-    if (this.context.config().forceDecorrelate()) {
+    // TopDownGeneralDecorrelator cannot be used until the subquerys are completely removed.
+    if (this.context.config().forceDecorrelate()
+        && !this.context.config().topDownGeneralDecorrelationEnabled()) {
       // Sub-query decorrelation.
       root = root.withRel(decorrelate(sqlToRelConverter, sqlQuery, root.rel));
     }

@@ -13,12 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 name: "Validate Gradle Wrapper"
-on: [push, pull_request]
+on:
+  push:
+    branches:
+      - main
+      - 'branch-*'
+  pull_request:
 
 jobs:
   validation:
     name: "Validation"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: gradle/actions/wrapper-validation@v3
+      - uses: actions/checkout@v7
+      - uses: gradle/actions/wrapper-validation@9c971963bec38e04b3d30dcc455b5382be2fdbfb

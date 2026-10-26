@@ -27,6 +27,7 @@ import org.apache.calcite.rel.RelDistribution;
 import org.apache.calcite.rel.RelInput;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.AggregateCall;
+import org.apache.calcite.rel.hint.RelHint;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rex.RexLiteral;
@@ -131,7 +132,7 @@ public class RelJsonReader {
   private void readRel(final Map<String, Object> jsonRel) {
     String id = (String) requireNonNull(jsonRel.get("id"), "jsonRel.id");
     String type = (String) requireNonNull(jsonRel.get("relOp"), "jsonRel.relOp");
-    Constructor constructor = relJson.getConstructor(type);
+    Constructor<? extends RelNode> constructor = relJson.getConstructor(type);
     RelInput input = new RelInput() {
       @Override public RelOptCluster getCluster() {
         return cluster;
@@ -165,6 +166,10 @@ public class RelJsonReader {
           inputs.add(lookupInput(jsonInput));
         }
         return inputs.build();
+      }
+
+      @Override public List<RelHint> getHints() {
+        return relJson.toHints(jsonRel.get("hints"));
       }
 
       @Override public @Nullable RexNode getExpression(String tag) {
@@ -309,7 +314,7 @@ public class RelJsonReader {
       }
     };
     try {
-      final RelNode rel = (RelNode) constructor.newInstance(input);
+      final RelNode rel = constructor.newInstance(input);
       relMap.put(id, rel);
       lastRel = rel;
     } catch (InstantiationException | IllegalAccessException e) {

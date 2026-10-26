@@ -17,14 +17,29 @@
 package org.apache.calcite.test;
 
 import org.apache.calcite.config.CalciteConnectionProperty;
+import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.rel2sql.RelToSqlConverter;
 import org.apache.calcite.rel.type.DelegatingTypeSystem;
+import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rel.type.TimeFrameSet;
+import org.apache.calcite.schema.SchemaPlus;
+import org.apache.calcite.sql.SqlDialect;
+import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlOperatorTable;
+import org.apache.calcite.sql.dialect.CalciteSqlDialect;
 import org.apache.calcite.sql.fun.SqlLibrary;
 import org.apache.calcite.sql.fun.SqlLibraryOperatorTableFactory;
+import org.apache.calcite.sql.parser.SqlParser;
 import org.apache.calcite.sql.parser.SqlParserFixture;
 import org.apache.calcite.sql.parser.babel.SqlBabelParserImpl;
 import org.apache.calcite.sql.validate.SqlConformanceEnum;
+import org.apache.calcite.tools.FrameworkConfig;
+import org.apache.calcite.tools.Frameworks;
+import org.apache.calcite.tools.Planner;
+import org.apache.calcite.tools.Programs;
+import org.apache.calcite.util.TestUtil;
+
+import com.google.common.collect.ImmutableList;
 
 import org.junit.jupiter.api.Test;
 
@@ -35,8 +50,12 @@ import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Types;
+import java.util.List;
 import java.util.Properties;
 import java.util.function.UnaryOperator;
+import java.util.stream.Collectors;
+
+import static org.apache.calcite.test.Matchers.isLinux;
 
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -156,7 +175,177 @@ class BabelTest {
 
     // Postgres cast is invalid with core parser
     p.sql("select 1 ^:^: integer as x")
-        .fails("(?s).*Encountered \":\" at .*");
+        .fails("(?s).*Encountered \":[^\"]*\" at .*");
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7310">
+   * [CALCITE-7310] Support the syntax SELECT * EXCLUDE(columns)</a>. */
+  @Test void testStarExcludeValidation() {
+    final SqlValidatorFixture fixture = Fixtures.forValidator()
+        .withParserConfig(p -> p.withParserFactory(SqlBabelParserImpl.FACTORY));
+
+    fixture.withSql("select * exclude(empno, deptno) from emp")
+        .type(type -> {
+          final List<String> names = type.getFieldList().stream()
+              .map(RelDataTypeField::getName)
+              .collect(Collectors.toList());
+          assertThat(
+              names, is(
+                  ImmutableList.of("ENAME", "JOB", "MGR", "HIREDATE", "SAL", "COMM", "SLACKER")));
+        });
+
+    fixture.withSql("select * exclude (empno, ^foo^) from emp")
+        .fails("SELECT \\* EXCLUDE/EXCEPT list contains unknown column\\(s\\): FOO");
+
+    // Alias form: EXCEPT behaves the same as EXCLUDE
+    fixture.withSql("select * except(empno, deptno) from emp")
+        .type(type -> {
+          final List<String> names = type.getFieldList().stream()
+              .map(RelDataTypeField::getName)
+              .collect(Collectors.toList());
+          assertThat(
+              names, is(
+                  ImmutableList.of("ENAME", "JOB", "MGR", "HIREDATE", "SAL", "COMM", "SLACKER")));
+        });
+
+    fixture.withSql("select * except (empno, ^foo^) from emp")
+        .fails("SELECT \\* EXCLUDE/EXCEPT list contains unknown column\\(s\\): FOO");
+
+    fixture.withSql("select e.* exclude(e.empno, e.ename, e.job, e.mgr)"
+            + " from emp e join dept d on e.deptno = d.deptno")
+        .type(type -> {
+          final List<String> names = type.getFieldList().stream()
+              .map(RelDataTypeField::getName)
+              .collect(Collectors.toList());
+          assertThat(
+              names, is(
+                  ImmutableList.of("HIREDATE", "SAL", "COMM", "DEPTNO", "SLACKER")));
+        });
+
+    fixture.withSql("select e.* exclude(e.empno, e.ename, e.job, e.mgr, ^d.deptno^)"
+            + " from emp e join dept d on e.deptno = d.deptno")
+        .fails("SELECT \\* EXCLUDE/EXCEPT list contains unknown column\\(s\\): D.DEPTNO");
+
+    // Alias form: EXCEPT for table-qualified star
+    fixture.withSql("select e.* except(e.empno, e.ename, e.job, e.mgr)"
+            + " from emp e join dept d on e.deptno = d.deptno")
+        .type(type -> {
+          final List<String> names = type.getFieldList().stream()
+              .map(RelDataTypeField::getName)
+              .collect(Collectors.toList());
+          assertThat(
+              names, is(
+                  ImmutableList.of("HIREDATE", "SAL", "COMM", "DEPTNO", "SLACKER")));
+        });
+
+    fixture.withSql("select e.* except(e.empno, e.ename, e.job, e.mgr, ^d.deptno^)"
+            + " from emp e join dept d on e.deptno = d.deptno")
+        .fails("SELECT \\* EXCLUDE/EXCEPT list contains unknown column\\(s\\): D.DEPTNO");
+
+    fixture.withSql("select e.* exclude(e.empno, e.ename, e.job, e.mgr), d.* exclude(d.name)"
+            + " from emp e join dept d on e.deptno = d.deptno")
+        .type(type -> {
+          final List<String> names = type.getFieldList().stream()
+              .map(RelDataTypeField::getName)
+              .collect(Collectors.toList());
+          assertThat(
+              names, is(
+                  ImmutableList.of("HIREDATE", "SAL", "COMM", "DEPTNO", "SLACKER", "DEPTNO0")));
+        });
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7332">[CALCITE-7332]
+   * SELECT * EXCLUDE list should error when it excludes all columns</a>. */
+  @Test void testStarExcludeWithEmptyColumn() {
+    final SqlValidatorFixture fixture = Fixtures.forValidator()
+        .withParserConfig(p -> p.withParserFactory(SqlBabelParserImpl.FACTORY));
+
+    // To verify the scenario where all columns in the exclude list exist
+    // and the number of columns in the list is equal to the number of columns in the table.
+    fixture.withSql("select * exclude(deptno, deptno) from dept")
+        .type(type -> {
+          final List<String> names = type.getFieldList().stream()
+              .map(RelDataTypeField::getName)
+              .collect(Collectors.toList());
+          assertThat(names, is(ImmutableList.of("NAME")));
+        });
+
+    // To verify that the exclude list contains all columns in the table
+    fixture.withSql("select ^*^ exclude(deptno, name) from dept")
+        .fails("SELECT \\* EXCLUDE/EXCEPT list cannot exclude all columns");
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7532">
+   * [CALCITE-7532] Support the syntax SELECT * REPLACE(expr as column)</a>. */
+  @Test void testStarReplaceValidation() {
+    final SqlValidatorFixture fixture = Fixtures.forValidator()
+        .withParserConfig(p -> p.withParserFactory(SqlBabelParserImpl.FACTORY));
+
+    fixture.withSql("select * replace(empno + 1 as empno) from emp")
+        .type(type -> {
+          final List<String> names = type.getFieldList().stream()
+              .map(RelDataTypeField::getName)
+              .collect(Collectors.toList());
+          assertThat(
+              names, is(
+                  ImmutableList.of("EMPNO", "ENAME", "JOB", "MGR",
+              "HIREDATE", "SAL", "COMM", "DEPTNO", "SLACKER")));
+          // Verify that EMPNO type is still INTEGER (or similar)
+          assertThat(type.getFieldList().get(0).getType().getSqlTypeName().getName(),
+              is("INTEGER"));
+        });
+
+    fixture.withSql("select * replace(empno + 1 as empno, sal * 2 as sal) from emp")
+        .type(type -> {
+          final List<String> names = type.getFieldList().stream()
+              .map(RelDataTypeField::getName)
+              .collect(Collectors.toList());
+          assertThat(
+              names, is(
+                  ImmutableList.of("EMPNO", "ENAME", "JOB", "MGR",
+              "HIREDATE", "SAL", "COMM", "DEPTNO", "SLACKER")));
+        });
+
+    // REPLACE with a completely different type
+    fixture.withSql("select * replace('fixed' as empno) from emp")
+        .type(type -> {
+          final List<String> names = type.getFieldList().stream()
+              .map(RelDataTypeField::getName)
+              .collect(Collectors.toList());
+          assertThat(
+              names, is(
+                  ImmutableList.of("EMPNO", "ENAME", "JOB", "MGR",
+              "HIREDATE", "SAL", "COMM", "DEPTNO", "SLACKER")));
+          // EMPNO was INTEGER, now replaced by a CHAR literal
+          assertThat(type.getFieldList().get(0).getType().getSqlTypeName().getName(),
+              is("CHAR"));
+        });
+
+    // Same column replaced twice
+    fixture.withSql("select * replace(empno + 1 as empno, 'fixed' as ^empno^) from emp")
+        .fails("SELECT \\* REPLACE list contains duplicate column\\(s\\): EMPNO");
+
+    // Unknown column in REPLACE list
+    fixture.withSql("select * replace(empno + 1 as ^foo^) from emp")
+        .fails("SELECT \\* REPLACE list contains unknown column\\(s\\): FOO");
+
+    // Table-qualified star with REPLACE
+    fixture.withSql("select e.* replace(e.empno + 1 as e.empno)"
+            + " from emp e join dept d on e.deptno = d.deptno")
+        .type(type -> {
+          final List<String> names = type.getFieldList().stream()
+              .map(RelDataTypeField::getName)
+              .collect(Collectors.toList());
+          assertThat(
+              names, is(
+                  ImmutableList.of("EMPNO", "ENAME", "JOB", "MGR",
+              "HIREDATE", "SAL", "COMM", "DEPTNO", "SLACKER")));
+        });
+
+    // REPLACE with unknown qualified column
+    fixture.withSql("select e.* replace(e.empno + 1 as ^d.deptno^)"
+            + " from emp e join dept d on e.deptno = d.deptno")
+        .fails("SELECT \\* REPLACE list contains unknown column\\(s\\): DEPTNO");
   }
 
   /** Tests that DATEADD, DATEDIFF, DATEPART, DATE_PART allow custom time
@@ -232,6 +421,24 @@ class BabelTest {
         "EXPR$0=false\n");
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-5696">[CALCITE-5696]
+   * Support trailing comma in SELECT list for Babel parser (like BigQuery)</a>.
+   *
+   * <p>Verifies that queries with a trailing comma in the SELECT list are
+   * not only parsed but executed end to end, with the trailing comma dropped. */
+  @Test void testTrailingCommaInSelectList() {
+    checkSqlResult("standard",
+        "SELECT x, y, FROM (VALUES (1, 2)) as tbl(x, y)",
+        "X=1; Y=2\n");
+    checkSqlResult("standard",
+        "SELECT 1 AS one, 2 AS two, FROM (VALUES (0)) as tbl(z)",
+        "ONE=1; TWO=2\n");
+    checkSqlResult("standard,bigquery",
+        "SELECT x, y, FROM (VALUES (1, 2)) as tbl(x, y)",
+        "X=1; Y=2\n");
+  }
+
   /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-6030">
    * [CALCITE-6030] DATE_PART is not handled by the RexToLixTranslator</a>. */
   @Test void testDatePart() {
@@ -269,6 +476,133 @@ class BabelTest {
         .type("RecordType(VARCHAR(10) NOT NULL NAME) NOT NULL");
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-5347">[CALCITE-5347]
+   * Support parse "SELECT ... BY" in Babel parser</a>. */
+  @Test void testByClause() {
+    final SqlValidatorFixture v = Fixtures.forValidator()
+        .withParserConfig(c -> c.withParserFactory(SqlBabelParserImpl.FACTORY))
+        .withConformance(SqlConformanceEnum.BABEL);
+
+    // Test basic BY clause: SELECT a BY b is sugar for SELECT b, a GROUP BY b ORDER BY b
+    v.withSql("select ename, empno by deptno from emp").ok();
+    // Test BY clause with alias
+    v.withSql("select ename, empno by deptno as dept from emp").ok();
+    // Test BY clause with DESC modifier
+    v.withSql("select ename, empno by deptno DESC from emp").ok();
+    // Test BY clause with multiple columns
+    v.withSql("select ename, empno by deptno, job from emp").ok();
+    // Test complex BY clause example from the feature proposal
+    v.withSql("select e.ename, e.empno by d.name as dept DESC, e.job as title "
+        + "from emp as e join dept as d on e.deptno = d.deptno where d.name = 'SALES'")
+        .ok();
+
+    // Test SELECT BY cannot be used with GROUP BY
+    v.withSql("select ename by deptno from emp ^group by empno^")
+        .fails("SELECT BY cannot be used with GROUP BY");
+    // Test SELECT BY cannot be used with ORDER BY
+    v.withSql("select ename by deptno from emp ^order by empno^")
+        .fails("SELECT BY cannot be used with ORDER BY");
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-5347">[CALCITE-5347]
+   * Add 'SELECT ... BY', a syntax extension that is shorthand for GROUP BY and ORDER BY</a>. */
+  @Test void testByClauseConversion() {
+    // Test basic BY clause: SELECT a BY b is sugar for SELECT b, a GROUP BY b ORDER BY b
+    final String sql = "select ename, empno by deptno from emp";
+    final String expected = "SELECT \"DEPTNO\","
+        + " ANY_VALUE(\"ENAME\") AS \"ENAME\","
+        + " ANY_VALUE(\"EMPNO\") AS \"EMPNO\"\n"
+        + "FROM \"SCOTT\".\"EMP\"\n"
+        + "GROUP BY \"DEPTNO\"\n"
+        + "ORDER BY \"DEPTNO\"";
+    checkSqlConversion(sql, expected);
+
+    // Test BY clause with alias
+    final String sql2 = "select ename, empno by deptno as dept from emp";
+    final String expected2 = "SELECT \"DEPTNO\" AS \"DEPT\","
+        + " ANY_VALUE(\"ENAME\") AS \"ENAME\","
+        + " ANY_VALUE(\"EMPNO\") AS \"EMPNO\"\n"
+        + "FROM \"SCOTT\".\"EMP\"\n"
+        + "GROUP BY \"DEPTNO\"\n"
+        + "ORDER BY \"DEPTNO\"";
+    checkSqlConversion(sql2, expected2);
+
+    // Test BY clause with DESC modifier
+    final String sql3 = "select ename, empno by deptno DESC from emp";
+    final String expected3 = "SELECT \"DEPTNO\","
+        + " ANY_VALUE(\"ENAME\") AS \"ENAME\","
+        + " ANY_VALUE(\"EMPNO\") AS \"EMPNO\"\n"
+        + "FROM \"SCOTT\".\"EMP\"\n"
+        + "GROUP BY \"DEPTNO\"\n"
+        + "ORDER BY \"DEPTNO\" DESC";
+    checkSqlConversion(sql3, expected3);
+
+    // Test BY clause with multiple columns
+    final String sql4 = "select ename, empno by deptno, job from emp";
+    final String expected4 = "SELECT \"DEPTNO\", \"JOB\","
+        + " ANY_VALUE(\"ENAME\") AS \"ENAME\","
+        + " ANY_VALUE(\"EMPNO\") AS \"EMPNO\"\n"
+        + "FROM \"SCOTT\".\"EMP\"\n"
+        + "GROUP BY \"DEPTNO\", \"JOB\"\n"
+        + "ORDER BY \"DEPTNO\", \"JOB\"";
+    checkSqlConversion(sql4, expected4);
+
+    // Test complex BY clause example from the feature proposal
+    final String sql5 = "SELECT e.ename, e.empno BY d.dname AS dept DESC, e.job AS title\n"
+        + "FROM emp AS e\n"
+        + "  JOIN dept AS d ON e.deptno = d.deptno\n"
+        + "WHERE d.loc = 'CHICAGO'";
+    final String expected5 = "SELECT \"DEPT\".\"DNAME\" AS \"DEPT\","
+        + " \"EMP\".\"JOB\" AS \"TITLE\","
+        + " ANY_VALUE(\"EMP\".\"ENAME\") AS \"ENAME\","
+        + " ANY_VALUE(\"EMP\".\"EMPNO\") AS \"EMPNO\"\n"
+        + "FROM \"SCOTT\".\"EMP\"\n"
+        + "INNER JOIN \"SCOTT\".\"DEPT\" ON \"EMP\".\"DEPTNO\" = \"DEPT\".\"DEPTNO\"\n"
+        + "WHERE \"DEPT\".\"LOC\" = 'CHICAGO'\n"
+        + "GROUP BY \"DEPT\".\"DNAME\", \"EMP\".\"JOB\"\n"
+        + "ORDER BY \"DEPT\".\"DNAME\" DESC, \"EMP\".\"JOB\"";
+    checkSqlConversion(sql5, expected5);
+  }
+
+  private void checkSqlConversion(String sql, String expected) {
+    try {
+      final SqlParser.Config parserConfig = SqlParser.config()
+          .withParserFactory(SqlBabelParserImpl.FACTORY);
+
+      final SchemaPlus rootSchema = Frameworks.createRootSchema(true);
+      final SchemaPlus defaultSchema =
+          CalciteAssert.addSchema(rootSchema, CalciteAssert.SchemaSpec.JDBC_SCOTT);
+
+      final FrameworkConfig config = Frameworks.newConfigBuilder()
+          .parserConfig(parserConfig)
+          .defaultSchema(defaultSchema)
+          .programs(Programs.standard())
+          .build();
+
+      final Planner planner = Frameworks.getPlanner(config);
+      final SqlNode parse = planner.parse(sql);
+      final SqlNode validate = planner.validate(parse);
+      RelNode rel = planner.rel(validate).project();
+
+      final SqlDialect dialect = CalciteSqlDialect.DEFAULT;
+      final RelToSqlConverter converter = new RelToSqlConverter(dialect);
+      final SqlNode sqlNode = converter.visitRoot(rel).asStatement();
+      final String actual = sqlNode.toSqlString(c ->
+          c.withDialect(dialect)
+              .withAlwaysUseParentheses(false)
+              .withSelectListItemsOnSeparateLines(false)
+              .withUpdateSetListNewline(false)
+              .withIndentation(0))
+          .getSql();
+
+      assertThat(actual, isLinux(expected));
+    } catch (Exception e) {
+      throw TestUtil.rethrow(e);
+    }
+  }
+
   private void checkSqlResult(String funLibrary, String query, String result) {
     CalciteAssert.that()
         .with(CalciteConnectionProperty.PARSER_FACTORY,
@@ -277,4 +611,84 @@ class BabelTest {
         .query(query)
         .returns(result);
   }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-5406">[CALCITE-5406]
+   * Support the SELECT DISTINCT ON statement</a>. */
+  @Test void testDistinctOn() {
+    final SqlValidatorFixture v = Fixtures.forValidator()
+        .withParserConfig(c -> c.withParserFactory(SqlBabelParserImpl.FACTORY))
+        .withConformance(SqlConformanceEnum.BABEL);
+
+    // Basic DISTINCT ON
+    v.withSql("select distinct on (deptno) empno, ename from emp order by deptno, empno")
+        .ok();
+
+    // DISTINCT ON with multiple columns
+    v.withSql("select distinct on (deptno, job) empno, ename from emp order by deptno, job, empno")
+        .ok();
+
+    // DISTINCT ON with expression
+    v.withSql("select distinct on (deptno) empno, sal * 12 as annual_sal "
+            + "from emp order by deptno, sal desc").ok();
+
+    // DISTINCT ON without ORDER BY should fail
+    v.withSql("^select distinct on (deptno) empno from emp^")
+        .fails("SELECT DISTINCT ON requires an ORDER BY clause");
+
+    // DISTINCT ON with ORDER BY mismatch should fail
+    v.withSql("select distinct on (deptno) empno from emp order by ^empno^")
+        .fails("SELECT DISTINCT ON expressions must match ORDER BY expressions");
+
+    // DISTINCT and DISTINCT ON are mutually exclusive
+    v.withSql("SELECT DISTINCT ^DISTINCT^ ON (deptno) empno, ename\n"
+        + "FROM emp\n"
+        + "ORDER BY deptno, empno")
+        .fails("(?s)Incorrect syntax near the keyword 'DISTINCT' at line 1, column 17.*");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7337">[CALCITE-7337]
+   * Add age function (enabled in PostgreSQL library)</a>. */
+  @Test void testAgeFunction() {
+    checkSqlResult("postgresql",
+        "SELECT AGE(timestamp '2023-12-25', timestamp '2020-01-01') FROM (VALUES (1)) t",
+        "EXPR$0=3 years 11 mons 24 days\n");
+
+    checkSqlResult("postgresql",
+        "SELECT AGE(timestamp '2023-01-01', timestamp '2023-01-01') FROM (VALUES (1)) t",
+        "EXPR$0=00:00:00\n");
+
+    checkSqlResult("postgresql",
+        "SELECT AGE(timestamp '2020-01-01', timestamp '2023-12-25') FROM (VALUES (1)) t",
+        "EXPR$0=-3 years -11 mons -24 days\n");
+
+    checkSqlResult("postgresql",
+        "SELECT AGE(timestamp '2023-02-01', timestamp '2023-01-31') FROM (VALUES (1)) t",
+        "EXPR$0=1 day\n");
+
+    checkSqlResult("postgresql",
+        "SELECT AGE(timestamp '2023-12-26 14:30:00', timestamp '2023-12-25 14:30:00') FROM (VALUES (1)) t",
+        "EXPR$0=1 day\n");
+
+    checkSqlResult("postgresql",
+        "SELECT AGE(timestamp '2023-12-25 00:00:00', timestamp '2020-01-01 23:59:59') FROM (VALUES (1)) t",
+        "EXPR$0=3 years 11 mons 23 days 00:00:01\n");
+
+    checkSqlResult("postgresql",
+        "SELECT AGE(timestamp '2023-12-25 00:00:00.101', timestamp '2020-01-01 23:59:59.202') FROM (VALUES (1)) t",
+        "EXPR$0=3 years 11 mons 23 days 00:00:00.899\n");
+
+    checkSqlResult("postgresql",
+        "SELECT AGE(timestamp '2023-12-25 12:00:00.500', timestamp '2023-12-25 12:00:00.000') FROM (VALUES (1)) t",
+        "EXPR$0=00:00:00.5\n");
+
+    CalciteAssert.that()
+        .with(CalciteConnectionProperty.PARSER_FACTORY,
+            SqlBabelParserImpl.class.getName() + "#FACTORY")
+        .with(CalciteConnectionProperty.FUN, "postgresql")
+        .query("SELECT AGE(timestamp '2023-12-25') FROM (VALUES (1)) t")
+        .runs();
+  }
+
 }

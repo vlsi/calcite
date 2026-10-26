@@ -20,10 +20,13 @@ import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelRule;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.rel.RelCollationTraitDef;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Calc;
 import org.apache.calcite.rel.core.Project;
+import org.apache.calcite.rel.hint.RelHint;
 import org.apache.calcite.rel.logical.LogicalCalc;
+import org.apache.calcite.rel.logical.LogicalProject;
 import org.apache.calcite.rel.logical.LogicalWindow;
 import org.apache.calcite.rex.RexBiVisitorImpl;
 import org.apache.calcite.rex.RexCall;
@@ -51,6 +54,7 @@ import org.immutables.value.Value;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.List;
@@ -156,7 +160,9 @@ public abstract class ProjectToWindowRule
               project.getRowType(),
               project.getCluster().getRexBuilder());
       // temporary LogicalCalc, never registered
-      final LogicalCalc calc = LogicalCalc.create(input, program);
+      final LogicalCalc calc =
+          new LogicalCalc(project.getCluster(), project.getTraitSet(),
+              project.getHints(), input, program);
       final CalcRelSplitter transform =
           new WindowedAggRelSplitter(calc, call.builder()) {
             @Override protected RelNode handle(RelNode rel) {
@@ -190,7 +196,7 @@ public abstract class ProjectToWindowRule
       ProjectToLogicalProjectAndWindowRuleConfig DEFAULT =
           ImmutableProjectToLogicalProjectAndWindowRuleConfig.of()
               .withOperandSupplier(b ->
-                  b.operand(Project.class)
+                  b.operand(LogicalProject.class)
                       .predicate(Project::containsOver)
                       .anyInputs())
               .withDescription("ProjectToWindowRule:project");
@@ -226,11 +232,11 @@ public abstract class ProjectToWindowRule
 
             @Override protected RelNode makeRel(RelOptCluster cluster,
                 RelTraitSet traitSet, RelBuilder relBuilder, RelNode input,
-                RexProgram program) {
+                RexProgram program, List<RelHint> hints) {
               assert !program.containsAggs();
               program = program.normalize(cluster.getRexBuilder(), null);
               return super.makeRel(cluster, traitSet, relBuilder, input,
-                  program);
+                  program, hints);
             }
         },
         new RelType("WinAggRelType") {
@@ -255,11 +261,12 @@ public abstract class ProjectToWindowRule
           }
 
           @Override protected RelNode makeRel(RelOptCluster cluster, RelTraitSet traitSet,
-              RelBuilder relBuilder, RelNode input, RexProgram program) {
+              RelBuilder relBuilder, RelNode input, RexProgram program, List<RelHint> hints) {
             checkArgument(program.getCondition() == null,
                 "WindowedAggregateRel cannot accept a condition");
+            traitSet = traitSet.replaceIfs(RelCollationTraitDef.INSTANCE, Collections::emptyList);
             return LogicalWindow.create(cluster, traitSet, relBuilder, input,
-                program);
+                program, hints);
           }
         }
     };

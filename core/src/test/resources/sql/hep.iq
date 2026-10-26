@@ -77,6 +77,53 @@ EnumerableAggregate(group=[{0, 1}])
 !plan
 !set hep-rules original
 
+# [CALCITE-7638] SetOpToFilterRule MINUS drops rows when right-side filters evaluate to UNKNOWN.
+!set hep-rules "
++CoreRules.PROJECT_FILTER_TRANSPOSE,
++CoreRules.MINUS_FILTER_TO_FILTER"
+
+SELECT mgr, comm FROM (
+  SELECT mgr, comm FROM emp WHERE mgr = 7698
+  EXCEPT
+  SELECT mgr, comm FROM emp WHERE comm = 500
+) ORDER BY comm NULLS LAST;
++------+---------+
+| MGR  | COMM    |
++------+---------+
+| 7698 |    0.00 |
+| 7698 |  300.00 |
+| 7698 | 1400.00 |
+| 7698 |         |
++------+---------+
+(4 rows)
+
+!ok
+EnumerableSort(sort0=[$1], dir0=[ASC])
+  EnumerableAggregate(group=[{0, 1}])
+    EnumerableCalc(expr#0..7=[{inputs}], expr#8=[CAST($t3):INTEGER], expr#9=[7698], expr#10=[=($t8, $t9)], expr#11=[CAST($t6):DECIMAL(12, 2)], expr#12=[500.00:DECIMAL(12, 2)], expr#13=[=($t11, $t12)], expr#14=[IS NOT TRUE($t13)], expr#15=[AND($t10, $t14)], MGR=[$t3], COMM=[$t6], $condition=[$t15])
+      EnumerableTableScan(table=[[scott, EMP]])
+!plan
+
+# [CALCITE-7645] AggregateUnionTransposeRule must preserve aggregate FILTER when creating pushed-down aggregates
+!set hep-rules "
++AGGREGATE_UNION_TRANSPOSE"
+
+select min(v) filter (where p) as m
+from (
+  select * from (values (10, false), (100, true)) as t(v, p)
+  union all
+  select * from (values (cast(null as integer), true), (200, true)) as t(v, p)
+);
++-----+
+| M   |
++-----+
+| 100 |
++-----+
+(1 row)
+
+!ok
+!set hep-rules original
+
 # Testing with the planner-rules shows that due to cost-based selection issues,
 # the planner fails to choose a plan that includes the Aggregate operator.
 !set planner-rules "
@@ -141,6 +188,8 @@ WHERE e1.mgr > 12
 (5 rows)
 
 !ok
+
+!if (use_old_decorr) {
 EnumerableCalc(expr#0..3=[{inputs}], MGR=[$t1], COMM=[$t2])
   EnumerableHashJoin(condition=[=($1, $3)], joinType=[inner])
     EnumerableCalc(expr#0..7=[{inputs}], expr#8=[CAST($t3):INTEGER], expr#9=[12], expr#10=[>($t8, $t9)], EMPNO=[$t0], MGR=[$t3], COMM=[$t6], $condition=[$t10])
@@ -149,6 +198,217 @@ EnumerableCalc(expr#0..3=[{inputs}], MGR=[$t1], COMM=[$t2])
       EnumerableCalc(expr#0..7=[{inputs}], expr#8=[CAST($t6):DECIMAL(12, 2)], expr#9=[5.00:DECIMAL(12, 2)], expr#10=[>($t8, $t9)], expr#11=[IS NOT NULL($t3)], expr#12=[AND($t10, $t11)], MGR=[$t3], $condition=[$t12])
         EnumerableTableScan(table=[[scott, EMP]])
 !plan
+!}
+
+!if (use_new_decorr) {
+EnumerableCalc(expr#0..2=[{inputs}], MGR=[$t1], COMM=[$t2])
+  EnumerableHashJoin(condition=[IS NOT DISTINCT FROM($1, $4)], joinType=[semi])
+    EnumerableCalc(expr#0..7=[{inputs}], expr#8=[CAST($t3):INTEGER], expr#9=[12], expr#10=[>($t8, $t9)], EMPNO=[$t0], MGR=[$t3], COMM=[$t6], $condition=[$t10])
+      EnumerableTableScan(table=[[scott, EMP]])
+    EnumerableCalc(expr#0..7=[{inputs}], expr#8=[CAST($t6):DECIMAL(12, 2)], expr#9=[5.00:DECIMAL(12, 2)], expr#10=[>($t8, $t9)], expr#11=[IS NOT NULL($t3)], expr#12=[AND($t10, $t11)], EMPNO=[$t0], MGR=[$t3], COMM=[$t6], $condition=[$t12])
+      EnumerableTableScan(table=[[scott, EMP]])
+!plan
+!}
+!set hep-rules original
+
+# Test predicate push down with/without expand disjunction.
+with t1 (id1, col11, col12) as (values (1, 11, 111), (2, 12, 122), (3, 13, 133), (4, 14, 144), (5, 15, 155)),
+t2 (id2, col21, col22) as (values (1, 21, 211), (2, 22, 222), (3, 23, 233), (4, 24, 244), (5, 25, 255)),
+t3 (id3, col31, col32) as (values (1, 31, 311), (2, 32, 322), (3, 33, 333), (4, 34, 344), (5, 35, 355))
+select * from t1, t2, t3 where id1 = id2 and id1 = id3 and
+(
+(col11 > 11 and col31 <= 32)
+or
+(col22 < 255 and col32 >= 344)
+);
++-----+-------+-------+-----+-------+-------+-----+-------+-------+
+| ID1 | COL11 | COL12 | ID2 | COL21 | COL22 | ID3 | COL31 | COL32 |
++-----+-------+-------+-----+-------+-------+-----+-------+-------+
+|   2 |    12 |   122 |   2 |    22 |   222 |   2 |    32 |   322 |
+|   4 |    14 |   144 |   4 |    24 |   244 |   4 |    34 |   344 |
++-----+-------+-------+-----+-------+-------+-----+-------+-------+
+(2 rows)
+
+!ok
+
+EnumerableMergeJoin(condition=[AND(=($0, $6), OR(AND(>($1, 11), <=($7, 32)), AND(<($5, 255), >=($8, 344))))], joinType=[inner])
+  EnumerableMergeJoin(condition=[=($0, $3)], joinType=[inner])
+    EnumerableValues(tuples=[[{ 1, 11, 111 }, { 2, 12, 122 }, { 3, 13, 133 }, { 4, 14, 144 }, { 5, 15, 155 }]])
+    EnumerableValues(tuples=[[{ 1, 21, 211 }, { 2, 22, 222 }, { 3, 23, 233 }, { 4, 24, 244 }, { 5, 25, 255 }]])
+  EnumerableValues(tuples=[[{ 1, 31, 311 }, { 2, 32, 322 }, { 3, 33, 333 }, { 4, 34, 344 }, { 5, 35, 355 }]])
+!plan
+
+!set hep-rules "
++CoreRules.EXPAND_FILTER_DISJUNCTION_LOCAL,
++CoreRules.EXPAND_JOIN_DISJUNCTION_LOCAL,
++CoreRules.JOIN_CONDITION_PUSH,
++CoreRules.FILTER_INTO_JOIN"
+
+with t1 (id1, col11, col12) as (values (1, 11, 111), (2, 12, 122), (3, 13, 133), (4, 14, 144), (5, 15, 155)),
+t2 (id2, col21, col22) as (values (1, 21, 211), (2, 22, 222), (3, 23, 233), (4, 24, 244), (5, 25, 255)),
+t3 (id3, col31, col32) as (values (1, 31, 311), (2, 32, 322), (3, 33, 333), (4, 34, 344), (5, 35, 355))
+select * from t1, t2, t3 where id1 = id2 and id1 = id3 and
+(
+(col11 > 11 and col31 <= 32)
+or
+(col22 < 255 and col32 >= 344)
+);
++-----+-------+-------+-----+-------+-------+-----+-------+-------+
+| ID1 | COL11 | COL12 | ID2 | COL21 | COL22 | ID3 | COL31 | COL32 |
++-----+-------+-------+-----+-------+-------+-----+-------+-------+
+|   2 |    12 |   122 |   2 |    22 |   222 |   2 |    32 |   322 |
+|   4 |    14 |   144 |   4 |    24 |   244 |   4 |    34 |   344 |
++-----+-------+-------+-----+-------+-------+-----+-------+-------+
+(2 rows)
+
+!ok
+
+!if (use_old_decorr) {
+EnumerableCalc(expr#0..8=[{inputs}], proj#0..8=[{exprs}])
+  EnumerableHashJoin(condition=[AND(=($0, $6), OR(AND(>($1, 11), <=($7, 32)), AND(<($5, 255), >=($8, 344))))], joinType=[inner])
+    EnumerableMergeJoin(condition=[AND(=($0, $3), OR(>($1, 11), <($5, 255)))], joinType=[inner])
+      EnumerableValues(tuples=[[{ 1, 11, 111 }, { 2, 12, 122 }, { 3, 13, 133 }, { 4, 14, 144 }, { 5, 15, 155 }]])
+      EnumerableValues(tuples=[[{ 1, 21, 211 }, { 2, 22, 222 }, { 3, 23, 233 }, { 4, 24, 244 }, { 5, 25, 255 }]])
+    EnumerableCalc(expr#0..2=[{inputs}], expr#3=[32], expr#4=[<=($t1, $t3)], expr#5=[344], expr#6=[>=($t2, $t5)], expr#7=[OR($t4, $t6)], proj#0..2=[{exprs}], $condition=[$t7])
+      EnumerableValues(tuples=[[{ 1, 31, 311 }, { 2, 32, 322 }, { 3, 33, 333 }, { 4, 34, 344 }, { 5, 35, 355 }]])
+!plan
+!}
+
+!if (use_new_decorr) {
+EnumerableHashJoin(condition=[AND(=($0, $6), OR(AND(>($1, 11), <=($7, 32)), AND(<($5, 255), >=($8, 344))))], joinType=[inner])
+  EnumerableMergeJoin(condition=[AND(=($0, $3), OR(>($1, 11), <($5, 255)))], joinType=[inner])
+    EnumerableValues(tuples=[[{ 1, 11, 111 }, { 2, 12, 122 }, { 3, 13, 133 }, { 4, 14, 144 }, { 5, 15, 155 }]])
+    EnumerableValues(tuples=[[{ 1, 21, 211 }, { 2, 22, 222 }, { 3, 23, 233 }, { 4, 24, 244 }, { 5, 25, 255 }]])
+  EnumerableCalc(expr#0..2=[{inputs}], expr#3=[32], expr#4=[<=($t1, $t3)], expr#5=[344], expr#6=[>=($t2, $t5)], expr#7=[OR($t4, $t6)], proj#0..2=[{exprs}], $condition=[$t7])
+    EnumerableValues(tuples=[[{ 1, 31, 311 }, { 2, 32, 322 }, { 3, 33, 333 }, { 4, 34, 344 }, { 5, 35, 355 }]])
+!plan
+!}
+!set hep-rules original
+
+# [CALCITE-7634] JoinExpandOrToUnionRule incorrectly expands OR branches with non-equi predicates referencing both join inputs
+!set hep-rules "
++CoreRules.JOIN_EXPAND_OR_TO_UNION_RULE"
+
+with emp_nulls (empno, mgr, sal, comm, deptno) as (values
+  (1, 10, 100, cast(null as integer), 20),
+  (2, 10, 200, 5, 20),
+  (3, 30, 300, cast(null as integer), 30))
+select p1.empno as e1, p2.empno as e2
+from emp_nulls as p1
+inner join emp_nulls as p2 on (p1.empno = p2.empno and p1.sal < p2.sal)
+or (p1.mgr = p2.mgr and p1.comm < p2.comm)
+or p1.deptno = p2.deptno
+order by e1, e2;
++----+----+
+| E1 | E2 |
++----+----+
+|  1 |  1 |
+|  1 |  2 |
+|  2 |  1 |
+|  2 |  2 |
+|  3 |  3 |
++----+----+
+(5 rows)
+
+!ok
+EnumerableSort(sort0=[$0], sort1=[$1], dir0=[ASC], dir1=[ASC])
+  EnumerableCalc(expr#0..9=[{inputs}], E1=[$t0], E2=[$t5])
+    EnumerableUnion(all=[true])
+      EnumerableNestedLoopJoin(condition=[OR(AND(=($0, $5), <($2, $7)), AND(=($1, $6), <($3, $8)))], joinType=[inner])
+        EnumerableValues(tuples=[[{ 1, 10, 100, null, 20 }, { 2, 10, 200, 5, 20 }, { 3, 30, 300, null, 30 }]])
+        EnumerableValues(tuples=[[{ 1, 10, 100, null, 20 }, { 2, 10, 200, 5, 20 }, { 3, 30, 300, null, 30 }]])
+      EnumerableMergeJoin(condition=[AND(=($4, $9), IS NOT TRUE(OR(AND(=($0, $5), <($2, $7)), AND(=($1, $6), <($3, $8)))))], joinType=[inner])
+        EnumerableValues(tuples=[[{ 1, 10, 100, null, 20 }, { 2, 10, 200, 5, 20 }, { 3, 30, 300, null, 30 }]])
+        EnumerableValues(tuples=[[{ 1, 10, 100, null, 20 }, { 2, 10, 200, 5, 20 }, { 3, 30, 300, null, 30 }]])
+!plan
+!set hep-rules original
+
+# [CALCITE-5740] Support for AggToSemiJoinRule
+!set hep-rules "
++CoreRules.AGGREGATE_PROJECT_MERGE,
++CoreRules.AGGREGATE_TO_SEMI_JOIN"
+
+select dept.deptno, count(*)
+from dept join (
+  select distinct deptno from emp
+  where sal > 100) using (deptno)
+group by dept.deptno;
++--------+--------+
+| DEPTNO | EXPR$1 |
++--------+--------+
+|     10 |      1 |
+|     20 |      1 |
+|     30 |      1 |
++--------+--------+
+(3 rows)
+
+!ok
+EnumerableAggregate(group=[{0}], EXPR$1=[COUNT()])
+  EnumerableHashJoin(condition=[=($0, $3)], joinType=[semi])
+    EnumerableCalc(expr#0..2=[{inputs}], DEPTNO=[$t0])
+      EnumerableTableScan(table=[[scott, DEPT]])
+    EnumerableCalc(expr#0..7=[{inputs}], expr#8=[CAST($t5):DECIMAL(12, 2)], expr#9=[100.00:DECIMAL(12, 2)], expr#10=[>($t8, $t9)], EMPNO=[$t0], SAL=[$t5], DEPTNO=[$t7], $condition=[$t10])
+      EnumerableTableScan(table=[[scott, EMP]])
+!plan
+
+!set hep-rules original
+
+# [CALCITE-7779] Optimization rule FilterAggregateTransposeRule rewrites queries to semantically non-equivalent ones
+!set hep-rules "
++CoreRules.AGGREGATE_PROJECT_MERGE,
++CoreRules.FILTER_AGGREGATE_TRANSPOSE"
+
+select dname, loc
+from dept
+group by grouping sets ((dname), (dname, loc))
+having loc is null;
++------------+-----+
+| DNAME      | LOC |
++------------+-----+
+| ACCOUNTING |     |
+| OPERATIONS |     |
+| RESEARCH   |     |
+| SALES      |     |
++------------+-----+
+(4 rows)
+
+!ok
+!set hep-rules original
+
+# [CALCITE-7687] Aggregate selectivity estimation uses incorrect column references
+!set hep-rules "
++CoreRules.AGGREGATE_PROJECT_MERGE"
+
+# Display the result of the query explained below.
+with t(n, a, r) as (
+  values (0, 'a', cast(row(10) as row(d integer))),
+         (1, 'b', cast(row(20) as row(d integer)))
+)
+select a, r, sum(n) as s
+from t
+group by a, r
+having (r).d = 10;
++---+------+---+
+| A | R    | S |
++---+------+---+
+| a | {10} | 0 |
++---+------+---+
+(1 row)
+
+!ok
+
+# Verify aggregate selectivity estimation during EXPLAIN preparation does not fail.
+explain plan including all attributes for
+with t(n, a, r) as (
+  values (0, 'a', cast(row(10) as row(d integer))),
+         (1, 'b', cast(row(20) as row(d integer)))
+)
+select a, r, sum(n) as s
+from t
+group by a, r
+having (r).d = 10;
+PLAN VARCHAR NOT NULL
+!type
 !set hep-rules original
 
 # End hep.iq

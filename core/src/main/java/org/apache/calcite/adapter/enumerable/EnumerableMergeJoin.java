@@ -18,6 +18,7 @@ package org.apache.calcite.adapter.enumerable;
 
 import org.apache.calcite.adapter.java.JavaTypeFactory;
 import org.apache.calcite.linq4j.EnumerableDefaults;
+import org.apache.calcite.linq4j.function.Function1;
 import org.apache.calcite.linq4j.tree.BlockBuilder;
 import org.apache.calcite.linq4j.tree.Expression;
 import org.apache.calcite.linq4j.tree.Expressions;
@@ -34,6 +35,7 @@ import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.CorrelationId;
 import org.apache.calcite.rel.core.Join;
+import org.apache.calcite.rel.core.JoinInfo;
 import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rel.metadata.RelMdCollation;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
@@ -71,6 +73,9 @@ import static java.util.Objects.requireNonNull;
  * {@link EnumerableConvention enumerable calling convention} using
  * a merge algorithm. */
 public class EnumerableMergeJoin extends Join implements EnumerableRel {
+  @SuppressWarnings("HidingField")
+  private final JoinInfo joinInfo;
+
   protected EnumerableMergeJoin(
       RelOptCluster cluster,
       RelTraitSet traits,
@@ -80,6 +85,12 @@ public class EnumerableMergeJoin extends Join implements EnumerableRel {
       Set<CorrelationId> variablesSet,
       JoinRelType joinType) {
     super(cluster, traits, ImmutableList.of(), left, right, condition, variablesSet, joinType);
+    // TODO: support IS NOT DISTINCT FROM condition as join keys of MergeJoin
+    // EnumerableMergeJoin cannot use IS NOT DISTINCT FROM condition as join keys
+    // (In the algorithm of MergeJoin in Enumerable convention, it will stop
+    // when leftKey or rightKey is NULL), so we create a new JoinInfo that only
+    // considers EQUALS.
+    this.joinInfo = JoinInfo.createWithStrictEquality(left, right, condition);
     assert getConvention() instanceof EnumerableConvention;
     final List<RelCollation> leftCollations = getCollations(left.getTraitSet());
     final List<RelCollation> rightCollations = getCollations(right.getTraitSet());
@@ -520,9 +531,12 @@ public class EnumerableMergeJoin extends Join implements EnumerableRel {
                 Expressions.list(
                     leftExpression,
                     rightExpression,
-                    Expressions.lambda(
+                    // Force Function1: a single BOOLEAN key would otherwise
+                    // deduce Predicate1, which does not match the signature of
+                    // EnumerableDefaults.mergeJoin
+                    Expressions.lambda(Function1.class,
                         leftKeyPhysType.record(leftExpressions), left_),
-                    Expressions.lambda(
+                    Expressions.lambda(Function1.class,
                         rightKeyPhysType.record(rightExpressions), right_),
                     predicate,
                     EnumUtils.joinSelector(joinType,

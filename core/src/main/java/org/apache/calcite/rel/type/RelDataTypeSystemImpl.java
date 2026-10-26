@@ -20,12 +20,16 @@ import org.apache.calcite.sql.type.BasicSqlType;
 import org.apache.calcite.sql.type.SqlTypeFamily;
 import org.apache.calcite.sql.type.SqlTypeName;
 
+import com.google.common.collect.ImmutableList;
+
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 import java.math.RoundingMode;
 
 import static org.apache.calcite.sql.type.SqlTypeName.DEFAULT_INTERVAL_FRACTIONAL_SECOND_PRECISION;
 import static org.apache.calcite.sql.type.SqlTypeName.MIN_INTERVAL_START_PRECISION;
+
+import static java.util.Objects.requireNonNull;
 
 /** Default implementation of
  * {@link org.apache.calcite.rel.type.RelDataTypeSystem},
@@ -46,8 +50,7 @@ public abstract class RelDataTypeSystemImpl implements RelDataTypeSystem {
   @Override public int getMaxScale(SqlTypeName typeName) {
     switch (typeName) {
     case DECIMAL:
-      // from 1.39, this will be 'return 19;'
-      return getMaxNumericScale();
+      return 19;
     case INTERVAL_YEAR:
     case INTERVAL_YEAR_MONTH:
     case INTERVAL_MONTH:
@@ -107,8 +110,7 @@ public abstract class RelDataTypeSystemImpl implements RelDataTypeSystem {
     case VARBINARY:
       return RelDataType.PRECISION_NOT_SPECIFIED;
     case DECIMAL:
-      // from 1.39, this will be 'return getMaxPrecision(typeName);'
-      return getMaxNumericPrecision();
+      return getMaxPrecision(typeName);
     case INTERVAL_YEAR:
     case INTERVAL_YEAR_MONTH:
     case INTERVAL_MONTH:
@@ -187,8 +189,7 @@ public abstract class RelDataTypeSystemImpl implements RelDataTypeSystem {
   @Override public int getMaxPrecision(SqlTypeName typeName) {
     switch (typeName) {
     case DECIMAL:
-      // from 1.39, this will be 'return 19;'
-      return getMaxNumericPrecision();
+      return 19;
     case VARCHAR:
     case CHAR:
       return 65536;
@@ -262,13 +263,13 @@ public abstract class RelDataTypeSystemImpl implements RelDataTypeSystem {
   }
 
   @SuppressWarnings("deprecation")
-  @Override public int getMaxNumericScale() {
-    return 19;
+  @Override public final int getMaxNumericScale() {
+    return getMaxScale(SqlTypeName.DECIMAL);
   }
 
   @SuppressWarnings("deprecation")
-  @Override public int getMaxNumericPrecision() {
-    return 19;
+  @Override public final int getMaxNumericPrecision() {
+    return getMaxPrecision(SqlTypeName.DECIMAL);
   }
 
   @Override public RoundingMode roundingMode() {
@@ -372,7 +373,10 @@ public abstract class RelDataTypeSystemImpl implements RelDataTypeSystem {
 
   @Override public RelDataType deriveCovarType(RelDataTypeFactory typeFactory,
       RelDataType arg0Type, RelDataType arg1Type) {
-    return arg0Type;
+    RelDataType type =
+        typeFactory.leastRestrictive(ImmutableList.of(arg0Type, arg1Type));
+    return requireNonNull(type, () ->
+        "no least restrictive type for " + arg0Type + " and " + arg1Type);
   }
 
   @Override public RelDataType deriveFractionalRankType(RelDataTypeFactory typeFactory) {

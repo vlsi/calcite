@@ -29,15 +29,40 @@ import org.apache.calcite.util.BuiltInMethod;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.Arrays;
 
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * Tests for {@link EnumUtils}.
  */
 public final class EnumUtilsTest {
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-6284">[CALCITE-6284]
+   * Invalid conversion triggers ClassCastException</a>. */
+  @Test void testObjectToNumberConvert() {
+    // Object x;
+    final ParameterExpression objectVariable =
+        Expressions.parameter(0, Object.class, "x");
+    final Expression objectToNumber =
+        EnumUtils.convert(objectVariable, Number.class);
+    assertThat(Expressions.toString(objectToNumber),
+        is("x == null ? (java.math.BigDecimal) null"
+            + " : org.apache.calcite.runtime.SqlFunctions.toBigDecimal(x)"));
+
+    // String s;
+    final ParameterExpression stringVariable =
+        Expressions.parameter(0, String.class, "s");
+    final Expression stringToNumber =
+        EnumUtils.convert(stringVariable, Number.class);
+    assertThat(Expressions.toString(stringToNumber),
+        is("s == null ? (java.math.BigDecimal) null"
+            + " : org.apache.calcite.runtime.SqlFunctions.toBigDecimal(s)"));
+  }
 
   @Test void testDateTypeToInnerTypeConvert() {
     // java.sql.Date x;
@@ -169,6 +194,30 @@ public final class EnumUtilsTest {
     final Expression e2 = EnumUtils.convert(nullLiteral2, String.class);
     assertThat(Expressions.toString(e1), is("(String) null"));
     assertThat(Expressions.toString(e2), is("(String) (Object) null"));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7624">[CALCITE-7624]
+   * Support BigDecimal for FETCH and OFFSET in Enumerable</a>. */
+  @Test void testNumberToBigDecimalPreservesFractionalNumber() {
+    final FetchOffsetRoundingPolicy ceiling =
+        value -> value.setScale(0, RoundingMode.CEILING);
+    assertThat(EnumUtils.numberToBigDecimal(1.5D, "FETCH"),
+        is(new BigDecimal("1.5")));
+    assertThat(EnumUtils.numberToBigDecimal(1.5F, "OFFSET"),
+        is(new BigDecimal("1.5")));
+    assertThat(EnumUtils.numberToBigDecimal(1.5D, "FETCH", ceiling),
+        is(BigDecimal.valueOf(2)));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testNumberToBigDecimalRejectsNull() {
+    final IllegalArgumentException e =
+        assertThrows(IllegalArgumentException.class,
+            () -> EnumUtils.numberToBigDecimal(null, "FETCH"));
+    assertThat(e.getMessage(), is("FETCH expression evaluated to NULL"));
   }
 
   @Test void testMethodCallExpression() {

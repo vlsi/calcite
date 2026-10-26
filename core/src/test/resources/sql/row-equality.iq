@@ -1,0 +1,1917 @@
+# row-equality.iq - Tests for equality of ROW values at runtime
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to you under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+!use scott
+!set outputformat mysql
+
+# Test cases for https://issues.apache.org/jira/browse/CALCITE-7678
+# [CALCITE-7678] Runtime equality for ROW values produces incorrect results
+#
+# Calcite has one ROW type, compared everywhere with the standard's row
+# semantics: "(a, b)" and "ROW(a, b)" have the same representation, and a
+# CREATE TYPE structured type uses the same RelRecordType as a ROW
+# expression.
+#
+# Each query below carries a comment recording its status on PostgreSQL 14.
+# Note that Postgres does NOT implement the standard SQL semantics for nested ROW comparisons.
+
+#####################################################################
+# GROUP BY
+
+# GROUP BY a flat ROW value.
+# Validated on PostgreSQL 14: same result.
+SELECT r, COUNT(*) AS c
+FROM (SELECT ROW(x, y) AS r
+      FROM (VALUES (1, 'a'), (1, 'a'), (2, 'b')) AS v(x, y)) AS t
+GROUP BY r
+ORDER BY c;
++--------+---+
+| R      | C |
++--------+---+
+| {2, b} | 1 |
+| {1, a} | 2 |
++--------+---+
+(2 rows)
+
+!ok
+
+# GROUP BY a ROW value with a NULL field: grouping uses not-distinct
+# semantics, so the two ROW(2, NULL) values belong to the same group.
+# Validated on PostgreSQL 14: same result.
+SELECT r, COUNT(*) AS c
+FROM (SELECT ROW(x, y) AS r
+      FROM (VALUES (1, 'a'), (2, NULL), (2, NULL)) AS v(x, y)) AS t
+GROUP BY r
+ORDER BY c;
++-----------+---+
+| R         | C |
++-----------+---+
+| {1, a}    | 1 |
+| {2, null} | 2 |
++-----------+---+
+(2 rows)
+
+!ok
+
+# GROUP BY a nested ROW value.
+# Validated on PostgreSQL 14: same result.
+SELECT r, COUNT(*) AS c
+FROM (SELECT ROW(ROW(x, y), z) AS r
+      FROM (VALUES (1, 'a', 10), (1, 'a', 10), (2, 'b', 20)) AS v(x, y, z)) AS t
+GROUP BY r
+ORDER BY c;
++--------------+---+
+| R            | C |
++--------------+---+
+| {{2, b}, 20} | 1 |
+| {{1, a}, 10} | 2 |
++--------------+---+
+(2 rows)
+
+!ok
+
+#####################################################################
+# DISTINCT
+
+# SELECT DISTINCT over ROW values, including ones with a NULL field.
+# Validated on PostgreSQL 14: same result.
+SELECT DISTINCT r
+FROM (SELECT ROW(x, y) AS r
+      FROM (VALUES (1, 'a'), (1, 'a'), (2, NULL), (2, NULL)) AS v(x, y)) AS t
+ORDER BY r;
++-----------+
+| R         |
++-----------+
+| {1, a}    |
+| {2, null} |
++-----------+
+(2 rows)
+
+!ok
+
+#####################################################################
+# Set operations
+
+# UNION removes duplicate ROW values, including ones with a NULL field.
+# Validated on PostgreSQL 14: same result.
+SELECT ROW(x, y) AS r
+FROM (VALUES (1, 'a'), (2, NULL)) AS v(x, y)
+UNION
+SELECT ROW(x, y) AS r
+FROM (VALUES (2, NULL)) AS w(x, y)
+ORDER BY r;
++-----------+
+| R         |
++-----------+
+| {1, a}    |
+| {2, null} |
++-----------+
+(2 rows)
+
+!ok
+
+# INTERSECT over ROW values.
+# Validated on PostgreSQL 14: same result.
+SELECT ROW(x, y) AS r
+FROM (VALUES (1, 'a'), (2, 'b')) AS v(x, y)
+INTERSECT
+SELECT ROW(x, y) AS r
+FROM (VALUES (2, 'b'), (3, 'c')) AS w(x, y);
++--------+
+| R      |
++--------+
+| {2, b} |
++--------+
+(1 row)
+
+!ok
+
+# EXCEPT over ROW values.
+# Validated on PostgreSQL 14: same result.
+SELECT ROW(x, y) AS r
+FROM (VALUES (1, 'a'), (2, 'b')) AS v(x, y)
+EXCEPT
+SELECT ROW(x, y) AS r
+FROM (VALUES (2, 'b'), (3, 'c')) AS w(x, y);
++--------+
+| R      |
++--------+
+| {1, a} |
++--------+
+(1 row)
+
+!ok
+
+#####################################################################
+# JOIN on ROW values, strict equality
+
+# A flat ROW value equals itself and nothing else.
+# Validated on PostgreSQL 14: same result.
+WITH t(x, r) AS (
+  SELECT x, ROW(x, y)
+  FROM (VALUES (1, 'a'), (2, 'b')) AS v(x, y))
+SELECT t1.x AS x1, t2.x AS x2
+FROM t AS t1
+JOIN t AS t2 ON t1.r = t2.r
+ORDER BY x1;
++----+----+
+| X1 | X2 |
++----+----+
+|  1 |  1 |
+|  2 |  2 |
++----+----+
+(2 rows)
+
+!ok
+
+# A nested ROW value equals itself and nothing else.
+# Validated on PostgreSQL 14: same result.
+WITH t(x, r) AS (
+  SELECT x, ROW(ROW(x, y), z)
+  FROM (VALUES (1, 'a', 10), (2, 'b', 20)) AS v(x, y, z))
+SELECT t1.x AS x1, t2.x AS x2
+FROM t AS t1
+JOIN t AS t2 ON t1.r = t2.r
+ORDER BY x1;
++----+----+
+| X1 | X2 |
++----+----+
+|  1 |  1 |
+|  2 |  2 |
++----+----+
+(2 rows)
+
+!ok
+
+# A NULL field makes the strict comparison UNKNOWN, so ROW(2, NULL) does
+# not join with itself. Postgres returns 2 rows instead of one, because
+# in Postgres (1, 'a') is not the same as ROW(1, 'a').
+WITH t(x, r) AS (
+  SELECT x, ROW(x, y)
+  FROM (VALUES (1, 'a'), (2, NULL)) AS v(x, y))
+SELECT t1.x AS x1, t2.x AS x2
+FROM t AS t1
+JOIN t AS t2 ON t1.r = t2.r
+ORDER BY x1;
++----+----+
+| X1 | X2 |
++----+----+
+|  1 |  1 |
++----+----+
+(1 row)
+
+!ok
+
+# Same problem as above when validated on Postgres.
+WITH t(x, r) AS (
+  SELECT x, ROW(ROW(x, y), z)
+  FROM (VALUES (1, 'a', 10), (2, NULL, 20)) AS v(x, y, z))
+SELECT t1.x AS x1, t2.x AS x2
+FROM t AS t1
+JOIN t AS t2 ON t1.r = t2.r
+ORDER BY x1;
++----+----+
+| X1 | X2 |
++----+----+
+|  1 |  1 |
++----+----+
+(1 row)
+
+!ok
+
+#####################################################################
+# JOIN on ROW values using IS NOT DISTINCT FROM
+
+# Under not-distinct semantics the ROW(2, NULL) pair matches.
+# Validated on PostgreSQL 14: same result.
+WITH t(x, r) AS (
+  SELECT x, ROW(x, y)
+  FROM (VALUES (1, 'a'), (2, NULL)) AS v(x, y))
+SELECT t1.x AS x1, t2.x AS x2
+FROM t AS t1
+JOIN t AS t2 ON t1.r IS NOT DISTINCT FROM t2.r
+ORDER BY x1;
++----+----+
+| X1 | X2 |
++----+----+
+|  1 |  1 |
+|  2 |  2 |
++----+----+
+(2 rows)
+
+!ok
+
+# The same, for a NULL in the inner ROW.
+# Validated on PostgreSQL 14: same result.
+WITH t(x, r) AS (
+  SELECT x, ROW(ROW(x, y), z)
+  FROM (VALUES (1, 'a', 10), (2, NULL, 20)) AS v(x, y, z))
+SELECT t1.x AS x1, t2.x AS x2
+FROM t AS t1
+JOIN t AS t2 ON t1.r IS NOT DISTINCT FROM t2.r
+ORDER BY x1;
++----+----+
+| X1 | X2 |
++----+----+
+|  1 |  1 |
+|  2 |  2 |
++----+----+
+(2 rows)
+
+!ok
+
+#####################################################################
+# Comparison in predicate position
+
+# Row comparison is three-valued. Row 2 is UNKNOWN because the only
+# difference is a NULL field pair; row 3 is FALSE because the first fields
+# already differ, which outranks the NULL pair. IS DISTINCT FROM stays
+# two-valued throughout.
+#
+# Postgres answers TRUE for row 2, because tuples are not ROW values in Postgres.
+WITH t(id, a, b) AS (
+  SELECT id, ROW(x, y), ROW(z, w)
+  FROM (VALUES (1, 1, 'a', 1, 'a'),
+               (2, 1, NULL, 1, NULL),
+               (3, 1, NULL, 2, NULL),
+               (4, 1, 'a', 2, 'b')) AS v(id, x, y, z, w))
+SELECT id, a = b AS eq, a <> b AS ne, a IS DISTINCT FROM b AS dist
+FROM t
+ORDER BY id;
++----+-------+-------+-------+
+| ID | EQ    | NE    | DIST  |
++----+-------+-------+-------+
+|  1 | true  | false | false |
+|  2 |       |       | false |
+|  3 | false | true  | true  |
+|  4 | false | true  | true  |
++----+-------+-------+-------+
+(4 rows)
+
+!ok
+
+# A NULL nested inside an inner ROW makes the comparison UNKNOWN too.
+# Postgres answers TRUE for row 2.
+WITH t(id, a, b) AS (
+  SELECT id, ROW(ROW(x, y), x), ROW(ROW(z, w), z)
+  FROM (VALUES (1, 1, 'a', 1, 'a'),
+               (2, 1, NULL, 1, NULL)) AS v(id, x, y, z, w))
+SELECT id, a = b AS eq
+FROM t
+ORDER BY id;
++----+------+
+| ID | EQ   |
++----+------+
+|  1 | true |
+|  2 |      |
++----+------+
+(2 rows)
+
+!ok
+
+# Constant folding must reach the same answer as the runtime.
+# In PostgreSQL 14: the deeply nested ROWs evaluate to TRUE there.
+SELECT ROW(1, CAST(NULL AS VARCHAR))
+     = ROW(1, CAST(NULL AS VARCHAR)) AS flat,
+       ROW(ROW(1, CAST(NULL AS VARCHAR)), 2)
+     = ROW(ROW(1, CAST(NULL AS VARCHAR)), 2) AS nested2,
+       ROW(ROW(ROW(1, CAST(NULL AS VARCHAR)), 2), 3)
+     = ROW(ROW(ROW(1, CAST(NULL AS VARCHAR)), 2), 3) AS nested3;
++------+---------+---------+
+| FLAT | NESTED2 | NESTED3 |
++------+---------+---------+
+|      |         |         |
++------+---------+---------+
+(1 row)
+
+!ok
+
+# With no nullable field anywhere, "x = x" still folds to TRUE.
+# Validated on PostgreSQL 14: same result.
+SELECT ROW(ROW(1, CAST('a' AS VARCHAR)), 2)
+     = ROW(ROW(1, CAST('a' AS VARCHAR)), 2) AS all_non_null;
++--------------+
+| ALL_NON_NULL |
++--------------+
+| true         |
++--------------+
+(1 row)
+
+!ok
+
+# Three levels of nesting, with the NULL at the innermost level. The
+# UNKNOWN has to propagate all the way out for =, while IS [NOT] DISTINCT
+# FROM stays two-valued at every level.
+WITH t(id, a, b) AS (
+  SELECT id, ROW(ROW(ROW(x, y), x), x), ROW(ROW(ROW(z, w), z), z)
+  FROM (VALUES (1, 1, 'a', 1, 'a'),
+               (2, 1, NULL, 1, NULL),
+               (3, 1, NULL, 2, NULL)) AS v(id, x, y, z, w))
+SELECT id, a = b AS eq, a IS DISTINCT FROM b AS dist,
+       a IS NOT DISTINCT FROM b AS ndf
+FROM t
+ORDER BY id;
++----+-------+-------+-------+
+| ID | EQ    | DIST  | NDF   |
++----+-------+-------+-------+
+|  1 | true  | false | true  |
+|  2 |       | false | true  |
+|  3 | false | true  | false |
++----+-------+-------+-------+
+(3 rows)
+
+!ok
+
+#####################################################################
+# Nested ROW values produced by a query
+
+WITH t(id, r) AS (
+  SELECT id, ROW(ROW(x, y), x)
+  FROM (VALUES (1, 1, 'a'), (2, 1, NULL)) AS v(id, x, y))
+SELECT t1.id, t1.r = t2.r AS eq, t1.r IS DISTINCT FROM t2.r AS dist
+FROM t AS t1
+JOIN t AS t2 ON t1.id = t2.id
+ORDER BY t1.id;
++----+------+-------+
+| ID | EQ   | DIST  |
++----+------+-------+
+|  1 | true | false |
+|  2 |      | false |
++----+------+-------+
+(2 rows)
+
+!ok
+
+# Grouped after a UNION ALL: the four rows collapse to two values.
+# Validated on PostgreSQL 14: same result.
+SELECT COUNT(*) AS n FROM (
+  SELECT r FROM (
+    SELECT ROW(ROW(x, y), x) AS r
+    FROM (VALUES (1, 'a'), (2, NULL)) AS v(x, y)
+    UNION ALL
+    SELECT ROW(ROW(x, y), x) AS r
+    FROM (VALUES (1, 'a'), (2, NULL)) AS w(x, y)) AS u
+  GROUP BY r) AS g;
++---+
+| N |
++---+
+| 2 |
++---+
+(1 row)
+
+!ok
+
+# The NULL field is produced by an aggregate rather than written literally.
+# In PostgreSQL 14 row 1 is TRUE.
+SELECT g, ROW(ROW(g, MIN(v)), g) = ROW(ROW(g, MIN(v)), g) AS eq
+FROM (VALUES (1, CAST(NULL AS VARCHAR)), (2, 'x')) AS t(g, v)
+GROUP BY g
+ORDER BY g;
++---+------+
+| G | EQ   |
++---+------+
+| 1 |      |
+| 2 | true |
++---+------+
+(2 rows)
+
+!ok
+
+# PostgreSQL 14 differs: TRUE for row 2.
+WITH t(id, r) AS (
+  SELECT id, ROW(ROW(x, y), x)
+  FROM (VALUES (1, 1, 'a'), (2, 1, NULL)) AS v(id, x, y))
+SELECT id,
+       EXISTS (SELECT 1 FROM t AS u WHERE u.r = t.r) AS ex,
+       EXISTS (SELECT 1 FROM t AS u WHERE u.r IS NOT DISTINCT FROM t.r) AS ex_ndf
+FROM t
+ORDER BY id;
++----+-------+--------+
+| ID | EX    | EX_NDF |
++----+-------+--------+
+|  1 | true  | true   |
+|  2 | false | true   |
++----+-------+--------+
+(2 rows)
+
+!ok
+
+#####################################################################
+# IN predicates
+#
+# IN and NOT IN are defined in terms of =, so over ROW values they inherits
+# three-valued comparisons.
+
+# Both operands are row constructors.
+# Validated on PostgreSQL 14: same result.
+SELECT ROW(1, CAST(NULL AS VARCHAR))
+    IN (ROW(1, CAST(NULL AS VARCHAR))) AS in_null,
+       ROW(1, CAST(NULL AS VARCHAR))
+    NOT IN (ROW(1, CAST(NULL AS VARCHAR))) AS notin_null,
+       ROW(1, 'a') IN (ROW(1, 'a'), ROW(2, 'b')) AS in_true,
+       ROW(1, CAST(NULL AS VARCHAR)) IN (ROW(2, 'b')) AS in_false;
++---------+------------+---------+----------+
+| IN_NULL | NOTIN_NULL | IN_TRUE | IN_FALSE |
++---------+------------+---------+----------+
+|         |            | true    | false    |
++---------+------------+---------+----------+
+(1 row)
+
+!ok
+
+# Struct-typed columns rather than constructors.
+# In PostgreSQL 14 row 2 is TRUE/FALSE.
+WITH t(id, a, b) AS (
+  SELECT id, ROW(x, y), ROW(z, w)
+  FROM (VALUES (1, 1, 'a', 1, 'a'),
+               (2, 1, NULL, 1, NULL),
+               (3, 1, NULL, 2, NULL)) AS v(id, x, y, z, w))
+SELECT id, a IN (b) AS in_b, a NOT IN (b) AS notin_b
+FROM t
+ORDER BY id;
++----+-------+---------+
+| ID | IN_B  | NOTIN_B |
++----+-------+---------+
+|  1 | true  | false   |
+|  2 |       |         |
+|  3 | false | true    |
++----+-------+---------+
+(3 rows)
+
+!ok
+
+# Row-valued IN against a sub-query.
+# Validated on PostgreSQL 14: same result.
+SELECT (1, CAST(NULL AS VARCHAR))
+    IN (SELECT 1, CAST(NULL AS VARCHAR)) AS in_subq;
++---------+
+| IN_SUBQ |
++---------+
+|         |
++---------+
+(1 row)
+
+!ok
+
+# Test cases for https://issues.apache.org/jira/browse/CALCITE-7886
+# [CALCITE-7886] Subquery expansion fails for IN subquery with ROW types
+!set insubquerythreshold 0
+
+# Validated on H2 2.4.240 and PostgreSQL 14: same result.
+SELECT * FROM (SELECT ROW(1, 2) AS r) AS t WHERE r IN (ROW(1, 2), ROW(3, 4));
++--------+
+| R      |
++--------+
+| {1, 2} |
++--------+
+(1 row)
+
+!ok
+
+# IN_DECIMAL casts "a" to ROW(DECIMAL, CHAR(1)) before it compares.
+WITH t(id, a) AS (
+  SELECT id, ROW(x, y)
+  FROM (VALUES (1, 1, 'a'), (2, 1, NULL), (3, 2, 'c')) AS v(id, x, y))
+SELECT id,
+  a IN (ROW(1, 'a'), ROW(2, 'b')) AS in_list,
+  a NOT IN (ROW(1, 'a'), ROW(2, 'b')) AS notin_list,
+  a IN (ROW(1.0, 'a'), ROW(2.5, 'b')) AS in_decimal,
+  a IN (VALUES (1, 'a'), (2, 'b')) AS in_values,
+  a NOT IN (SELECT 1, 'a') AS notin_subq
+FROM t
+ORDER BY id;
++----+---------+------------+------------+-----------+------------+
+| ID | IN_LIST | NOTIN_LIST | IN_DECIMAL | IN_VALUES | NOTIN_SUBQ |
++----+---------+------------+------------+-----------+------------+
+|  1 | true    | false      | true       | true      | false      |
+|  2 |         |            |            |           |            |
+|  3 | false   | true       | false      | false     | true       |
++----+---------+------------+------------+-----------+------------+
+(3 rows)
+
+!ok
+
+# A window function of a ROW type on the left of IN.
+# Validated on H2 2.4.240: same result.
+WITH t(id, a) AS (
+  SELECT id, ROW(x, y)
+  FROM (VALUES (1, 1, 'a'), (2, 1, NULL), (3, 2, 'c')) AS v(id, x, y))
+SELECT id,
+  LAG(a) OVER (ORDER BY id) IN (ROW(1, 'a'), ROW(2, 'b')) AS lag_in_list,
+  LEAD(a) OVER (ORDER BY id) IN (ROW(1, 'a'), ROW(2, 'b')) AS lead_in_list,
+  LAG(a) OVER (ORDER BY id) IN (SELECT 1, 'a') AS lag_in_subq
+FROM t
+ORDER BY id;
++----+-------------+--------------+-------------+
+| ID | LAG_IN_LIST | LEAD_IN_LIST | LAG_IN_SUBQ |
++----+-------------+--------------+-------------+
+|  1 |             |              |             |
+|  2 | true        | false        | true        |
+|  3 |             |              |             |
++----+-------------+--------------+-------------+
+(3 rows)
+
+!ok
+!set insubquerythreshold 20
+
+#####################################################################
+# ROW values inside a collection
+#
+# A ROW nested in a collection is compared by a different rule
+# (IS NOT DISTINCT FROM) than a
+# top-level ROW. Array equality is total: it compares element-wise and
+# never yields UNKNOWN, so the NULL fields of the nested ROW values are
+# treated as equal. ROW(NULL) is not equal with ROW(NULL), but
+# ARRAY[ROW(NULL)] is equal to ARRAY[ROW(NULL)].
+#
+# Postgres agrees with Calcite on every query in this section, because
+# both compare collections totally.
+
+# Validated on PostgreSQL 14: same result.
+SELECT ROW(1, CAST(NULL AS VARCHAR))
+     = ROW(1, CAST(NULL AS VARCHAR)) AS bare,
+       ARRAY[ROW(1, CAST(NULL AS VARCHAR))]
+     = ARRAY[ROW(1, CAST(NULL AS VARCHAR))] AS in_array;
++------+----------+
+| BARE | IN_ARRAY |
++------+----------+
+|      | true     |
++------+----------+
+(1 row)
+
+!ok
+
+# Validated on PostgreSQL 14: same result.
+SELECT ARRAY[ROW(1, CAST(NULL AS VARCHAR))]
+     = ARRAY[ROW(2, CAST(NULL AS VARCHAR))] AS differ;
++--------+
+| DIFFER |
++--------+
+| false  |
++--------+
+(1 row)
+
+!ok
+
+# Validated on PostgreSQL 14: same result.
+WITH t(id, a, b) AS (
+  SELECT id, ARRAY[ROW(x, y)], ARRAY[ROW(z, w)]
+  FROM (VALUES (1, 1, 'a', 1, 'a'),
+               (2, 1, NULL, 1, NULL),
+               (3, 1, NULL, 2, NULL)) AS v(id, x, y, z, w))
+SELECT id, a = b AS eq, a IS DISTINCT FROM b AS dist
+FROM t
+ORDER BY id;
++----+-------+-------+
+| ID | EQ    | DIST  |
++----+-------+-------+
+|  1 | true  | false |
+|  2 | true  | false |
+|  3 | false | true  |
++----+-------+-------+
+(3 rows)
+
+!ok
+
+# Validated on PostgreSQL 14: same result.
+SELECT ROW(1, ARRAY[ROW(1, CAST(NULL AS VARCHAR))])
+     = ROW(1, ARRAY[ROW(1, CAST(NULL AS VARCHAR))]) AS row_of_array;
++--------------+
+| ROW_OF_ARRAY |
++--------------+
+| true         |
++--------------+
+(1 row)
+
+!ok
+
+# Validated on PostgreSQL 14: same result.
+SELECT a, COUNT(*) AS c
+FROM (SELECT ARRAY[ROW(x, y)] AS a
+      FROM (VALUES (1, 'a'), (2, NULL), (2, NULL)) AS v(x, y)) AS t
+GROUP BY a
+ORDER BY c;
++-------------+---+
+| A           | C |
++-------------+---+
+| [{1, a}]    | 1 |
+| [{2, null}] | 2 |
++-------------+---+
+(2 rows)
+
+!ok
+
+# A MAP holding ROW values also uses IS NOT DISTINCT FROM
+# Postgres has no MAP type.
+SELECT c
+FROM (SELECT COUNT(*) AS c
+      FROM (SELECT MAP['k', ROW(x, y)] AS m
+            FROM (VALUES (1, 'a'), (2, NULL), (2, NULL)) AS v(x, y)) AS t
+      GROUP BY m) AS g
+ORDER BY c;
++---+
+| C |
++---+
+| 1 |
+| 2 |
++---+
+(2 rows)
+
+!ok
+
+# Test cases for https://issues.apache.org/jira/browse/CALCITE-7836
+# [CALCITE-7836] Array functions return incorrect results for ROW elements
+# All 32 queries below were checked against Apache Spark 3.5.5 using a custom
+# Python script in Spark Playground. All 64 results matched, including array
+# contents and element order. The script used array(...) for ARRAY[...] and
+# named_struct(...) for ROW(...), with matching field names.
+!use sparkfunc
+
+# Flat ROW values.
+SELECT ARRAY_CONTAINS(ARRAY[ROW(x, y)], ROW(z, w)) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++-------+
+| R     |
++-------+
+| true  |
+| false |
++-------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_POSITION(ARRAY[ROW(x, y)], ROW(z, w)) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++---+
+| R |
++---+
+| 1 |
+| 0 |
++---+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_REMOVE(ARRAY[ROW(x, y), ROW(z, w)], ROW(z, w)) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++------------+
+| R          |
++------------+
+| []         |
+| [{2, Bar}] |
++------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_DISTINCT(ARRAY[ROW(x, y), ROW(z, w)]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++----------------------+
+| R                    |
++----------------------+
+| [{1, Foo}]           |
+| [{2, Bar}, {2, Car}] |
++----------------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_UNION(ARRAY[ROW(x, y)], ARRAY[ROW(z, w)]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++----------------------+
+| R                    |
++----------------------+
+| [{1, Foo}]           |
+| [{2, Bar}, {2, Car}] |
++----------------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_INTERSECT(ARRAY[ROW(x, y)], ARRAY[ROW(z, w)]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++------------+
+| R          |
++------------+
+| [{1, Foo}] |
+| []         |
++------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_EXCEPT(ARRAY[ROW(x, y)], ARRAY[ROW(z, w)]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++------------+
+| R          |
++------------+
+| []         |
+| [{2, Bar}] |
++------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAYS_OVERLAP(ARRAY[ROW(x, y)], ARRAY[ROW(z, w)]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++-------+
+| R     |
++-------+
+| true  |
+| false |
++-------+
+(2 rows)
+
+!ok
+
+# Nested ROW values.
+
+SELECT ARRAY_CONTAINS(ARRAY[ROW(ROW(x, y), 10)], ROW(ROW(z, w), 10)) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++-------+
+| R     |
++-------+
+| true  |
+| false |
++-------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_POSITION(ARRAY[ROW(ROW(x, y), 10)], ROW(ROW(z, w), 10)) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++---+
+| R |
++---+
+| 1 |
+| 0 |
++---+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_REMOVE(ARRAY[ROW(ROW(x, y), 10), ROW(ROW(z, w), 10)], ROW(ROW(z, w), 10)) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++------------------+
+| R                |
++------------------+
+| []               |
+| [{{2, Bar}, 10}] |
++------------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_DISTINCT(ARRAY[ROW(ROW(x, y), 10), ROW(ROW(z, w), 10)]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++----------------------------------+
+| R                                |
++----------------------------------+
+| [{{1, Foo}, 10}]                 |
+| [{{2, Bar}, 10}, {{2, Car}, 10}] |
++----------------------------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_UNION(ARRAY[ROW(ROW(x, y), 10)], ARRAY[ROW(ROW(z, w), 10)]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++----------------------------------+
+| R                                |
++----------------------------------+
+| [{{1, Foo}, 10}]                 |
+| [{{2, Bar}, 10}, {{2, Car}, 10}] |
++----------------------------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_INTERSECT(ARRAY[ROW(ROW(x, y), 10)], ARRAY[ROW(ROW(z, w), 10)]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++------------------+
+| R                |
++------------------+
+| [{{1, Foo}, 10}] |
+| []               |
++------------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_EXCEPT(ARRAY[ROW(ROW(x, y), 10)], ARRAY[ROW(ROW(z, w), 10)]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++------------------+
+| R                |
++------------------+
+| []               |
+| [{{2, Bar}, 10}] |
++------------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAYS_OVERLAP(ARRAY[ROW(ROW(x, y), 10)], ARRAY[ROW(ROW(z, w), 10)]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++-------+
+| R     |
++-------+
+| true  |
+| false |
++-------+
+(2 rows)
+
+!ok
+
+# ROW values containing arrays of ROW values.
+
+SELECT ARRAY_CONTAINS(ARRAY[ROW(ARRAY[ROW(x, y)], 10)], ROW(ARRAY[ROW(z, w)], 10)) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++-------+
+| R     |
++-------+
+| true  |
+| false |
++-------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_POSITION(ARRAY[ROW(ARRAY[ROW(x, y)], 10)], ROW(ARRAY[ROW(z, w)], 10)) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++---+
+| R |
++---+
+| 1 |
+| 0 |
++---+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_REMOVE(ARRAY[ROW(ARRAY[ROW(x, y)], 10), ROW(ARRAY[ROW(z, w)], 10)], ROW(ARRAY[ROW(z, w)], 10)) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++--------------------+
+| R                  |
++--------------------+
+| []                 |
+| [{[{2, Bar}], 10}] |
++--------------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_DISTINCT(ARRAY[ROW(ARRAY[ROW(x, y)], 10), ROW(ARRAY[ROW(z, w)], 10)]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++--------------------------------------+
+| R                                    |
++--------------------------------------+
+| [{[{1, Foo}], 10}]                   |
+| [{[{2, Bar}], 10}, {[{2, Car}], 10}] |
++--------------------------------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_UNION(ARRAY[ROW(ARRAY[ROW(x, y)], 10)], ARRAY[ROW(ARRAY[ROW(z, w)], 10)]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++--------------------------------------+
+| R                                    |
++--------------------------------------+
+| [{[{1, Foo}], 10}]                   |
+| [{[{2, Bar}], 10}, {[{2, Car}], 10}] |
++--------------------------------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_INTERSECT(ARRAY[ROW(ARRAY[ROW(x, y)], 10)], ARRAY[ROW(ARRAY[ROW(z, w)], 10)]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++--------------------+
+| R                  |
++--------------------+
+| [{[{1, Foo}], 10}] |
+| []                 |
++--------------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_EXCEPT(ARRAY[ROW(ARRAY[ROW(x, y)], 10)], ARRAY[ROW(ARRAY[ROW(z, w)], 10)]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++--------------------+
+| R                  |
++--------------------+
+| []                 |
+| [{[{2, Bar}], 10}] |
++--------------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAYS_OVERLAP(ARRAY[ROW(ARRAY[ROW(x, y)], 10)], ARRAY[ROW(ARRAY[ROW(z, w)], 10)]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++-------+
+| R     |
++-------+
+| true  |
+| false |
++-------+
+(2 rows)
+
+!ok
+
+# ROW values with NULL fields.
+
+SELECT ARRAY_CONTAINS(ARRAY[ROW(x, CAST(NULL AS INTEGER))], ROW(z, CAST(NULL AS INTEGER))) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++------+
+| R    |
++------+
+| true |
+| true |
++------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_POSITION(ARRAY[ROW(x, CAST(NULL AS INTEGER))], ROW(z, CAST(NULL AS INTEGER))) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++---+
+| R |
++---+
+| 1 |
+| 1 |
++---+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_REMOVE(ARRAY[ROW(x, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER))], ROW(z, CAST(NULL AS INTEGER))) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++----+
+| R  |
++----+
+| [] |
+| [] |
++----+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_DISTINCT(ARRAY[ROW(x, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER))]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++-------------+
+| R           |
++-------------+
+| [{1, null}] |
+| [{2, null}] |
++-------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_UNION(ARRAY[ROW(x, CAST(NULL AS INTEGER))], ARRAY[ROW(z, CAST(NULL AS INTEGER))]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++-------------+
+| R           |
++-------------+
+| [{1, null}] |
+| [{2, null}] |
++-------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_INTERSECT(ARRAY[ROW(x, CAST(NULL AS INTEGER))], ARRAY[ROW(z, CAST(NULL AS INTEGER))]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++-------------+
+| R           |
++-------------+
+| [{1, null}] |
+| [{2, null}] |
++-------------+
+(2 rows)
+
+!ok
+
+SELECT ARRAY_EXCEPT(ARRAY[ROW(x, CAST(NULL AS INTEGER))], ARRAY[ROW(z, CAST(NULL AS INTEGER))]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++----+
+| R  |
++----+
+| [] |
+| [] |
++----+
+(2 rows)
+
+!ok
+
+SELECT ARRAYS_OVERLAP(ARRAY[ROW(x, CAST(NULL AS INTEGER))], ARRAY[ROW(z, CAST(NULL AS INTEGER))]) AS r
+FROM (VALUES (1, 'Foo', 1, 'Foo'), (2, 'Bar', 2, 'Car')) AS t(x, y, z, w);
++------+
+| R    |
++------+
+| true |
+| true |
++------+
+(2 rows)
+
+!ok
+
+# Test cases for https://issues.apache.org/jira/browse/CALCITE-7842
+# [CALCITE-7842] Multiset operators return incorrect results for ROW elements
+# All 31 queries below were checked against Oracle using OneCompiler.
+# The Oracle adaptation used object types in place of ROW values and nested
+# table types in place of MULTISET literals. Explicit MAP methods compared
+# object fields, treating corresponding NULL fields as equal.
+# All 217 result rows matched after ordering by case id and element fields.
+!use scott
+
+# Original MEMBER OF reproduction.
+SELECT ROW(1, 'Foo') MEMBER OF MULTISET[ROW(x, y)] AS r
+FROM (VALUES (1, 'Foo'), (2, 'Bar')) AS t(x, y);
++-------+
+| R     |
++-------+
+| true  |
+| false |
++-------+
+(2 rows)
+
+!ok
+
+# Flat ROW values.
+
+# MEMBER OF
+SELECT id, ROW(x, y) MEMBER OF MULTISET[ROW(z, w)] AS r
+FROM (VALUES
+    (1, 1, 'Foo', 1, 'Foo'),
+    (2, 2, 'Bar', 2, 'Car'),
+    (3, 3, 'Baz', 4, 'Baz'),
+    (4, 5, NULL, 5, NULL)) AS t(id, x, y, z, w)
+ORDER BY id;
++----+-------+
+| ID | R     |
++----+-------+
+|  1 | true  |
+|  2 | false |
+|  3 | false |
+|  4 | true  |
++----+-------+
+(4 rows)
+
+!ok
+
+# IS A SET and IS NOT A SET
+SELECT id,
+    MULTISET[ROW(x, y), ROW(z, w)] IS A SET AS r,
+    MULTISET[ROW(x, y), ROW(z, w)] IS NOT A SET AS not_r
+FROM (VALUES
+    (1, 1, 'Foo', 1, 'Foo'),
+    (2, 2, 'Bar', 2, 'Car'),
+    (3, 3, 'Baz', 4, 'Baz'),
+    (4, 5, NULL, 5, NULL)) AS t(id, x, y, z, w)
+ORDER BY id;
++----+-------+-------+
+| ID | R     | NOT_R |
++----+-------+-------+
+|  1 | false | true  |
+|  2 | true  | false |
+|  3 | true  | false |
+|  4 | false | true  |
++----+-------+-------+
+(4 rows)
+
+!ok
+
+# SUBMULTISET OF and NOT SUBMULTISET OF
+SELECT id,
+    MULTISET[ROW(x, y), ROW(x, y)]
+        SUBMULTISET OF MULTISET[ROW(z, w), ROW(z, w), ROW(z, w), ROW(9, 'Zzz')] AS r,
+    MULTISET[ROW(x, y), ROW(x, y)]
+        NOT SUBMULTISET OF MULTISET[ROW(z, w), ROW(z, w), ROW(z, w), ROW(9, 'Zzz')] AS not_r
+FROM (VALUES
+    (1, 1, 'Foo', 1, 'Foo'),
+    (2, 2, 'Bar', 2, 'Car'),
+    (3, 3, 'Baz', 4, 'Baz'),
+    (4, 5, NULL, 5, NULL)) AS t(id, x, y, z, w)
+ORDER BY id;
++----+-------+-------+
+| ID | R     | NOT_R |
++----+-------+-------+
+|  1 | true  | false |
+|  2 | false | true  |
+|  3 | false | true  |
+|  4 | true  | false |
++----+-------+-------+
+(4 rows)
+
+!ok
+
+# Equal input cardinalities, but too few occurrences of the requested row.
+SELECT id, MULTISET[ROW(x, y), ROW(x, y)]
+    SUBMULTISET OF MULTISET[ROW(z, w), ROW(9, 'Zzz')] AS r
+FROM (VALUES
+    (1, 1, 'Foo', 1, 'Foo'),
+    (2, 2, 'Bar', 2, 'Car'),
+    (3, 3, 'Baz', 4, 'Baz'),
+    (4, 5, NULL, 5, NULL)) AS t(id, x, y, z, w)
+ORDER BY id;
++----+-------+
+| ID | R     |
++----+-------+
+|  1 | false |
+|  2 | false |
+|  3 | false |
+|  4 | false |
++----+-------+
+(4 rows)
+
+!ok
+
+# MULTISET INTERSECT ALL
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(x, y), ROW(x, y), ROW(9, 'Zzz')]
+        MULTISET INTERSECT ALL
+        MULTISET[ROW(z, w), ROW(z, w), ROW(z, w), ROW(8, 'Yyy')] AS m
+    FROM (VALUES
+        (1, 1, 'Foo', 1, 'Foo'),
+        (2, 2, 'Bar', 2, 'Car'),
+        (3, 3, 'Baz', 4, 'Baz'),
+        (4, 5, NULL, 5, NULL)) AS t(id, x, y, z, w)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, a, b;
++----+-----------+
+| ID | R         |
++----+-----------+
+|  1 | {1, Foo}  |
+|  1 | {1, Foo}  |
+|  4 | {5, null} |
+|  4 | {5, null} |
++----+-----------+
+(4 rows)
+
+!ok
+
+# MULTISET INTERSECT DISTINCT
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(x, y), ROW(x, y), ROW(9, 'Zzz')]
+        MULTISET INTERSECT DISTINCT
+        MULTISET[ROW(z, w), ROW(z, w), ROW(z, w), ROW(8, 'Yyy')] AS m
+    FROM (VALUES
+        (1, 1, 'Foo', 1, 'Foo'),
+        (2, 2, 'Bar', 2, 'Car'),
+        (3, 3, 'Baz', 4, 'Baz'),
+        (4, 5, NULL, 5, NULL)) AS t(id, x, y, z, w)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, a, b;
++----+-----------+
+| ID | R         |
++----+-----------+
+|  1 | {1, Foo}  |
+|  4 | {5, null} |
++----+-----------+
+(2 rows)
+
+!ok
+
+# MULTISET EXCEPT ALL
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(x, y), ROW(x, y), ROW(9, 'Zzz')]
+        MULTISET EXCEPT ALL
+        MULTISET[ROW(z, w), ROW(z, w), ROW(z, w), ROW(8, 'Yyy')] AS m
+    FROM (VALUES
+        (1, 1, 'Foo', 1, 'Foo'),
+        (2, 2, 'Bar', 2, 'Car'),
+        (3, 3, 'Baz', 4, 'Baz'),
+        (4, 5, NULL, 5, NULL)) AS t(id, x, y, z, w)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, a, b;
++----+----------+
+| ID | R        |
++----+----------+
+|  1 | {9, Zzz} |
+|  2 | {2, Bar} |
+|  2 | {2, Bar} |
+|  2 | {9, Zzz} |
+|  3 | {3, Baz} |
+|  3 | {3, Baz} |
+|  3 | {9, Zzz} |
+|  4 | {9, Zzz} |
++----+----------+
+(8 rows)
+
+!ok
+
+# MULTISET EXCEPT DISTINCT
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(x, y), ROW(x, y), ROW(9, 'Zzz')]
+        MULTISET EXCEPT DISTINCT
+        MULTISET[ROW(z, w), ROW(z, w), ROW(z, w), ROW(8, 'Yyy')] AS m
+    FROM (VALUES
+        (1, 1, 'Foo', 1, 'Foo'),
+        (2, 2, 'Bar', 2, 'Car'),
+        (3, 3, 'Baz', 4, 'Baz'),
+        (4, 5, NULL, 5, NULL)) AS t(id, x, y, z, w)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, a, b;
++----+----------+
+| ID | R        |
++----+----------+
+|  1 | {9, Zzz} |
+|  2 | {2, Bar} |
+|  2 | {9, Zzz} |
+|  3 | {3, Baz} |
+|  3 | {9, Zzz} |
+|  4 | {9, Zzz} |
++----+----------+
+(6 rows)
+
+!ok
+
+# MULTISET UNION DISTINCT
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(x, y), ROW(x, y), ROW(9, 'Zzz')]
+        MULTISET UNION DISTINCT
+        MULTISET[ROW(z, w), ROW(z, w), ROW(z, w), ROW(8, 'Yyy')] AS m
+    FROM (VALUES
+        (1, 1, 'Foo', 1, 'Foo'),
+        (2, 2, 'Bar', 2, 'Car'),
+        (3, 3, 'Baz', 4, 'Baz'),
+        (4, 5, NULL, 5, NULL)) AS t(id, x, y, z, w)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, a, b;
++----+-----------+
+| ID | R         |
++----+-----------+
+|  1 | {1, Foo}  |
+|  1 | {8, Yyy}  |
+|  1 | {9, Zzz}  |
+|  2 | {2, Bar}  |
+|  2 | {2, Car}  |
+|  2 | {8, Yyy}  |
+|  2 | {9, Zzz}  |
+|  3 | {3, Baz}  |
+|  3 | {4, Baz}  |
+|  3 | {8, Yyy}  |
+|  3 | {9, Zzz}  |
+|  4 | {5, null} |
+|  4 | {8, Yyy}  |
+|  4 | {9, Zzz}  |
++----+-----------+
+(14 rows)
+
+!ok
+
+# MULTISET UNION ALL
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(x, y), ROW(x, y), ROW(9, 'Zzz')]
+        MULTISET UNION ALL
+        MULTISET[ROW(z, w), ROW(z, w), ROW(z, w), ROW(8, 'Yyy')] AS m
+    FROM (VALUES
+        (1, 1, 'Foo', 1, 'Foo'),
+        (2, 2, 'Bar', 2, 'Car'),
+        (3, 3, 'Baz', 4, 'Baz'),
+        (4, 5, NULL, 5, NULL)) AS t(id, x, y, z, w)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, a, b;
++----+-----------+
+| ID | R         |
++----+-----------+
+|  1 | {1, Foo}  |
+|  1 | {1, Foo}  |
+|  1 | {1, Foo}  |
+|  1 | {1, Foo}  |
+|  1 | {1, Foo}  |
+|  1 | {8, Yyy}  |
+|  1 | {9, Zzz}  |
+|  2 | {2, Bar}  |
+|  2 | {2, Bar}  |
+|  2 | {2, Car}  |
+|  2 | {2, Car}  |
+|  2 | {2, Car}  |
+|  2 | {8, Yyy}  |
+|  2 | {9, Zzz}  |
+|  3 | {3, Baz}  |
+|  3 | {3, Baz}  |
+|  3 | {4, Baz}  |
+|  3 | {4, Baz}  |
+|  3 | {4, Baz}  |
+|  3 | {8, Yyy}  |
+|  3 | {9, Zzz}  |
+|  4 | {5, null} |
+|  4 | {5, null} |
+|  4 | {5, null} |
+|  4 | {5, null} |
+|  4 | {5, null} |
+|  4 | {8, Yyy}  |
+|  4 | {9, Zzz}  |
++----+-----------+
+(28 rows)
+
+!ok
+
+# Nested ROW values.
+
+# MEMBER OF
+SELECT id, ROW(ROW(x, y), p) MEMBER OF MULTISET[ROW(ROW(z, w), q)] AS r
+FROM (VALUES
+    (1, 1, 'Foo', 10, 1, 'Foo', 10),
+    (2, 2, 'Bar', 10, 2, 'Car', 10),
+    (3, 3, 'Baz', 10, 4, 'Baz', 10),
+    (4, 5, NULL, 10, 5, NULL, 10),
+    (5, 6, 'Qux', 10, 6, 'Qux', 11)) AS t(id, x, y, p, z, w, q)
+ORDER BY id;
++----+-------+
+| ID | R     |
++----+-------+
+|  1 | true  |
+|  2 | false |
+|  3 | false |
+|  4 | true  |
+|  5 | false |
++----+-------+
+(5 rows)
+
+!ok
+
+# IS A SET and IS NOT A SET
+SELECT id,
+    MULTISET[ROW(ROW(x, y), p), ROW(ROW(z, w), q)] IS A SET AS r,
+    MULTISET[ROW(ROW(x, y), p), ROW(ROW(z, w), q)] IS NOT A SET AS not_r
+FROM (VALUES
+    (1, 1, 'Foo', 10, 1, 'Foo', 10),
+    (2, 2, 'Bar', 10, 2, 'Car', 10),
+    (3, 3, 'Baz', 10, 4, 'Baz', 10),
+    (4, 5, NULL, 10, 5, NULL, 10),
+    (5, 6, 'Qux', 10, 6, 'Qux', 11)) AS t(id, x, y, p, z, w, q)
+ORDER BY id;
++----+-------+-------+
+| ID | R     | NOT_R |
++----+-------+-------+
+|  1 | false | true  |
+|  2 | true  | false |
+|  3 | true  | false |
+|  4 | false | true  |
+|  5 | true  | false |
++----+-------+-------+
+(5 rows)
+
+!ok
+
+# SUBMULTISET OF and NOT SUBMULTISET OF
+SELECT id,
+    MULTISET[ROW(ROW(x, y), p), ROW(ROW(x, y), p)]
+        SUBMULTISET OF MULTISET[ROW(ROW(z, w), q), ROW(ROW(z, w), q), ROW(ROW(z, w), q), ROW(ROW(9, 'Zzz'), 10)] AS r,
+    MULTISET[ROW(ROW(x, y), p), ROW(ROW(x, y), p)]
+        NOT SUBMULTISET OF MULTISET[ROW(ROW(z, w), q), ROW(ROW(z, w), q), ROW(ROW(z, w), q), ROW(ROW(9, 'Zzz'), 10)] AS not_r
+FROM (VALUES
+    (1, 1, 'Foo', 10, 1, 'Foo', 10),
+    (2, 2, 'Bar', 10, 2, 'Car', 10),
+    (3, 3, 'Baz', 10, 4, 'Baz', 10),
+    (4, 5, NULL, 10, 5, NULL, 10),
+    (5, 6, 'Qux', 10, 6, 'Qux', 11)) AS t(id, x, y, p, z, w, q)
+ORDER BY id;
++----+-------+-------+
+| ID | R     | NOT_R |
++----+-------+-------+
+|  1 | true  | false |
+|  2 | false | true  |
+|  3 | false | true  |
+|  4 | true  | false |
+|  5 | false | true  |
++----+-------+-------+
+(5 rows)
+
+!ok
+
+# Equal input cardinalities, but too few occurrences of the requested row.
+SELECT id, MULTISET[ROW(ROW(x, y), p), ROW(ROW(x, y), p)]
+    SUBMULTISET OF MULTISET[ROW(ROW(z, w), q), ROW(ROW(9, 'Zzz'), 10)] AS r
+FROM (VALUES
+    (1, 1, 'Foo', 10, 1, 'Foo', 10),
+    (2, 2, 'Bar', 10, 2, 'Car', 10),
+    (3, 3, 'Baz', 10, 4, 'Baz', 10),
+    (4, 5, NULL, 10, 5, NULL, 10),
+    (5, 6, 'Qux', 10, 6, 'Qux', 11)) AS t(id, x, y, p, z, w, q)
+ORDER BY id;
++----+-------+
+| ID | R     |
++----+-------+
+|  1 | false |
+|  2 | false |
+|  3 | false |
+|  4 | false |
+|  5 | false |
++----+-------+
+(5 rows)
+
+!ok
+
+# MULTISET INTERSECT ALL
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(ROW(x, y), p), ROW(ROW(x, y), p), ROW(ROW(9, 'Zzz'), 10)]
+        MULTISET INTERSECT ALL
+        MULTISET[ROW(ROW(z, w), q), ROW(ROW(z, w), q), ROW(ROW(z, w), q), ROW(ROW(8, 'Yyy'), 10)] AS m
+    FROM (VALUES
+        (1, 1, 'Foo', 10, 1, 'Foo', 10),
+        (2, 2, 'Bar', 10, 2, 'Car', 10),
+        (3, 3, 'Baz', 10, 4, 'Baz', 10),
+        (4, 5, NULL, 10, 5, NULL, 10),
+        (5, 6, 'Qux', 10, 6, 'Qux', 11)) AS t(id, x, y, p, z, w, q)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, u.a."EXPR$0", u.a."EXPR$1", b;
++----+-----------------+
+| ID | R               |
++----+-----------------+
+|  1 | {{1, Foo}, 10}  |
+|  1 | {{1, Foo}, 10}  |
+|  4 | {{5, null}, 10} |
+|  4 | {{5, null}, 10} |
++----+-----------------+
+(4 rows)
+
+!ok
+
+# MULTISET INTERSECT DISTINCT
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(ROW(x, y), p), ROW(ROW(x, y), p), ROW(ROW(9, 'Zzz'), 10)]
+        MULTISET INTERSECT DISTINCT
+        MULTISET[ROW(ROW(z, w), q), ROW(ROW(z, w), q), ROW(ROW(z, w), q), ROW(ROW(8, 'Yyy'), 10)] AS m
+    FROM (VALUES
+        (1, 1, 'Foo', 10, 1, 'Foo', 10),
+        (2, 2, 'Bar', 10, 2, 'Car', 10),
+        (3, 3, 'Baz', 10, 4, 'Baz', 10),
+        (4, 5, NULL, 10, 5, NULL, 10),
+        (5, 6, 'Qux', 10, 6, 'Qux', 11)) AS t(id, x, y, p, z, w, q)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, u.a."EXPR$0", u.a."EXPR$1", b;
++----+-----------------+
+| ID | R               |
++----+-----------------+
+|  1 | {{1, Foo}, 10}  |
+|  4 | {{5, null}, 10} |
++----+-----------------+
+(2 rows)
+
+!ok
+
+# MULTISET EXCEPT ALL
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(ROW(x, y), p), ROW(ROW(x, y), p), ROW(ROW(9, 'Zzz'), 10)]
+        MULTISET EXCEPT ALL
+        MULTISET[ROW(ROW(z, w), q), ROW(ROW(z, w), q), ROW(ROW(z, w), q), ROW(ROW(8, 'Yyy'), 10)] AS m
+    FROM (VALUES
+        (1, 1, 'Foo', 10, 1, 'Foo', 10),
+        (2, 2, 'Bar', 10, 2, 'Car', 10),
+        (3, 3, 'Baz', 10, 4, 'Baz', 10),
+        (4, 5, NULL, 10, 5, NULL, 10),
+        (5, 6, 'Qux', 10, 6, 'Qux', 11)) AS t(id, x, y, p, z, w, q)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, u.a."EXPR$0", u.a."EXPR$1", b;
++----+----------------+
+| ID | R              |
++----+----------------+
+|  1 | {{9, Zzz}, 10} |
+|  2 | {{2, Bar}, 10} |
+|  2 | {{2, Bar}, 10} |
+|  2 | {{9, Zzz}, 10} |
+|  3 | {{3, Baz}, 10} |
+|  3 | {{3, Baz}, 10} |
+|  3 | {{9, Zzz}, 10} |
+|  4 | {{9, Zzz}, 10} |
+|  5 | {{6, Qux}, 10} |
+|  5 | {{6, Qux}, 10} |
+|  5 | {{9, Zzz}, 10} |
++----+----------------+
+(11 rows)
+
+!ok
+
+# MULTISET EXCEPT DISTINCT
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(ROW(x, y), p), ROW(ROW(x, y), p), ROW(ROW(9, 'Zzz'), 10)]
+        MULTISET EXCEPT DISTINCT
+        MULTISET[ROW(ROW(z, w), q), ROW(ROW(z, w), q), ROW(ROW(z, w), q), ROW(ROW(8, 'Yyy'), 10)] AS m
+    FROM (VALUES
+        (1, 1, 'Foo', 10, 1, 'Foo', 10),
+        (2, 2, 'Bar', 10, 2, 'Car', 10),
+        (3, 3, 'Baz', 10, 4, 'Baz', 10),
+        (4, 5, NULL, 10, 5, NULL, 10),
+        (5, 6, 'Qux', 10, 6, 'Qux', 11)) AS t(id, x, y, p, z, w, q)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, u.a."EXPR$0", u.a."EXPR$1", b;
++----+----------------+
+| ID | R              |
++----+----------------+
+|  1 | {{9, Zzz}, 10} |
+|  2 | {{2, Bar}, 10} |
+|  2 | {{9, Zzz}, 10} |
+|  3 | {{3, Baz}, 10} |
+|  3 | {{9, Zzz}, 10} |
+|  4 | {{9, Zzz}, 10} |
+|  5 | {{6, Qux}, 10} |
+|  5 | {{9, Zzz}, 10} |
++----+----------------+
+(8 rows)
+
+!ok
+
+# MULTISET UNION DISTINCT
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(ROW(x, y), p), ROW(ROW(x, y), p), ROW(ROW(9, 'Zzz'), 10)]
+        MULTISET UNION DISTINCT
+        MULTISET[ROW(ROW(z, w), q), ROW(ROW(z, w), q), ROW(ROW(z, w), q), ROW(ROW(8, 'Yyy'), 10)] AS m
+    FROM (VALUES
+        (1, 1, 'Foo', 10, 1, 'Foo', 10),
+        (2, 2, 'Bar', 10, 2, 'Car', 10),
+        (3, 3, 'Baz', 10, 4, 'Baz', 10),
+        (4, 5, NULL, 10, 5, NULL, 10),
+        (5, 6, 'Qux', 10, 6, 'Qux', 11)) AS t(id, x, y, p, z, w, q)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, u.a."EXPR$0", u.a."EXPR$1", b;
++----+-----------------+
+| ID | R               |
++----+-----------------+
+|  1 | {{1, Foo}, 10}  |
+|  1 | {{8, Yyy}, 10}  |
+|  1 | {{9, Zzz}, 10}  |
+|  2 | {{2, Bar}, 10}  |
+|  2 | {{2, Car}, 10}  |
+|  2 | {{8, Yyy}, 10}  |
+|  2 | {{9, Zzz}, 10}  |
+|  3 | {{3, Baz}, 10}  |
+|  3 | {{4, Baz}, 10}  |
+|  3 | {{8, Yyy}, 10}  |
+|  3 | {{9, Zzz}, 10}  |
+|  4 | {{5, null}, 10} |
+|  4 | {{8, Yyy}, 10}  |
+|  4 | {{9, Zzz}, 10}  |
+|  5 | {{6, Qux}, 10}  |
+|  5 | {{6, Qux}, 11}  |
+|  5 | {{8, Yyy}, 10}  |
+|  5 | {{9, Zzz}, 10}  |
++----+-----------------+
+(18 rows)
+
+!ok
+
+# MULTISET UNION ALL
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(ROW(x, y), p), ROW(ROW(x, y), p), ROW(ROW(9, 'Zzz'), 10)]
+        MULTISET UNION ALL
+        MULTISET[ROW(ROW(z, w), q), ROW(ROW(z, w), q), ROW(ROW(z, w), q), ROW(ROW(8, 'Yyy'), 10)] AS m
+    FROM (VALUES
+        (1, 1, 'Foo', 10, 1, 'Foo', 10),
+        (2, 2, 'Bar', 10, 2, 'Car', 10),
+        (3, 3, 'Baz', 10, 4, 'Baz', 10),
+        (4, 5, NULL, 10, 5, NULL, 10),
+        (5, 6, 'Qux', 10, 6, 'Qux', 11)) AS t(id, x, y, p, z, w, q)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, u.a."EXPR$0", u.a."EXPR$1", b;
++----+-----------------+
+| ID | R               |
++----+-----------------+
+|  1 | {{1, Foo}, 10}  |
+|  1 | {{1, Foo}, 10}  |
+|  1 | {{1, Foo}, 10}  |
+|  1 | {{1, Foo}, 10}  |
+|  1 | {{1, Foo}, 10}  |
+|  1 | {{8, Yyy}, 10}  |
+|  1 | {{9, Zzz}, 10}  |
+|  2 | {{2, Bar}, 10}  |
+|  2 | {{2, Bar}, 10}  |
+|  2 | {{2, Car}, 10}  |
+|  2 | {{2, Car}, 10}  |
+|  2 | {{2, Car}, 10}  |
+|  2 | {{8, Yyy}, 10}  |
+|  2 | {{9, Zzz}, 10}  |
+|  3 | {{3, Baz}, 10}  |
+|  3 | {{3, Baz}, 10}  |
+|  3 | {{4, Baz}, 10}  |
+|  3 | {{4, Baz}, 10}  |
+|  3 | {{4, Baz}, 10}  |
+|  3 | {{8, Yyy}, 10}  |
+|  3 | {{9, Zzz}, 10}  |
+|  4 | {{5, null}, 10} |
+|  4 | {{5, null}, 10} |
+|  4 | {{5, null}, 10} |
+|  4 | {{5, null}, 10} |
+|  4 | {{5, null}, 10} |
+|  4 | {{8, Yyy}, 10}  |
+|  4 | {{9, Zzz}, 10}  |
+|  5 | {{6, Qux}, 10}  |
+|  5 | {{6, Qux}, 10}  |
+|  5 | {{6, Qux}, 11}  |
+|  5 | {{6, Qux}, 11}  |
+|  5 | {{6, Qux}, 11}  |
+|  5 | {{8, Yyy}, 10}  |
+|  5 | {{9, Zzz}, 10}  |
++----+-----------------+
+(35 rows)
+
+!ok
+
+# ROW values with NULL fields.
+
+# MEMBER OF
+SELECT id, ROW(x, CAST(NULL AS INTEGER)) MEMBER OF MULTISET[ROW(z, CAST(NULL AS INTEGER))] AS r
+FROM (VALUES
+    (1, 1, 1),
+    (2, 2, 3)) AS t(id, x, z)
+ORDER BY id;
++----+-------+
+| ID | R     |
++----+-------+
+|  1 | true  |
+|  2 | false |
++----+-------+
+(2 rows)
+
+!ok
+
+# IS A SET and IS NOT A SET
+SELECT id,
+    MULTISET[ROW(x, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER))] IS A SET AS r,
+    MULTISET[ROW(x, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER))] IS NOT A SET AS not_r
+FROM (VALUES
+    (1, 1, 1),
+    (2, 2, 3)) AS t(id, x, z)
+ORDER BY id;
++----+-------+-------+
+| ID | R     | NOT_R |
++----+-------+-------+
+|  1 | false | true  |
+|  2 | true  | false |
++----+-------+-------+
+(2 rows)
+
+!ok
+
+# SUBMULTISET OF and NOT SUBMULTISET OF
+SELECT id,
+    MULTISET[ROW(x, CAST(NULL AS INTEGER)), ROW(x, CAST(NULL AS INTEGER))]
+        SUBMULTISET OF MULTISET[ROW(z, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER)), ROW(9, CAST(NULL AS INTEGER))] AS r,
+    MULTISET[ROW(x, CAST(NULL AS INTEGER)), ROW(x, CAST(NULL AS INTEGER))]
+        NOT SUBMULTISET OF MULTISET[ROW(z, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER)), ROW(9, CAST(NULL AS INTEGER))] AS not_r
+FROM (VALUES
+    (1, 1, 1),
+    (2, 2, 3)) AS t(id, x, z)
+ORDER BY id;
++----+-------+-------+
+| ID | R     | NOT_R |
++----+-------+-------+
+|  1 | true  | false |
+|  2 | false | true  |
++----+-------+-------+
+(2 rows)
+
+!ok
+
+# Equal input cardinalities, but too few occurrences of the requested row.
+SELECT id, MULTISET[ROW(x, CAST(NULL AS INTEGER)), ROW(x, CAST(NULL AS INTEGER))]
+    SUBMULTISET OF MULTISET[ROW(z, CAST(NULL AS INTEGER)), ROW(9, CAST(NULL AS INTEGER))] AS r
+FROM (VALUES
+    (1, 1, 1),
+    (2, 2, 3)) AS t(id, x, z)
+ORDER BY id;
++----+-------+
+| ID | R     |
++----+-------+
+|  1 | false |
+|  2 | false |
++----+-------+
+(2 rows)
+
+!ok
+
+# MULTISET INTERSECT ALL
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(x, CAST(NULL AS INTEGER)), ROW(x, CAST(NULL AS INTEGER)), ROW(9, CAST(NULL AS INTEGER))]
+        MULTISET INTERSECT ALL
+        MULTISET[ROW(z, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER)), ROW(8, CAST(NULL AS INTEGER))] AS m
+    FROM (VALUES
+        (1, 1, 1),
+        (2, 2, 3)) AS t(id, x, z)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, a, b;
++----+-----------+
+| ID | R         |
++----+-----------+
+|  1 | {1, null} |
+|  1 | {1, null} |
++----+-----------+
+(2 rows)
+
+!ok
+
+# MULTISET INTERSECT DISTINCT
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(x, CAST(NULL AS INTEGER)), ROW(x, CAST(NULL AS INTEGER)), ROW(9, CAST(NULL AS INTEGER))]
+        MULTISET INTERSECT DISTINCT
+        MULTISET[ROW(z, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER)), ROW(8, CAST(NULL AS INTEGER))] AS m
+    FROM (VALUES
+        (1, 1, 1),
+        (2, 2, 3)) AS t(id, x, z)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, a, b;
++----+-----------+
+| ID | R         |
++----+-----------+
+|  1 | {1, null} |
++----+-----------+
+(1 row)
+
+!ok
+
+# MULTISET EXCEPT ALL
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(x, CAST(NULL AS INTEGER)), ROW(x, CAST(NULL AS INTEGER)), ROW(9, CAST(NULL AS INTEGER))]
+        MULTISET EXCEPT ALL
+        MULTISET[ROW(z, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER)), ROW(8, CAST(NULL AS INTEGER))] AS m
+    FROM (VALUES
+        (1, 1, 1),
+        (2, 2, 3)) AS t(id, x, z)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, a, b;
++----+-----------+
+| ID | R         |
++----+-----------+
+|  1 | {9, null} |
+|  2 | {2, null} |
+|  2 | {2, null} |
+|  2 | {9, null} |
++----+-----------+
+(4 rows)
+
+!ok
+
+# MULTISET EXCEPT DISTINCT
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(x, CAST(NULL AS INTEGER)), ROW(x, CAST(NULL AS INTEGER)), ROW(9, CAST(NULL AS INTEGER))]
+        MULTISET EXCEPT DISTINCT
+        MULTISET[ROW(z, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER)), ROW(8, CAST(NULL AS INTEGER))] AS m
+    FROM (VALUES
+        (1, 1, 1),
+        (2, 2, 3)) AS t(id, x, z)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, a, b;
++----+-----------+
+| ID | R         |
++----+-----------+
+|  1 | {9, null} |
+|  2 | {2, null} |
+|  2 | {9, null} |
++----+-----------+
+(3 rows)
+
+!ok
+
+# MULTISET UNION DISTINCT
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(x, CAST(NULL AS INTEGER)), ROW(x, CAST(NULL AS INTEGER)), ROW(9, CAST(NULL AS INTEGER))]
+        MULTISET UNION DISTINCT
+        MULTISET[ROW(z, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER)), ROW(8, CAST(NULL AS INTEGER))] AS m
+    FROM (VALUES
+        (1, 1, 1),
+        (2, 2, 3)) AS t(id, x, z)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, a, b;
++----+-----------+
+| ID | R         |
++----+-----------+
+|  1 | {1, null} |
+|  1 | {8, null} |
+|  1 | {9, null} |
+|  2 | {2, null} |
+|  2 | {3, null} |
+|  2 | {8, null} |
+|  2 | {9, null} |
++----+-----------+
+(7 rows)
+
+!ok
+
+# MULTISET UNION ALL
+SELECT id, ROW(a, b) AS r
+FROM (
+    SELECT id,
+        MULTISET[ROW(x, CAST(NULL AS INTEGER)), ROW(x, CAST(NULL AS INTEGER)), ROW(9, CAST(NULL AS INTEGER))]
+        MULTISET UNION ALL
+        MULTISET[ROW(z, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER)), ROW(z, CAST(NULL AS INTEGER)), ROW(8, CAST(NULL AS INTEGER))] AS m
+    FROM (VALUES
+        (1, 1, 1),
+        (2, 2, 3)) AS t(id, x, z)) AS t
+CROSS JOIN UNNEST(m) AS u(a, b)
+ORDER BY id, a, b;
++----+-----------+
+| ID | R         |
++----+-----------+
+|  1 | {1, null} |
+|  1 | {1, null} |
+|  1 | {1, null} |
+|  1 | {1, null} |
+|  1 | {1, null} |
+|  1 | {8, null} |
+|  1 | {9, null} |
+|  2 | {2, null} |
+|  2 | {2, null} |
+|  2 | {3, null} |
+|  2 | {3, null} |
+|  2 | {3, null} |
+|  2 | {8, null} |
+|  2 | {9, null} |
++----+-----------+
+(14 rows)
+
+!ok
+
+# End row-equality.iq
