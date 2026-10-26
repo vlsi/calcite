@@ -128,6 +128,13 @@ const include = matrix.generateRows(Number(process.env.MATRIX_JOBS || 6), {
     {guava: guavaMax},
     {locale: {language: 'tr'}},
     {avatica: {value: 'main'}},
+    {os: {value: 'macos-15'}, java_version: '8'},
+    ...matrix.allAxisValues('java_version'),
+    ...matrix.allAxisValues('java_distribution'),
+    ...matrix.allAxisValues('guava'),
+    ...matrix.allAxisValues('os'),
+    ...matrix.allAxisValues('tz'),
+    ...matrix.allAxisValues('locale'),
   ],
 });
 if (include.length === 0) {
